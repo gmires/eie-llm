@@ -246,6 +246,7 @@ svr.Post("/v1/completions",
                   << "\" max_tokens=" << max_tokens
                   << " temp=" << params.temperature
                   << " top_p=" << params.top_p
+                  << " top_k=" << params.top_k
                   << " penalty=" << params.rep_penalty << "\n";
 
         int prompt_tokens = static_cast<int>(
