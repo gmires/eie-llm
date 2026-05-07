@@ -183,8 +183,7 @@ static std::vector<std::string> split_into_chars(const std::string& word) {
 //  Con il lookup O(1) via merge_rank diventa
 //  O(n²) per parola — accettabile per GPT-2.
 // ─────────────────────────────────────────────
-static void apply_bpe(std::vector<std::string>& tokens,
-                      const Tokenizer& tok) {
+static void apply_bpe(std::vector<std::string>& tokens, const Tokenizer& tok) {
     while (tokens.size() > 1) {
         // Cerca la coppia adiacente con rank minimo
         int    best_rank = INT_MAX;
@@ -221,8 +220,7 @@ static void apply_bpe(std::vector<std::string>& tokens,
 //    → lookup ID nel vocabolario
 //  → sequenza finale di ID
 // ─────────────────────────────────────────────
-std::vector<int> tokenizer_encode(const Tokenizer& tok,
-                                  const std::string& text) {
+std::vector<int> tokenizer_encode(const Tokenizer& tok, const std::string& text) {
     if (text.empty()) return {};
 
     std::vector<int> result;

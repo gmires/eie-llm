@@ -14,6 +14,7 @@ compatibile con l'API OpenAI. Zero dipendenze pesanti, solo stdlib + httplib.
 - [x] Fase 4 — Forward pass GPT-2
 - [x] Fase 5 — Shell interattiva
 - [x] Fase 6 — Server HTTP minimale
+- [x] Fase 7 — Sampling avanzato (top-k, top-p, repetition penalty)
 
 ---
 
@@ -77,13 +78,26 @@ Comandi disponibili nella shell:
 | Comando | Descrizione |
 |---------|-------------|
 | `:help` | Mostra la lista dei comandi |
-| `:tokens <n>` | Imposta il numero massimo di token generati |
-| `:temp <f>` | Imposta la temperatura (es. `0.8`) |
+| `:tokens <n>` | Max token da generare (default 200) |
+| `:temp <f>` | Temperatura, es. `0.8` (default 1.0) |
+| `:topk <n>` | Top-k sampling, `0` = disabilitato (default 40) |
+| `:topp <f>` | Nucleus sampling p, es. `0.9` (default 0.9) |
+| `:penalty <f>` | Repetition penalty, es. `1.3` (default 1.1) |
 | `:greedy` | Attiva sampling greedy (argmax) |
-| `:sample` | Attiva sampling con temperatura |
+| `:sample` | Attiva top-k + top-p sampling |
+| `:params` | Mostra parametri correnti |
 | `:reset` | Azzera la KV cache |
 | `:quit` | Esci |
 | `qualsiasi testo` | Genera il completamento |
+
+**Configurazione consigliata per output bilanciato:**
+
+```
+eie> :topk 40
+eie> :topp 0.9
+eie> :temp 0.8
+eie> :penalty 1.2
+```
 
 ### Server HTTP
 
@@ -101,8 +115,6 @@ Comandi disponibili nella shell:
 
 ### `GET /health`
 
-Verifica che il server sia attivo.
-
 ```bash
 curl http://localhost:8080/health
 ```
@@ -113,7 +125,6 @@ curl http://localhost:8080/health
 
 ### `POST /v1/completions`
 
-Genera testo a partire da un prompt.
 Formato compatibile con l'API OpenAI.
 
 ```bash
@@ -122,7 +133,10 @@ curl -X POST http://localhost:8080/v1/completions \
   -d '{
     "prompt": "The meaning of life is",
     "max_tokens": 50,
-    "temperature": 0.8
+    "temperature": 0.8,
+    "top_k": 40,
+    "top_p": 0.9,
+    "repetition_penalty": 1.2
   }'
 ```
 
@@ -132,7 +146,10 @@ curl -X POST http://localhost:8080/v1/completions \
 |-------|------|---------|-------------|
 | `prompt` | string | — | Testo di input (obbligatorio) |
 | `max_tokens` | int | 50 | Token massimi da generare (max 500) |
-| `temperature` | float | 1.0 | Temperatura del sampling (0 = greedy) |
+| `temperature` | float | 1.0 | Temperatura del sampling |
+| `top_k` | int | 40 | Mantieni i k token più probabili (0 = disabilitato) |
+| `top_p` | float | 0.9 | Nucleus sampling — taglia al p% cumulativo |
+| `repetition_penalty` | float | 1.1 | Penalizza token già generati (1.0 = disabilitato) |
 
 **Risposta:**
 
@@ -155,25 +172,48 @@ curl -X POST http://localhost:8080/v1/completions \
 }
 ```
 
-**Esempio con Python:**
+---
 
-```python
-import urllib.request, json
+## Sampling — come funziona
 
-data = json.dumps({
-    "prompt": "Hello, I am",
-    "max_tokens": 30,
-    "temperature": 0.8
-}).encode()
+### Greedy (argmax)
+Sceglie sempre il token con probabilità massima. Deterministico ma tende
+a produrre testo ripetitivo.
 
-req = urllib.request.Request(
-    "http://localhost:8080/v1/completions",
-    data=data,
-    headers={"Content-Type": "application/json"}
-)
+### Top-k
+Mantiene solo i `k` token con logit più alto, azzera tutti gli altri.
+Riduce il rischio di campionare token improbabili.
 
-response = json.loads(urllib.request.urlopen(req).read())
-print(response["choices"][0]["text"])
+```
+k = 40, logits ordinati:
+[0.15, 0.12, 0.09, ..., 0.001, 0.0001, ...]
+ ──────────────────────────────────────
+ tieni solo i primi 40 → campiona da questi
+```
+
+### Top-p (nucleus sampling)
+Mantiene il sottoinsieme minimo di token la cui probabilità cumulativa
+raggiunge `p`. Si adatta dinamicamente alla distribuzione.
+
+```
+p = 0.9, probs ordinate:
+[0.40, 0.30, 0.15, 0.08, 0.04, 0.02, ...]
+ ─────────────────────────
+ somma = 0.93 >= 0.9 → taglia qui (4 token)
+```
+
+### Top-k + Top-p combinati (default)
+Prima applica top-k (tetto duro), poi top-p (affina la distribuzione).
+È la configurazione usata da GPT-2 originale.
+
+### Repetition penalty
+Penalizza i token già apparsi nel contesto dividendo o moltiplicando
+il loro logit per il fattore `penalty`.
+
+```
+penalty = 1.3
+token già visto con logit +2.0 → +2.0 / 1.3 = +1.54
+token già visto con logit -1.0 → -1.0 * 1.3 = -1.30
 ```
 
 ---
@@ -225,9 +265,9 @@ QKV projection [3×768]
     └── V [768] → salva in kv_cache.v[layer][pos] │
                                                    │
     per ogni head h (12 heads × 64 dim):           │
-        scores[t] = Q_h · K_h[t] / √64   t∈[0,pos]│
+        scores[t] = Q_h · K_h[t] / √64  t∈[0,pos] │
         scores    = softmax(scores)                 │
-        out_h     = Σ scores[t] * V_h[t]  ◄────────┘
+        out_h     = Σ scores[t] * V_h[t] ◄─────────┘
     │
     ▼
 concatena heads → output projection [768]
@@ -243,7 +283,7 @@ Quantizzazione:
     scale = max(|fi|) / 127.0   → float16 (2 byte)
     qi    = round(fi / scale)   → int8    (1 byte × 32)
 
-Blocco Q8_0 (34 byte):
+Blocco Q8_0 (34 byte totali):
     [scale_f16 | q0 q1 q2 ... q31]
 
 Dequantizzazione:
@@ -306,7 +346,6 @@ GPT-2 small — 124M parametri, architettura transformer decoder-only.
 |-----------|----------------|
 | **Performance** | AVX2/NEON per matmul, thread pool per i layer |
 | **Modelli più grandi** | Supporto LLaMA (RoPE, SwiGLU, RMSNorm) |
-| **Qualità output** | Top-p sampling, repetition penalty |
 | **Memoria** | Quantizzazione KV cache, sliding window attention |
 | **Streaming HTTP** | Server-Sent Events per output token per token |
 | **Benchmark** | Misura tokens/sec, latenza prefill vs generazione |

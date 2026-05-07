@@ -192,6 +192,21 @@ void feed_forward(const float* x, float* out, const LayerWeights& lw, const Mode
 // logits   : output [n_vocab] — probabilità grezze
 void forward(Model& model, int token_id, int pos, std::vector<float>& logits);
 
+// ─────────────────────────────────────────────
+//  Parametri di sampling raggruppati
+//
+//  Raccoglie tutti i parametri in una struct
+//  per passarli comodamente alle funzioni
+//  di generazione senza liste di argomenti lunghe
+// ─────────────────────────────────────────────
+struct SamplingParams {
+    float temperature  = 1.0f;   // temperatura del sampling
+    float top_p        = 0.9f;   // nucleus sampling
+    int   top_k        = 40;     // mantieni solo i k token più probabili
+    float rep_penalty  = 1.1f;   // repetition penalty
+    bool  greedy       = false;  // ignora tutto e fa argmax
+};
+
 // Sampling greedy — sceglie il token con
 // probabilità massima (argmax sui logits)
 int sample_argmax(const std::vector<float>& logits);
@@ -202,3 +217,61 @@ int sample_argmax(const std::vector<float>& logits);
 // temperature < 1 → distribuzione più concentrata (più deterministico)
 // temperature = 1 → sampling dalla distribuzione originale
 int sample_temperature(std::vector<float> logits, float temperature);
+
+// ─────────────────────────────────────────────
+//  Top-p (nucleus) sampling
+//
+//  Campiona solo dal sottoinsieme di token
+//  la cui probabilità cumulativa raggiunge p.
+//  Questo elimina i token improbabili mantenendo
+//  la varietà dell'output.
+//
+//  Algoritmo:
+//  1) Ordina i token per probabilità decrescente
+//  2) Prendi i primi k token tali che la loro
+//     somma cumulativa >= p (nucleus)
+//  3) Rinormalizza le probabilità nel nucleus
+//  4) Campiona dal nucleus
+//
+//  p = 1.0 → equivale a sampling normale
+//  p = 0.9 → top 90% della distribuzione
+//  p = 0.1 → molto conservativo
+// ─────────────────────────────────────────────
+int sample_topp(std::vector<float> logits, float p, float temperature);
+
+// ─────────────────────────────────────────────
+//  Repetition penalty
+//
+//  Penalizza i token già presenti nel contesto
+//  per ridurre le ripetizioni.
+//
+//  Formula (come in llama.cpp):
+//    se logit > 0: logit /= penalty
+//    se logit < 0: logit *= penalty
+//
+//  Questo abbassa i logit positivi e abbassa
+//  ulteriormente quelli negativi — in entrambi
+//  i casi il token diventa meno probabile.
+//
+//  penalty = 1.0 → nessun effetto
+//  penalty = 1.1 → leggera penalità
+//  penalty = 1.3 → penalità moderata (consigliato)
+//  penalty = 1.5 → penalità forte
+//
+//  context_ids : token già generati (prompt + output)
+// ─────────────────────────────────────────────
+void apply_repetition_penalty(std::vector<float>& logits, const std::vector<int>& context_ids, float penalty);
+
+// ─────────────────────────────────────────────
+//  Top-k sampling
+//
+//  Mantiene solo i k token con logit più alto
+//  e azzera tutti gli altri prima del softmax.
+//  Riduce il rischio di campionare token
+//  completamente improbabili.
+//
+//  k = 1   → equivale a greedy
+//  k = 40  → valore tipico usato da GPT-2
+//  k = 0   → disabilitato (tutti i token)
+// ─────────────────────────────────────────────
+int sample_topk_topp(std::vector<float> logits, int   top_k, float top_p, float temperature);

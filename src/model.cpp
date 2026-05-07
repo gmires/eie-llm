@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <unordered_set>
 
 // ─────────────────────────────────────────────
 //  Helper: leggi uint32 dai metadata
@@ -158,10 +159,8 @@ void model_init_kvcache(Model& model) {
     const ModelConfig& cfg = model.config;
     int cache_size = cfg.n_ctx * cfg.n_embd;
 
-    model.kv_cache.k.assign(cfg.n_layer,
-                            std::vector<float>(cache_size, 0.0f));
-    model.kv_cache.v.assign(cfg.n_layer,
-                            std::vector<float>(cache_size, 0.0f));
+    model.kv_cache.k.assign(cfg.n_layer, std::vector<float>(cache_size, 0.0f));
+    model.kv_cache.v.assign(cfg.n_layer, std::vector<float>(cache_size, 0.0f));
     model.kv_cache.n_cached = 0;
 }
 
@@ -196,8 +195,7 @@ void model_print_config(const ModelConfig& cfg) {
 //  se necessario.
 //  ε = 1e-5 evita divisione per zero quando σ²≈0
 // ─────────────────────────────────────────────
-void layer_norm(const float* x, const float* w, const float* b,
-                float* out, int n) {
+void layer_norm(const float* x, const float* w, const float* b, float* out, int n) {
     static constexpr float EPS = 1e-5f;
 
     // Calcola la media
@@ -233,10 +231,7 @@ void layer_norm(const float* x, const float* w, const float* b,
 //
 //  out = token_embd[token_id] + pos_embd[pos]
 // ─────────────────────────────────────────────
-void embedding_lookup(const float* token_embd,
-                      const float* pos_embd,
-                      int token_id, int pos,
-                      float* out, int n_embd) {
+void embedding_lookup(const float* token_embd, const float* pos_embd, int token_id, int pos, float* out, int n_embd) {
     // Puntatore alla riga del token embedding
     const float* te = token_embd + token_id * n_embd;
     // Puntatore alla riga del positional embedding
@@ -458,10 +453,7 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits) {
 
     // ── Step 1: embedding lookup ──────────────
     // Combina token embedding e positional embedding
-    embedding_lookup(w.token_embd.data(),
-                     w.pos_embd.data(),
-                     token_id, pos,
-                     x.data(), n_embd);
+    embedding_lookup(w.token_embd.data(), w.pos_embd.data(), token_id, pos, x.data(), n_embd);
 
     // ── Step 2: loop sui layer ─────────────────
     for (int l = 0; l < cfg.n_layer; l++) {
@@ -511,8 +503,7 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits) {
     // misura quanto il nostro stato è "simile"
     // all'embedding del token v.
     logits.resize(cfg.n_vocab);
-    matvec(w.token_embd.data(), ln_final.data(),
-           logits.data(), cfg.n_vocab, n_embd);
+    matvec(w.token_embd.data(), ln_final.data(), logits.data(), cfg.n_vocab, n_embd);
 }
 
 // ─────────────────────────────────────────────
@@ -560,4 +551,169 @@ int sample_temperature(std::vector<float> logits, float temperature) {
     }
     // Fallback — non dovrebbe mai succedere
     return static_cast<int>(logits.size()) - 1;
+}
+
+// ─────────────────────────────────────────────
+//  Repetition penalty
+//
+//  Scorriamo tutti i token già visti nel contesto
+//  e modifichiamo il loro logit.
+//  Usiamo un set per evitare di penalizzare
+//  lo stesso token più volte anche se appare
+//  più volte nel contesto.
+// ─────────────────────────────────────────────
+void apply_repetition_penalty(std::vector<float>& logits,
+                               const std::vector<int>& context_ids,
+                               float penalty) {
+    if (penalty == 1.0f) return;  // nessun effetto
+
+    // Insieme dei token unici già visti
+    // (penalizziamo ogni token al massimo una volta)
+    std::unordered_set<int> seen;
+
+    for (int id : context_ids) {
+        // Salta token fuori range o già penalizzati
+        if (id < 0 || id >= (int)logits.size()) continue;
+        if (seen.count(id)) continue;
+        seen.insert(id);
+
+        // Applica la penalità
+        if (logits[id] > 0.0f)
+            logits[id] /= penalty;
+        else
+            logits[id] *= penalty;
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Top-p (nucleus) sampling
+//
+//  Passi dettagliati:
+//  1) Dividi per temperatura
+//  2) Softmax → probabilità
+//  3) Ordina per probabilità decrescente
+//     mantenendo gli indici originali
+//  4) Trova il nucleus: accumula probabilità
+//     finché non raggiungiamo p
+//  5) Campiona dal nucleus con CDF inversa
+// ─────────────────────────────────────────────
+int sample_topp(std::vector<float> logits, float p, float temperature) {
+    const int n = static_cast<int>(logits.size());
+
+    // Step 1: applica temperatura
+    if (temperature > 0.0f)
+        for (auto& l : logits) l /= temperature;
+
+    // Step 2: softmax → probabilità
+    softmax(logits.data(), n);
+
+    // Step 3: crea lista (prob, indice) e ordina
+    // per probabilità decrescente
+    std::vector<std::pair<float, int>> sorted(n);
+    for (int i = 0; i < n; i++)
+        sorted[i] = {logits[i], i};
+
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) {
+                  return a.first > b.first;  // decrescente
+              });
+
+    // Step 4: trova il nucleus
+    // Accumula token finché la somma cumulativa >= p
+    float cumsum = 0.0f;
+    int   nucleus_size = 0;
+    for (int i = 0; i < n; i++) {
+        cumsum += sorted[i].first;
+        nucleus_size++;
+        if (cumsum >= p) break;
+    }
+
+    // Step 5: rinormalizza le probabilità nel nucleus
+    // e campiona con CDF inversa
+    float nucleus_sum = 0.0f;
+    for (int i = 0; i < nucleus_size; i++)
+        nucleus_sum += sorted[i].first;
+
+    float r = static_cast<float>(rand()) / RAND_MAX * nucleus_sum;
+    float cumulative = 0.0f;
+
+    for (int i = 0; i < nucleus_size; i++) {
+        cumulative += sorted[i].first;
+        if (cumulative >= r)
+            return sorted[i].second;
+    }
+
+    // Fallback — non dovrebbe mai succedere
+    return sorted[0].second;
+}
+
+// ─────────────────────────────────────────────
+//  Top-k + Top-p sampling combinati
+//
+//  Algoritmo:
+//  1) Applica temperatura
+//  2) Ordina per logit decrescente
+//  3) Top-k: tieni solo i primi k token
+//  4) Softmax sul sottoinsieme rimasto
+//  5) Top-p: taglia ulteriormente al nucleus p
+//  6) Rinormalizza e campiona
+//
+//  Applicarli in sequenza (prima k poi p)
+//  è la pratica standard — top-k dà un tetto
+//  duro al numero di candidati, top-p
+//  affina ulteriormente la distribuzione.
+// ─────────────────────────────────────────────
+int sample_topk_topp(std::vector<float> logits, int   top_k, float top_p, float temperature) {
+    const int n = static_cast<int>(logits.size());
+
+    // Step 1: applica temperatura
+    if (temperature > 0.0f)
+        for (auto& l : logits) l /= temperature;
+
+    // Step 2: crea lista (logit, indice) e ordina
+    std::vector<std::pair<float, int>> sorted(n);
+    for (int i = 0; i < n; i++)
+        sorted[i] = {logits[i], i};
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) {
+                  return a.first > b.first;
+              });
+
+    // Step 3: top-k — tronca la lista a k elementi
+    // top_k = 0 significa "disabilitato"
+    int k = (top_k > 0 && top_k < n) ? top_k : n;
+    sorted.resize(k);
+
+    // Step 4: softmax sul sottoinsieme
+    // Lavoriamo su un vettore temporaneo
+    std::vector<float> probs(k);
+    for (int i = 0; i < k; i++)
+        probs[i] = sorted[i].first;
+    softmax(probs.data(), k);
+
+    // Step 5: top-p — trova il nucleus
+    float cumsum = 0.0f;
+    int nucleus = k;
+    for (int i = 0; i < k; i++) {
+        cumsum += probs[i];
+        if (cumsum >= top_p) {
+            nucleus = i + 1;
+            break;
+        }
+    }
+
+    // Step 6: rinormalizza il nucleus e campiona
+    float nucleus_sum = 0.0f;
+    for (int i = 0; i < nucleus; i++)
+        nucleus_sum += probs[i];
+
+    float r = static_cast<float>(rand()) / RAND_MAX * nucleus_sum;
+    float cumulative = 0.0f;
+    for (int i = 0; i < nucleus; i++) {
+        cumulative += probs[i];
+        if (cumulative >= r)
+            return sorted[i].second;
+    }
+
+    return sorted[0].second;
 }

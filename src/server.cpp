@@ -146,20 +146,16 @@ static std::string generate_text(Model& model,
                                   const Tokenizer& tok,
                                   const std::string& prompt,
                                   int max_tokens,
-                                  float temperature) {
-    // Blocca il modello — una richiesta alla volta
+                                  const SamplingParams& params) {
     std::lock_guard<std::mutex> lock(model_mutex);
-
-    // Reset KV cache per ogni nuova richiesta
     model_init_kvcache(model);
 
-    // Tokenizza il prompt
     auto input_ids = tokenizer_encode(tok, prompt);
     if (input_ids.empty()) return "";
 
+    std::vector<int> context_ids = input_ids;
     std::vector<float> logits;
 
-    // Fase 1: prefill del prompt
     int pos = 0;
     for (int id : input_ids) {
         forward(model, id, pos, logits);
@@ -167,28 +163,29 @@ static std::string generate_text(Model& model,
     }
     model.kv_cache.n_cached = pos;
 
-    // Fase 2: generazione
     std::string output;
-    bool greedy = (temperature <= 0.0f);
 
-    int next_token = greedy
-        ? sample_argmax(logits)
-        : sample_temperature(logits, temperature);
+    int next_token;
+    // Campiona il primo token
+    apply_repetition_penalty(logits, context_ids, params.rep_penalty);
+    next_token = params.greedy
+            ? sample_argmax(logits)
+            : sample_topk_topp(logits, params.top_k, params.top_p, params.temperature);
 
     for (int i = 0; i < max_tokens; i++) {
-        // Token EOS di GPT-2
         if (next_token == 50256) break;
 
         output += tokenizer_decode(tok, {next_token});
+        context_ids.push_back(next_token);
 
         forward(model, next_token, pos, logits);
         pos++;
 
-        next_token = greedy
+        apply_repetition_penalty(logits, context_ids, params.rep_penalty);
+        next_token = params.greedy
             ? sample_argmax(logits)
-            : sample_temperature(logits, temperature);
+            : sample_topk_topp(logits, params.top_k, params.top_p, params.temperature);
     }
-
     return output;
 }
 
@@ -220,52 +217,49 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
     });
 
     // ── POST /v1/completions ──────────────────
-    svr.Post("/v1/completions",
+svr.Post("/v1/completions",
         [&model, &tok](const httplib::Request& req,
                        httplib::Response& res) {
 
-        // Leggi parametri dalla richiesta JSON
         std::string prompt     = json_get_string(req.body, "prompt");
-        int         max_tokens = json_get_int   (req.body, "max_tokens", 50);
-        float       temperature= json_get_float (req.body, "temperature", 1.0f);
+        int         max_tokens = json_get_int   (req.body, "max_tokens",  50);
+        max_tokens = std::min(max_tokens, 500);
 
-        // Valida il prompt
+        SamplingParams params;
+        params.temperature = json_get_float(req.body, "temperature",        1.0f);
+        params.top_p       = json_get_float(req.body, "top_p",              0.9f);
+        params.top_k       = json_get_int  (req.body, "top_k",              40);        
+        params.rep_penalty = json_get_float(req.body, "repetition_penalty", 1.1f);
+        params.greedy      = (params.temperature <= 0.0f);
+
         if (prompt.empty()) {
             res.status = 400;
             res.set_content(
                 "{\"error\":\"prompt mancante o vuoto\"}",
-                "application/json"
-            );
+                "application/json");
             return;
         }
 
-        // Limita max_tokens per sicurezza
-        max_tokens = std::min(max_tokens, 500);
-
-        std::cout << "[REQ] prompt=\"" << prompt.substr(0, 40)
+        std::cout << "[REQ] prompt=\""
+                  << prompt.substr(0, 40)
                   << (prompt.size() > 40 ? "..." : "")
                   << "\" max_tokens=" << max_tokens
-                  << " temp=" << temperature << "\n";
+                  << " temp=" << params.temperature
+                  << " top_p=" << params.top_p
+                  << " penalty=" << params.rep_penalty << "\n";
 
-        // Conta i token del prompt per usage stats
         int prompt_tokens = static_cast<int>(
-            tokenizer_encode(tok, prompt).size()
-        );
+            tokenizer_encode(tok, prompt).size());
 
-        // Genera il testo
         std::string generated = generate_text(
-            model, tok, prompt, max_tokens, temperature
-        );
+            model, tok, prompt, max_tokens, params);
 
         int completion_tokens = static_cast<int>(
-            tokenizer_encode(tok, generated).size()
-        );
+            tokenizer_encode(tok, generated).size());
 
-        std::cout << "[RES] generati " << completion_tokens
-                  << " token\n";
+        std::cout << "[RES] generati "
+                  << completion_tokens << " token\n";
 
-        // Costruisci la risposta JSON
-        // Formato compatibile con OpenAI API
         std::ostringstream json;
         json << "{"
              << "\"object\":\"text_completion\","
@@ -285,7 +279,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
 
         res.set_content(json.str(), "application/json");
     });
-
+    
     // ── Avvio ─────────────────────────────────
     std::cout << "\n╔═══════════════════════════════════════╗\n";
     std::cout << "║   EIE-LLM Server                      ║\n";
