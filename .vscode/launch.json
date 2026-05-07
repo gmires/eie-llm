@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug eie-llm",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/gpt2.Q8_0.gguf"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Abilita pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}
