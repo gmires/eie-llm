@@ -108,12 +108,20 @@ std::vector<float> tensor_to_float(const GGUFTensor& t) {
 
     switch (t.type()) {
         case GGMLType::F32:
-            // I dati sono già float32 — copia diretta
             memcpy(out.data(), t.data.data(), n_elem * sizeof(float));
             break;
 
+        case GGMLType::F16: {
+            // Ogni elemento è un uint16 — convertiamo uno per uno
+            // usando fp16_to_fp32 che abbiamo già implementato
+            const uint16_t* src = reinterpret_cast<const uint16_t*>
+                                  (t.data.data());
+            for (uint64_t i = 0; i < n_elem; i++)
+                out[i] = fp16_to_fp32(src[i]);
+            break;
+        }
+
         case GGMLType::Q8_0:
-            // Dequantizza da Q8_0 a float32
             dequantize_q8_0(t.data.data(), out.data(), n_elem);
             break;
 

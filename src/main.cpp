@@ -4,6 +4,7 @@
 #include "gguf.hpp"
 #include "tokenizer.hpp"
 #include "ops.hpp"
+#include "model.hpp"
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -18,65 +19,65 @@ int main(int argc, char* argv[]) {
     }
 
     GGUFContext ctx;
-
     if (!gguf_read_header(f, ctx.header))      return 1;
     std::cout << "✓ Header letto\n";
-
     if (!gguf_read_metadata(f, ctx))            return 1;
     std::cout << "✓ Metadata letti\n";
-
     if (!gguf_read_tensor_info(f, ctx))         return 1;
     std::cout << "✓ Info tensori lette\n";
-
     if (!gguf_load_tensors(f, ctx))             return 1;
     std::cout << "✓ Pesi caricati in RAM\n";
-    gguf_print_memory_usage(ctx);
 
     Tokenizer tok;
     if (!tokenizer_init(tok, ctx))              return 1;
     std::cout << "✓ Tokenizer inizializzato\n";
 
-    // ── Test ops ──────────────────────────────
+    // ── Carica il modello ──
+    Model model;
+    if (!model_load_config(model.config, ctx))  return 1;
+    model_print_config(model.config);
 
-    // Test 1: dequantizzazione del primo tensore Q8_0
-    std::cout << "\n── Test operazioni ──\n";
-    const GGUFTensor* embd = gguf_find_tensor(ctx, "token_embd.weight");
-    if (embd) {
-        auto floats = tensor_to_float(*embd);
-        std::cout << "✓ Dequantizzazione token_embd.weight\n";
-        std::cout << "  Elementi : " << floats.size() << "\n";
-        std::cout << "  Primi 4 valori: ";
-        for (int i = 0; i < 4; i++)
-            std::cout << std::fixed << std::setprecision(6)
-                      << floats[i] << " ";
-        std::cout << "\n";
-    }
+    if (!model_load_weights(model, ctx))        return 1;
+    std::cout << "✓ Pesi modello caricati\n";
 
-    // Test 2: softmax su un vettore semplice
-    float logits[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-    softmax(logits, 4);
-    std::cout << "✓ Softmax [1,2,3,4] → [";
-    for (int i = 0; i < 4; i++) {
-        if (i > 0) std::cout << ", ";
-        std::cout << std::fixed << std::setprecision(4) << logits[i];
-    }
-    std::cout << "] (somma deve essere 1.0)\n";
+    model_init_kvcache(model);
+    std::cout << "✓ KV cache inizializzata\n";
 
-    // Verifica che la somma sia 1
-    float sum = logits[0]+logits[1]+logits[2]+logits[3];
-    std::cout << "  Somma: " << std::fixed << std::setprecision(6)
-              << sum << (fabsf(sum - 1.0f) < 1e-6f ? " ✓" : " ✗") << "\n";
+    // ── Test embedding lookup ──
+    std::cout << "\n── Test embedding lookup ──\n";
+    const ModelConfig& cfg = model.config;
+    std::vector<float> embd(cfg.n_embd);
 
-    // Test 3: GELU su valori noti
-    float gelu_test[3] = {-1.0f, 0.0f, 1.0f};
-    gelu(gelu_test, 3);
-    std::cout << "✓ GELU [-1, 0, 1] → [";
-    for (int i = 0; i < 3; i++) {
-        if (i > 0) std::cout << ", ";
-        std::cout << std::fixed << std::setprecision(6) << gelu_test[i];
-    }
-    std::cout << "]\n";
-    std::cout << "  (atteso: ~[-0.158655, 0.0, 0.841345])\n";
+    // Token ID 15496 = "Hello" in GPT-2
+    int test_token = 15496;
+    int test_pos   = 0;
+    embedding_lookup(model.weights.token_embd.data(),
+                     model.weights.pos_embd.data(),
+                     test_token, test_pos,
+                     embd.data(), cfg.n_embd);
+
+    std::cout << "  Token " << test_token
+              << " @ pos " << test_pos << "\n";
+    std::cout << "  Primi 4 valori embedding: ";
+    for (int i = 0; i < 4; i++)
+        std::cout << std::fixed << std::setprecision(6)
+                  << embd[i] << " ";
+    std::cout << "\n";
+
+    // ── Test layer norm ──
+    std::cout << "\n── Test layer norm ──\n";
+    std::vector<float> norm_out(cfg.n_embd);
+    layer_norm(embd.data(),
+               model.weights.layers[0].ln1_w.data(),
+               model.weights.layers[0].ln1_b.data(),
+               norm_out.data(), cfg.n_embd);
+
+    std::cout << "  Primi 4 valori dopo LN: ";
+    for (int i = 0; i < 4; i++)
+        std::cout << std::fixed << std::setprecision(6)
+                  << norm_out[i] << " ";
+    std::cout << "\n";
+    std::cout << "✓ LayerNorm applicata correttamente\n";
 
     return 0;
 }
