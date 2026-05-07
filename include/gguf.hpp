@@ -105,6 +105,25 @@ struct GGUFTensorInfo {
 };
 
 // ─────────────────────────────────────────────
+//  Tensore caricato in RAM
+//
+//  Contiene le info (metadati) più i dati
+//  grezzi copiati dal file in memoria.
+//  'data' punta a un buffer allocato da noi —
+//  i byte sono esattamente quelli del file,
+//  quantizzati o float a seconda del tipo.
+// ─────────────────────────────────────────────
+struct GGUFTensor {
+    GGUFTensorInfo  info;        // metadati (nome, shape, tipo, offset)
+    std::vector<uint8_t> data;  // dati grezzi in RAM
+
+    // Accesso rapido alle info più usate
+    const std::string& name()   const { return info.name; }
+    GGMLType           type()   const { return info.type; }
+    uint64_t           offset() const { return info.offset; }
+};
+
+// ─────────────────────────────────────────────
 //  Header del file GGUF
 //  Contiene le informazioni base lette
 //  dai primi byte del file
@@ -123,9 +142,11 @@ struct GGUFHeader {
 //  nelle fasi successive aggiungeremo i tensori
 // ─────────────────────────────────────────────
 struct GGUFContext {
-    GGUFHeader                 header;
-    std::vector<GGUFKV>        metadata;
+    GGUFHeader                  header;
+    std::vector<GGUFKV>         metadata;
     std::vector<GGUFTensorInfo> tensors;
+    std::vector<GGUFTensor>     weights; 
+    uint64_t                    data_offset;
 };
 
 // ─────────────────────────────────────────────
@@ -165,3 +186,17 @@ uint64_t gguf_tensor_n_elements(const GGUFTensorInfo& ti);
 // Calcola la dimensione in byte di un tensore
 // tenendo conto della quantizzazione
 uint64_t gguf_tensor_size_bytes(const GGUFTensorInfo& ti);
+
+// Calcola e ritorna la posizione della data section nel file
+// (dopo header + metadata + tensor info, allineata a 32 byte)
+uint64_t gguf_calc_data_offset(std::ifstream& f);
+
+// Carica tutti i pesi in RAM
+// Deve essere chiamata dopo gguf_read_tensor_info
+bool gguf_load_tensors(std::ifstream& f, GGUFContext& ctx);
+
+// Cerca un tensore per nome — ritorna nullptr se non trovato
+const GGUFTensor* gguf_find_tensor(const GGUFContext& ctx,
+                                   const std::string& name);
+// Stampa un riepilogo della RAM occupata dai pesi
+void gguf_print_memory_usage(const GGUFContext& ctx);

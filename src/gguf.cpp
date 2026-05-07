@@ -334,3 +334,118 @@ bool gguf_read_tensor_info(std::ifstream& f, GGUFContext& ctx) {
     }
     return true;
 }
+
+// ─────────────────────────────────────────────
+//  Calcolo offset della data section
+//
+//  Dopo aver letto tutti i metadati, il file
+//  pointer è posizionato alla fine della
+//  tensor info section. La data section inizia
+//  al prossimo multiplo di 32 byte dall'inizio
+//  del file — questo è un requisito del formato
+//  GGUF per garantire l'allineamento dei dati.
+//
+//  Allineamento: se la posizione corrente è 1050,
+//  il prossimo multiplo di 32 è 1056.
+//  Formula: (pos + 31) / 32 * 32
+// ─────────────────────────────────────────────
+uint64_t gguf_calc_data_offset(std::ifstream& f) {
+    // Leggi la posizione corrente nel file
+    uint64_t pos = static_cast<uint64_t>(f.tellg());
+
+    // Arrotonda al prossimo multiplo di 32
+    uint64_t aligned = (pos + 31) / 32 * 32;
+
+    return aligned;
+}
+
+// ─────────────────────────────────────────────
+//  Caricamento dei pesi in RAM
+//
+//  Per ogni tensore:
+//  1) Calcoliamo la posizione assoluta nel file:
+//     data_offset + tensor.offset
+//  2) Ci spostiamo a quella posizione con seekg
+//  3) Leggiamo esattamente size_bytes byte
+//     nel vettore data del tensore
+//
+//  I dati sono copiati RAW — nessuna conversione.
+//  Se il tensore è Q8_0 i byte saranno in formato
+//  Q8_0, se è F32 saranno float a 32 bit, ecc.
+//  La conversione avverrà durante il forward pass.
+// ─────────────────────────────────────────────
+bool gguf_load_tensors(std::ifstream& f, GGUFContext& ctx) {
+    // Calcola dove inizia la data section
+    ctx.data_offset = gguf_calc_data_offset(f);
+
+    ctx.weights.reserve(ctx.tensors.size());
+
+    for (const auto& info : ctx.tensors) {
+        GGUFTensor tensor;
+        tensor.info = info;
+
+        // Posizione assoluta nel file
+        uint64_t abs_offset = ctx.data_offset + info.offset;
+
+        // Spostati a quella posizione
+        f.seekg(static_cast<std::streamoff>(abs_offset));
+        if (!f.good()) {
+            std::cerr << "[ERRORE] Seek fallito per tensore: "
+                      << info.name << " @ offset " << abs_offset << "\n";
+            return false;
+        }
+
+        // Calcola quanti byte occupano i dati
+        uint64_t size = gguf_tensor_size_bytes(info);
+
+        // Alloca il buffer e leggi i dati grezzi
+        tensor.data.resize(size);
+        f.read(reinterpret_cast<char*>(tensor.data.data()),
+               static_cast<std::streamsize>(size));
+
+        if (!f.good()) {
+            std::cerr << "[ERRORE] Lettura fallita per tensore: "
+                      << info.name << " (" << size << " byte)\n";
+            return false;
+        }
+
+        ctx.weights.push_back(std::move(tensor));
+    }
+
+    return true;
+}
+
+// ─────────────────────────────────────────────
+//  Ricerca di un tensore per nome
+//
+//  Ricerca lineare — con 148 tensori è più
+//  che sufficiente. In un engine di produzione
+//  si userebbe una std::unordered_map.
+// ─────────────────────────────────────────────
+const GGUFTensor* gguf_find_tensor(const GGUFContext& ctx,
+                                   const std::string& name) {
+    for (const auto& t : ctx.weights)
+        if (t.name() == name) return &t;
+    return nullptr;
+}
+
+// ─────────────────────────────────────────────
+//  Riepilogo utilizzo RAM
+//
+//  Utile per capire quanto pesa il modello
+//  e come è distribuita la memoria tra i layer
+// ─────────────────────────────────────────────
+void gguf_print_memory_usage(const GGUFContext& ctx) {
+    uint64_t total_bytes = 0;
+    for (const auto& t : ctx.weights)
+        total_bytes += t.data.size();
+
+    std::cout << "\n═══════════════════════════════════════\n";
+    std::cout << "  EIE-LLM — Memoria occupata dai pesi\n";
+    std::cout << "═══════════════════════════════════════\n";
+    std::cout << "  Tensori caricati : " << ctx.weights.size() << "\n";
+    std::cout << "  RAM totale       : "
+              << std::fixed << std::setprecision(1)
+              << total_bytes / (1024.0 * 1024.0) << " MB\n";
+    std::cout << "═══════════════════════════════════════\n\n";
+}
