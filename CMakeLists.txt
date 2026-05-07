@@ -16,13 +16,21 @@ add_executable(eie-llm
   src/ops.cpp
   src/model.cpp
   src/shell.cpp
+  src/server.cpp
 )
 
 # Ora gli header stanno in include/ separati dai sorgenti
-target_include_directories(eie-llm PRIVATE include)
+target_include_directories(eie-llm PRIVATE 
+  include
+  third_party
+)
+
+find_package(Threads REQUIRED)
 
 target_compile_options(eie-llm PRIVATE
   -Wall -Wextra
   $<$<CONFIG:Debug>:-g -O0>
   $<$<CONFIG:Release>:-O3>
 )
+
+target_link_libraries(eie-llm PRIVATE Threads::Threads)

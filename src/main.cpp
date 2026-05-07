@@ -1,13 +1,18 @@
 #include <iostream>
 #include <fstream>
+#include <string>
 #include "gguf.hpp"
 #include "tokenizer.hpp"
 #include "model.hpp"
 #include "shell.hpp"
+#include "server.hpp"
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Uso: eie-llm <model.gguf>\n";
+        std::cerr << "Uso:\n"
+                  << "  eie-llm <model.gguf>              → shell\n"
+                  << "  eie-llm <model.gguf> --server      → server :8080\n"
+                  << "  eie-llm <model.gguf> --server 9090 → server :9090\n";
         return 1;
     }
 
@@ -36,8 +41,16 @@ int main(int argc, char* argv[]) {
 
     std::cerr << "✓ Pronto!\n";
 
-    // ── Avvia la shell ────────────────────────
-    shell_run(model, tok);
+    // ── Modalità: server o shell ───────────────
+    bool server_mode = (argc >= 3 &&
+                        std::string(argv[2]) == "--server");
+
+    if (server_mode) {
+        int port = (argc >= 4) ? std::atoi(argv[3]) : 8080;
+        server_run(model, tok, port);
+    } else {
+        shell_run(model, tok);
+    }
 
     return 0;
 }
