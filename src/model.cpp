@@ -245,3 +245,124 @@ void embedding_lookup(const float* token_embd,
     for (int i = 0; i < n_embd; i++)
         out[i] = te[i] + pe[i];
 }
+
+// ─────────────────────────────────────────────
+//  Self-Attention con KV Cache
+//
+//  Implementa la scaled dot-product attention
+//  per un singolo token alla posizione pos.
+//
+//  Formula:
+//    Attention(Q,K,V) = softmax(Q·Kᵀ / √d_head) · V
+//
+//  La KV cache evita di ricalcolare K e V
+//  per i token già processati:
+//  - al passo pos=0 processiamo solo pos 0
+//  - al passo pos=1 Q viene da pos 1,
+//    ma K e V vengono da pos 0 e 1
+//  - al passo pos=n Q viene da pos n,
+//    ma K e V vengono da pos 0..n
+// ─────────────────────────────────────────────
+void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos) {
+
+    const int n_embd  = cfg.n_embd;
+    const int n_head  = cfg.n_head;
+    const int d_head  = cfg.d_head;
+
+    // ── Step 1: calcola Q, K, V ───────────────
+    //
+    // La matrice attn_qkv_w ha shape [3*n_embd × n_embd]
+    // e produce Q, K, V concatenati in un unico vettore.
+    // Lo splittiamo in 3 parti uguali da n_embd ciascuna.
+    std::vector<float> qkv(3 * n_embd);
+    matvec(lw.attn_qkv_w.data(), x, qkv.data(), 3 * n_embd, n_embd);
+
+    // Aggiungi i bias
+    vec_add(qkv.data(), lw.attn_qkv_b.data(), qkv.data(), 3 * n_embd);
+
+    // Puntatori alle 3 sezioni del vettore qkv
+    const float* Q = qkv.data();
+    const float* K = qkv.data() + n_embd;
+    const float* V = qkv.data() + 2 * n_embd;
+
+    // ── Step 2: salva K e V nella cache ───────
+    //
+    // Ogni posizione occupa n_embd float nella cache.
+    // Layout: cache[pos * n_embd + i]
+    float* k_pos = cache.k[layer].data() + pos * n_embd;
+    float* v_pos = cache.v[layer].data() + pos * n_embd;
+    vec_copy(K, k_pos, n_embd);
+    vec_copy(V, v_pos, n_embd);
+
+    // ── Step 3: attention per ogni head ───────
+    //
+    // Ogni head lavora su una "fetta" di Q, K, V
+    // di dimensione d_head = n_embd / n_head.
+    // Head h lavora su indici [h*d_head, (h+1)*d_head)
+    std::vector<float> attn_out(n_embd, 0.0f);
+
+    // scores[t] conterrà il peso di attenzione
+    // del token corrente verso il token t
+    std::vector<float> scores(pos + 1);
+
+    for (int h = 0; h < n_head; h++) {
+        // Offset della fetta di questo head
+        int h_off = h * d_head;
+
+        // Q per questo head
+        const float* Qh = Q + h_off;
+
+        // ── Calcola scores = Q·Kᵀ / √d_head ──
+        //
+        // Per ogni posizione t già in cache
+        // calcoliamo il dot product di Qh con Kh[t].
+        // Dividiamo per √d_head per stabilità
+        // (evita che i dot product crescano troppo
+        //  con d_head grande, saturando il softmax)
+        float scale = 1.0f / sqrtf((float)d_head);
+
+        for (int t = 0; t <= pos; t++) {
+            // K per il token t, head h dalla cache
+            const float* Kh_t = cache.k[layer].data()
+                                + t * n_embd + h_off;
+
+            // Dot product Q·K
+            float dot = 0.0f;
+            for (int d = 0; d < d_head; d++)
+                dot += Qh[d] * Kh_t[d];
+
+            scores[t] = dot * scale;
+        }
+
+        // ── Softmax sugli scores ───────────────
+        //
+        // Trasforma i punteggi grezzi in pesi
+        // di attenzione che sommano a 1.
+        // La maschera causale è implicita:
+        // iteriamo solo su t <= pos quindi non
+        // vediamo mai token futuri.
+        softmax(scores.data(), pos + 1);
+
+        // ── Weighted sum dei V ─────────────────
+        //
+        // L'output di questo head è la somma
+        // pesata dei vettori V di tutti i token,
+        // dove i pesi sono gli attention scores.
+        float* out_h = attn_out.data() + h_off;
+
+        for (int t = 0; t <= pos; t++) {
+            const float* Vh_t = cache.v[layer].data()
+                                + t * n_embd + h_off;
+            for (int d = 0; d < d_head; d++)
+                out_h[d] += scores[t] * Vh_t[d];
+        }
+    }
+
+    // ── Step 4: proiezione output ──────────────
+    //
+    // Riproietta il risultato dell'attention
+    // nello spazio n_embd con una matrice lineare.
+    // attn_out_w: [n_embd × n_embd]
+    matvec(lw.attn_out_w.data(), attn_out.data(), out, n_embd, n_embd);
+    vec_add(out, lw.attn_out_b.data(), out, n_embd);
+}

@@ -79,5 +79,41 @@ int main(int argc, char* argv[]) {
     std::cout << "\n";
     std::cout << "✓ LayerNorm applicata correttamente\n";
 
+    // ── Test self-attention ──
+    std::cout << "\n── Test self-attention ──\n";
+
+    // Simula il primo step del forward pass:
+    // embedding lookup + layer norm + attention
+    std::vector<float> x(cfg.n_embd);
+    std::vector<float> ln_out(cfg.n_embd);
+    std::vector<float> attn_out(cfg.n_embd);
+
+    // Token "Hello" alla posizione 0
+    embedding_lookup(model.weights.token_embd.data(),
+                     model.weights.pos_embd.data(),
+                     15496, 0, x.data(), cfg.n_embd);
+
+    // Layer norm prima dell'attention
+    layer_norm(x.data(),
+               model.weights.layers[0].ln1_w.data(),
+               model.weights.layers[0].ln1_b.data(),
+               ln_out.data(), cfg.n_embd);
+
+    // Self-attention layer 0, posizione 0
+    self_attention(ln_out.data(), attn_out.data(),
+                   model.weights.layers[0],
+                   model.kv_cache,
+                   model.config, 0, 0);
+
+    std::cout << "  Primi 4 valori attention output: ";
+    for (int i = 0; i < 4; i++)
+        std::cout << std::fixed << std::setprecision(6)
+                  << attn_out[i] << " ";
+    std::cout << "\n";
+    std::cout << "  KV cache pos 0 salvata: "
+              << (model.kv_cache.k[0][0] != 0.0f ? "✓" : "✗")
+              << "\n";
+    std::cout << "✓ Self-attention completata\n";
+    
     return 0;
 }

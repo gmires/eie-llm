@@ -157,3 +157,14 @@ void layer_norm(const float* x, const float* w, const float* b, float* out, int 
 // out[i] = token_embd[token_id * n_embd + i]
 //        + pos_embd[pos * n_embd + i]
 void embedding_lookup(const float* token_embd, const float* pos_embd, int token_id, int pos, float* out, int n_embd);
+
+// Self-attention per un singolo token
+//
+// x       : input [n_embd] — già layer-normalizzato
+// out     : output [n_embd]
+// lw      : pesi del layer corrente
+// cache   : KV cache da aggiornare
+// cfg     : configurazione del modello
+// layer   : indice del layer (per la KV cache)
+// pos     : posizione del token corrente
+void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos);

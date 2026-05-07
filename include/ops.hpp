@@ -81,8 +81,7 @@ std::vector<float> tensor_to_float(const GGUFTensor& t);
 //  e corretta, non ottimizzata per performance.
 //  In un engine reale si userebbe BLAS/AVX.
 // ─────────────────────────────────────────────
-void matmul(const float* A, const float* B, float* C,
-            int m, int k, int n);
+void matmul(const float* A, const float* B, float* C, int m, int k, int n);
 
 // ─────────────────────────────────────────────
 //  Matrix-vector multiplication: y = A × x
@@ -95,8 +94,7 @@ void matmul(const float* A, const float* B, float* C,
 //  x: vettore [in_dim]
 //  y: vettore [out_dim]           (output)
 // ─────────────────────────────────────────────
-void matvec(const float* A, const float* x, float* y,
-            int out_dim, int in_dim);
+void matvec(const float* A, const float* x, float* y, int out_dim, int in_dim);
 
 // ─────────────────────────────────────────────
 //  Addizione vettore elemento per elemento
