@@ -1,0 +1,134 @@
+#pragma once
+#include <vector>
+#include <cstdint>
+#include <cmath>
+#include "gguf.hpp"
+
+// ─────────────────────────────────────────────
+//  Operazioni primitive sui tensori
+//
+//  Tutte le operazioni lavorano su float32
+//  in memoria contigua (row-major).
+//  Un tensore 2D [righe × colonne] è memorizzato
+//  come: [riga0col0, riga0col1, ..., riga1col0, ...]
+//
+//  Convenzione dimensioni GPT-2:
+//    n_embd  = 768   (dimensione embedding)
+//    n_head  = 12    (numero attention heads)
+//    n_ctx   = 1024  (context length massimo)
+//    n_vocab = 50257 (dimensione vocabolario)
+//    n_layer = 12    (numero di layer)
+//    d_head  = 64    (n_embd / n_head)
+// ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+//  Dequantizzazione Q8_0 → float32
+//
+//  Il formato Q8_0 comprime i pesi in questo modo:
+//  - I valori float32 originali vengono divisi in
+//    blocchi da 32 elementi
+//  - Per ogni blocco si calcola il valore massimo
+//    assoluto (scale = max_abs / 127.0)
+//  - Ogni valore viene quantizzato a int8:
+//    q = round(v / scale)  → range [-127, 127]
+//
+//  Struttura di ogni blocco (34 byte totali):
+//    [float16: scale][int8 × 32: valori quantizzati]
+//
+//  Dequantizzazione inversa:
+//    v = q * scale
+//
+//  Parametri:
+//    src     : buffer raw Q8_0 dal file GGUF
+//    dst     : buffer float32 di output (già allocato)
+//    n_elem  : numero totale di elementi
+// ─────────────────────────────────────────────
+void dequantize_q8_0(const uint8_t* src, float* dst, uint64_t n_elem);
+
+// ─────────────────────────────────────────────
+//  Conversione float16 → float32
+//
+//  GPT-2 usa float16 (half precision) per alcuni
+//  tensori. IEEE 754 float16:
+//    bit 15    : segno
+//    bit 14-10 : esponente (bias 15)
+//    bit 9-0   : mantissa
+//
+//  Convertiamo manualmente senza librerie esterne.
+// ─────────────────────────────────────────────
+float fp16_to_fp32(uint16_t h);
+
+// ─────────────────────────────────────────────
+//  Ottieni un tensore dequantizzato come float32
+//
+//  Funzione di convenienza che:
+//  1) Legge il tipo del tensore
+//  2) Applica la dequantizzazione corretta
+//  3) Ritorna un vettore float32 pronto all'uso
+//
+//  Supporta: F32 (copia diretta), Q8_0
+// ─────────────────────────────────────────────
+std::vector<float> tensor_to_float(const GGUFTensor& t);
+
+// ─────────────────────────────────────────────
+//  Matrix multiplication: C = A × B
+//
+//  A: matrice [m × k]  (row-major)
+//  B: matrice [k × n]  (row-major)
+//  C: matrice [m × n]  (row-major, output)
+//
+//  Implementazione naive O(m×k×n) — didattica
+//  e corretta, non ottimizzata per performance.
+//  In un engine reale si userebbe BLAS/AVX.
+// ─────────────────────────────────────────────
+void matmul(const float* A, const float* B, float* C,
+            int m, int k, int n);
+
+// ─────────────────────────────────────────────
+//  Matrix-vector multiplication: y = A × x
+//
+//  Caso speciale molto comune nel forward pass:
+//  moltiplichiamo una matrice di pesi per un
+//  singolo vettore (un token alla volta).
+//
+//  A: matrice [out_dim × in_dim]  (row-major)
+//  x: vettore [in_dim]
+//  y: vettore [out_dim]           (output)
+// ─────────────────────────────────────────────
+void matvec(const float* A, const float* x, float* y,
+            int out_dim, int in_dim);
+
+// ─────────────────────────────────────────────
+//  Addizione vettore elemento per elemento
+//  out[i] = a[i] + b[i]
+// ─────────────────────────────────────────────
+void vec_add(const float* a, const float* b, float* out, int n);
+
+// ─────────────────────────────────────────────
+//  Copia vettore
+//  dst[i] = src[i]
+// ─────────────────────────────────────────────
+void vec_copy(const float* src, float* dst, int n);
+
+// ─────────────────────────────────────────────
+//  Softmax in-place su un vettore
+//
+//  Formula numericamente stabile:
+//    1) sottrai il massimo (evita overflow)
+//    2) calcola exp()
+//    3) dividi per la somma (normalizza)
+//
+//  softmax(x)[i] = exp(x[i] - max) / Σexp(x[j] - max)
+// ─────────────────────────────────────────────
+void softmax(float* x, int n);
+
+// ─────────────────────────────────────────────
+//  GELU activation function
+//
+//  Usata da GPT-2 nel feed-forward network.
+//  Formula approssimata (usata da GPT-2):
+//    GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715x³)))
+//
+//  Modifica il vettore in-place.
+// ─────────────────────────────────────────────
+void gelu(float* x, int n);
