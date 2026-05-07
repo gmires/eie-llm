@@ -12,7 +12,7 @@ ideale per capire i meccanismi base prima di passare a modelli più grandi.
 ## Roadmap
 
 - [x] Fase 1 — Parser GGUF: header + metadata KV
-- [ ] Fase 2 — Lettura info tensori
+- [x] Fase 2 — Lettura info tensori
 - [ ] Fase 3 — Tokenizer BPE
 - [ ] Fase 4 — Forward pass GPT-2
 - [ ] Fase 5 — Shell interattiva
