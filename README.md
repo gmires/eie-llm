@@ -13,9 +13,9 @@ ideale per capire i meccanismi base prima di passare a modelli più grandi.
 
 - [x] Fase 1 — Parser GGUF: header + metadata KV
 - [x] Fase 2 — Lettura info tensori
-- [ ] Fase 3 — Tokenizer BPE
-- [ ] Fase 4 — Forward pass GPT-2
-- [ ] Fase 5 — Shell interattiva
+- [x] Fase 3 — Tokenizer BPE
+- [x] Fase 4 — Forward pass GPT-2
+- [x] Fase 5 — Shell interattiva
 - [ ] Fase 6 — Server HTTP minimale
 
 ## Requisiti

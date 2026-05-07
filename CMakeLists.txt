@@ -15,6 +15,7 @@ add_executable(eie-llm
   src/tokenizer.cpp
   src/ops.cpp
   src/model.cpp
+  src/shell.cpp
 )
 
 # Ora gli header stanno in include/ separati dai sorgenti
