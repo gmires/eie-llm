@@ -21,4 +21,5 @@ Thumbs.db
 *.a
 *.so
 
+# Compilati
 venv/

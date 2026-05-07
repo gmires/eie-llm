@@ -64,6 +64,47 @@ struct GGUFKV {
 };
 
 // ─────────────────────────────────────────────
+//  Tipi di dato dei tensori GGUF
+//  Definiscono come i pesi sono memorizzati:
+//  F32 = float pieno, F16 = mezza precisione,
+//  Q4/Q8 = quantizzati (meno bit = meno RAM)
+// ─────────────────────────────────────────────
+enum class GGMLType : uint32_t {
+    F32     = 0,
+    F16     = 1,
+    Q4_0    = 2,
+    Q4_1    = 3,
+    Q8_0    = 8,   // quello usato dal nostro GPT-2
+    Q8_1    = 9,
+    I8      = 24,
+    I16     = 25,
+    I32     = 26,
+};
+
+// ─────────────────────────────────────────────
+//  Numero massimo di dimensioni di un tensore
+//  In GGUF un tensore può avere al massimo
+//  4 dimensioni (es: [vocab, embd, 1, 1])
+// ─────────────────────────────────────────────
+static constexpr uint32_t GGML_MAX_DIMS = 4;
+
+// ─────────────────────────────────────────────
+//  Informazioni su un singolo tensore
+//
+//  ATTENZIONE: qui salviamo solo i METADATI
+//  del tensore, non i dati veri e propri.
+//  I pesi reali stanno nel file a partire
+//  da 'offset' — li caricheremo nella Fase 2
+// ─────────────────────────────────────────────
+struct GGUFTensorInfo {
+    std::string name;                      // es: "blk.0.attn_q.weight"
+    uint32_t    n_dims;                    // numero di dimensioni (1-4)
+    uint64_t    shape[GGML_MAX_DIMS];      // dimensioni es: [768, 768, 1, 1]
+    GGMLType    type;                      // tipo dato (F32, Q8_0, ecc.)
+    uint64_t    offset;                    // posizione dei dati nel file
+};
+
+// ─────────────────────────────────────────────
 //  Header del file GGUF
 //  Contiene le informazioni base lette
 //  dai primi byte del file
@@ -82,8 +123,9 @@ struct GGUFHeader {
 //  nelle fasi successive aggiungeremo i tensori
 // ─────────────────────────────────────────────
 struct GGUFContext {
-    GGUFHeader       header;
-    std::vector<GGUFKV> metadata;  // tutti i KV letti dal file
+    GGUFHeader                 header;
+    std::vector<GGUFKV>        metadata;
+    std::vector<GGUFTensorInfo> tensors;
 };
 
 // ─────────────────────────────────────────────
@@ -108,3 +150,18 @@ bool gguf_read_metadata(std::ifstream& f, GGUFContext& ctx);
 
 // Stampa tutto il contesto in modo leggibile — utile per debug
 void gguf_print_context(const GGUFContext& ctx);
+
+// Legge le info di tutti i tensori dal file
+// Deve essere chiamata DOPO gguf_read_metadata
+bool gguf_read_tensor_info(std::ifstream& f, GGUFContext& ctx);
+
+// Converte GGMLType in stringa leggibile — utile per debug
+const char* ggml_type_name(GGMLType type);
+
+// Calcola il numero totale di elementi di un tensore
+// moltiplicando tutte le sue dimensioni
+uint64_t gguf_tensor_n_elements(const GGUFTensorInfo& ti);
+
+// Calcola la dimensione in byte di un tensore
+// tenendo conto della quantizzazione
+uint64_t gguf_tensor_size_bytes(const GGUFTensorInfo& ti);

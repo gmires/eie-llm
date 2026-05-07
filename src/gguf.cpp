@@ -191,5 +191,146 @@ void gguf_print_context(const GGUFContext& ctx) {
 
         std::cout << "\n";
     }
+
+    // Stampa la tabella dei tensori
+    std::cout << "\n";
+    std::cout << "  TENSORI\n";
+    std::cout << "───────────────────────────────────────\n";
+    std::cout << std::left
+              << std::setw(45) << "  Nome"
+              << std::setw(6)  << "Tipo"
+              << std::setw(28) << "  Shape"
+              << "Bytes\n";
+    std::cout << "───────────────────────────────────────\n";
+
+    for (const auto& ti : ctx.tensors) {
+        // Costruisce la stringa shape es: [768 x 768]
+        std::string shape_str = "[";
+        for (uint32_t d = 0; d < ti.n_dims; d++) {
+            if (d > 0) shape_str += " x ";
+            shape_str += std::to_string(ti.shape[d]);
+        }
+        shape_str += "]";
+
+        std::cout << "  " << std::left
+                  << std::setw(43) << ti.name
+                  << std::setw(6)  << ggml_type_name(ti.type)
+                  << std::setw(28) << shape_str
+                  << gguf_tensor_size_bytes(ti) << " B\n";
+    }
+
     std::cout << "═══════════════════════════════════════\n\n";
+}
+
+// ─────────────────────────────────────────────
+//  Nome leggibile del tipo tensore
+//  Utile nei messaggi di debug e nel dump
+// ─────────────────────────────────────────────
+const char* ggml_type_name(GGMLType type) {
+    switch (type) {
+        case GGMLType::F32:  return "F32";
+        case GGMLType::F16:  return "F16";
+        case GGMLType::Q4_0: return "Q4_0";
+        case GGMLType::Q4_1: return "Q4_1";
+        case GGMLType::Q8_0: return "Q8_0";
+        case GGMLType::Q8_1: return "Q8_1";
+        case GGMLType::I8:   return "I8";
+        case GGMLType::I16:  return "I16";
+        case GGMLType::I32:  return "I32";
+        default:             return "???";
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Numero totale di elementi del tensore
+//
+//  Un tensore [768, 12, 1, 1] ha
+//  768 × 12 × 1 × 1 = 9216 elementi.
+//  Moltiplichiamo solo le dimensioni attive
+//  (le restanti valgono 1 per convenzione)
+// ─────────────────────────────────────────────
+uint64_t gguf_tensor_n_elements(const GGUFTensorInfo& ti) {
+    uint64_t n = 1;
+    for (uint32_t i = 0; i < ti.n_dims; i++)
+        n *= ti.shape[i];
+    return n;
+}
+
+// ─────────────────────────────────────────────
+//  Dimensione in byte del tensore
+//
+//  Per i tipi quantizzati il calcolo NON è
+//  semplicemente n_elementi × sizeof(tipo).
+//  I pesi sono raggruppati in "block" da 32
+//  elementi con un fattore di scala condiviso.
+//
+//  Q8_0: ogni block = 32 elementi × 1 byte
+//        + 1 float16 (scale) = 34 byte
+//  F32:  ogni elemento = 4 byte (semplice)
+//  F16:  ogni elemento = 2 byte (semplice)
+// ─────────────────────────────────────────────
+uint64_t gguf_tensor_size_bytes(const GGUFTensorInfo& ti) {
+    uint64_t n = gguf_tensor_n_elements(ti);
+    switch (ti.type) {
+        case GGMLType::F32:  return n * 4;
+        case GGMLType::F16:  return n * 2;
+        case GGMLType::Q8_0: return (n / 32) * 34;  // 32 valori + 2 byte scale
+        case GGMLType::Q4_0: return (n / 32) * 18;  // 32 valori a 4bit + 2 byte scale
+        case GGMLType::Q4_1: return (n / 32) * 20;  // come Q4_0 + min value
+        default:             return n * 4;           // fallback a F32
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Lettura delle info di tutti i tensori
+//
+//  Segue immediatamente la sezione metadata.
+//  Per ogni tensore il formato GGUF è:
+//    [stringa:  nome]
+//    [uint32:   numero di dimensioni]
+//    [uint64 × n_dims: shape]
+//    [uint32:   tipo GGMLType]
+//    [uint64:   offset dall'inizio della data section]
+//
+//  NOTA: l'offset è relativo all'inizio della
+//  "data section" del file, non all'inizio del file.
+//  La data section inizia dopo header + metadata +
+//  tensor info, allineata a 32 byte.
+// ─────────────────────────────────────────────
+bool gguf_read_tensor_info(std::ifstream& f, GGUFContext& ctx) {
+    ctx.tensors.reserve(ctx.header.n_tensors);
+
+    for (uint64_t i = 0; i < ctx.header.n_tensors; i++) {
+        GGUFTensorInfo ti;
+
+        // Inizializza shape a 1 (dimensioni non usate = 1 per convenzione)
+        for (auto& s : ti.shape) s = 1;
+
+        // 1) Nome del tensore
+        ti.name = gguf_read_string(f);
+
+        // 2) Numero di dimensioni
+        f.read(reinterpret_cast<char*>(&ti.n_dims), sizeof(ti.n_dims));
+
+        // 3) Shape: leggi solo le n_dims dimensioni presenti nel file
+        for (uint32_t d = 0; d < ti.n_dims; d++)
+            f.read(reinterpret_cast<char*>(&ti.shape[d]), sizeof(ti.shape[d]));
+
+        // 4) Tipo dato del tensore
+        uint32_t type_raw = 0;
+        f.read(reinterpret_cast<char*>(&type_raw), sizeof(type_raw));
+        ti.type = static_cast<GGMLType>(type_raw);
+
+        // 5) Offset nella data section
+        f.read(reinterpret_cast<char*>(&ti.offset), sizeof(ti.offset));
+
+        ctx.tensors.push_back(std::move(ti));
+
+        if (!f.good()) {
+            std::cerr << "[ERRORE] File corrotto al tensore #" << i
+                      << " (nome: " << ti.name << ")\n";
+            return false;
+        }
+    }
+    return true;
 }

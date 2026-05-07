@@ -23,6 +23,10 @@ int main(int argc, char* argv[]) {
     if (!gguf_read_metadata(f, ctx)) return 1;
     std::cout << "✓ Metadata letti correttamente\n";
 
+    // ── Fase 3: leggi le info dei tensori ──
+    if (!gguf_read_tensor_info(f, ctx)) return 1;
+    std::cout << "✓ Info tensori lette correttamente\n";
+    
     // ── Stampa tutto per verifica ──
     gguf_print_context(ctx);
 
