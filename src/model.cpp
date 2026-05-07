@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 
 // ─────────────────────────────────────────────
 //  Helper: leggi uint32 dai metadata
@@ -365,4 +366,198 @@ void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache&
     // attn_out_w: [n_embd × n_embd]
     matvec(lw.attn_out_w.data(), attn_out.data(), out, n_embd, n_embd);
     vec_add(out, lw.attn_out_b.data(), out, n_embd);
+}
+
+// ─────────────────────────────────────────────
+//  Feed-Forward Network (FFN)
+//
+//  GPT-2 usa un FFN a 2 strati con GELU:
+//
+//  1) Proiezione up: n_embd → n_ff (=3072)
+//     h = x · fc1_w^T + fc1_b
+//
+//  2) Attivazione non lineare
+//     h = GELU(h)
+//
+//  3) Proiezione down: n_ff → n_embd
+//     out = h · fc2_w^T + fc2_b
+//
+//  La dimensione intermedia n_ff = 4 × n_embd
+//  è una scelta architetturale di GPT-2.
+//  Espandere e poi ricomprimere permette alla
+//  rete di fare computazioni più complesse.
+// ─────────────────────────────────────────────
+void feed_forward(const float* x, float* out,
+                  const LayerWeights& lw,
+                  const ModelConfig& cfg) {
+    const int n_embd = cfg.n_embd;
+    const int n_ff   = cfg.n_ff;
+
+    // Buffer intermedio per la proiezione up
+    std::vector<float> h(n_ff);
+
+    // Step 1: proiezione up x → h [n_embd → n_ff]
+    matvec(lw.ffn_fc1_w.data(), x, h.data(), n_ff, n_embd);
+    vec_add(h.data(), lw.ffn_fc1_b.data(), h.data(), n_ff);
+
+    // Step 2: attivazione GELU in-place
+    gelu(h.data(), n_ff);
+
+    // Step 3: proiezione down h → out [n_ff → n_embd]
+    matvec(lw.ffn_fc2_w.data(), h.data(), out, n_embd, n_ff);
+    vec_add(out, lw.ffn_fc2_b.data(), out, n_embd);
+}
+
+// ─────────────────────────────────────────────
+//  Forward pass completo
+//
+//  Per ogni layer il flusso è:
+//
+//  x_in
+//   │
+//   ├─ residual = x_in                  (salva per dopo)
+//   │
+//   ├─ x = LayerNorm1(x_in)
+//   ├─ x = SelfAttention(x)
+//   ├─ x = x + residual                 (residual connection 1)
+//   │
+//   ├─ residual = x                     (salva per dopo)
+//   ├─ x = LayerNorm2(x)
+//   ├─ x = FFN(x)
+//   └─ x = x + residual                 (residual connection 2)
+//
+//  Le residual connections sono fondamentali:
+//  permettono al gradiente di fluire direttamente
+//  attraverso i layer durante il training,
+//  rendendo possibile addestrare reti molto profonde.
+//  Durante l'inferenza stabilizzano il segnale.
+//
+//  Dopo tutti i layer:
+//    x = LayerNorm_finale(x)
+//    logits = x · token_embd^T   (lm_head)
+//
+//  Nota: GPT-2 usa weight tying — la matrice
+//  lm_head è la STESSA di token_embd trasposta.
+//  Questo riduce i parametri e migliora la qualità.
+// ─────────────────────────────────────────────
+void forward(Model& model, int token_id, int pos, std::vector<float>& logits) {
+
+    const ModelConfig& cfg = model.config;
+    const ModelWeights& w  = model.weights;
+    const int n_embd        = cfg.n_embd;
+
+    // Buffer principale — contiene lo stato
+    // del token mentre attraversa i layer
+    std::vector<float> x(n_embd);
+
+    // Buffer temporanei riusati ad ogni layer
+    std::vector<float> residual(n_embd);
+    std::vector<float> ln_out(n_embd);
+    std::vector<float> attn_out(n_embd);
+    std::vector<float> ffn_out(n_embd);
+
+    // ── Step 1: embedding lookup ──────────────
+    // Combina token embedding e positional embedding
+    embedding_lookup(w.token_embd.data(),
+                     w.pos_embd.data(),
+                     token_id, pos,
+                     x.data(), n_embd);
+
+    // ── Step 2: loop sui layer ─────────────────
+    for (int l = 0; l < cfg.n_layer; l++) {
+        const LayerWeights& lw = w.layers[l];
+
+        // Salva il residual prima dell'attention
+        vec_copy(x.data(), residual.data(), n_embd);
+
+        // LayerNorm 1 → Attention
+        layer_norm(x.data(), lw.ln1_w.data(),
+                   lw.ln1_b.data(), ln_out.data(), n_embd);
+        self_attention(ln_out.data(), attn_out.data(),
+                       lw, model.kv_cache, cfg, l, pos);
+
+        // Residual connection 1: x = attn_out + x_prima
+        vec_add(attn_out.data(), residual.data(),
+                x.data(), n_embd);
+
+        // Salva il residual prima del FFN
+        vec_copy(x.data(), residual.data(), n_embd);
+
+        // LayerNorm 2 → FFN
+        layer_norm(x.data(), lw.ln2_w.data(),
+                   lw.ln2_b.data(), ln_out.data(), n_embd);
+        feed_forward(ln_out.data(), ffn_out.data(), lw, cfg);
+
+        // Residual connection 2: x = ffn_out + x_prima
+        vec_add(ffn_out.data(), residual.data(),
+                x.data(), n_embd);
+    }
+
+    // ── Step 3: LayerNorm finale ──────────────
+    std::vector<float> ln_final(n_embd);
+    layer_norm(x.data(), w.ln_f_w.data(),
+               w.ln_f_b.data(), ln_final.data(), n_embd);
+
+    // ── Step 4: lm_head → logits ──────────────
+    //
+    // GPT-2 usa weight tying: la matrice lm_head
+    // è la trasposta di token_embd.
+    // Per ogni token del vocabolario calcoliamo
+    // il dot product con il vettore finale:
+    //   logits[v] = ln_final · token_embd[v]
+    //
+    // La riga v di token_embd è già il vettore
+    // embedding del token v — il dot product
+    // misura quanto il nostro stato è "simile"
+    // all'embedding del token v.
+    logits.resize(cfg.n_vocab);
+    matvec(w.token_embd.data(), ln_final.data(),
+           logits.data(), cfg.n_vocab, n_embd);
+}
+
+// ─────────────────────────────────────────────
+//  Sampling greedy (argmax)
+//
+//  Sceglie sempre il token con logit massimo.
+//  Deterministico ma tende a produrre testo
+//  ripetitivo e poco creativo.
+// ─────────────────────────────────────────────
+int sample_argmax(const std::vector<float>& logits) {
+    return static_cast<int>(
+        std::max_element(logits.begin(), logits.end())
+        - logits.begin()
+    );
+}
+
+// ─────────────────────────────────────────────
+//  Sampling con temperatura
+//
+//  1) Dividi i logits per la temperatura
+//     temperature > 1 → appiattisce la distribuzione
+//     temperature < 1 → la concentra sul massimo
+//  2) Applica softmax per ottenere probabilità
+//  3) Campiona dalla distribuzione risultante
+//
+//  Usiamo il metodo della CDF inversa:
+//  generiamo un numero random r in [0,1]
+//  e troviamo il primo token t tale che
+//  la somma cumulativa delle probabilità >= r
+// ─────────────────────────────────────────────
+int sample_temperature(std::vector<float> logits, float temperature) {
+    // Dividi per la temperatura
+    for (auto& l : logits)
+        l /= temperature;
+
+    // Softmax → probabilità
+    softmax(logits.data(), static_cast<int>(logits.size()));
+
+    // Campiona dalla distribuzione
+    float r = static_cast<float>(rand()) / RAND_MAX;
+    float cumsum = 0.0f;
+    for (int i = 0; i < (int)logits.size(); i++) {
+        cumsum += logits[i];
+        if (cumsum >= r) return i;
+    }
+    // Fallback — non dovrebbe mai succedere
+    return static_cast<int>(logits.size()) - 1;
 }

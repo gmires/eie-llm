@@ -168,3 +168,37 @@ void embedding_lookup(const float* token_embd, const float* pos_embd, int token_
 // layer   : indice del layer (per la KV cache)
 // pos     : posizione del token corrente
 void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos);
+
+// Feed-Forward Network
+//
+// Applica il blocco FFN di GPT-2:
+//   h  = GELU(x · fc1_w + fc1_b)   [n_embd → n_ff]
+//   out = h · fc2_w + fc2_b         [n_ff → n_embd]
+//
+// x   : input  [n_embd]
+// out : output [n_embd]
+// lw  : pesi del layer corrente
+// cfg : configurazione del modello
+void feed_forward(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg);
+
+// Forward pass completo per un singolo token
+//
+// Esegue tutti i 12 layer del transformer
+// e ritorna i logits sul vocabolario.
+// Aggiorna la KV cache internamente.
+//
+// token_id : ID del token corrente
+// pos      : posizione nella sequenza
+// logits   : output [n_vocab] — probabilità grezze
+void forward(Model& model, int token_id, int pos, std::vector<float>& logits);
+
+// Sampling greedy — sceglie il token con
+// probabilità massima (argmax sui logits)
+int sample_argmax(const std::vector<float>& logits);
+
+// Sampling con temperatura
+//
+// temperature > 1 → distribuzione più uniforme (più creativo)
+// temperature < 1 → distribuzione più concentrata (più deterministico)
+// temperature = 1 → sampling dalla distribuzione originale
+int sample_temperature(std::vector<float> logits, float temperature);

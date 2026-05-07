@@ -1,6 +1,8 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <cstdlib>
+#include <ctime>
 #include "gguf.hpp"
 #include "tokenizer.hpp"
 #include "ops.hpp"
@@ -8,9 +10,13 @@
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Uso: eie-llm <model.gguf>\n";
+        std::cerr << "Uso: eie-llm <model.gguf> [prompt] [n_tokens]\n";
         return 1;
     }
+
+    // Argomenti opzionali
+    std::string prompt   = argc >= 3 ? argv[2] : "Hello, I am a language model";
+    int         n_tokens = argc >= 4 ? std::atoi(argv[3]) : 20;
 
     std::ifstream f(argv[1], std::ios::binary);
     if (!f) {
@@ -18,102 +24,86 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // ── Caricamento ───────────────────────────
     GGUFContext ctx;
     if (!gguf_read_header(f, ctx.header))      return 1;
-    std::cout << "✓ Header letto\n";
     if (!gguf_read_metadata(f, ctx))            return 1;
-    std::cout << "✓ Metadata letti\n";
     if (!gguf_read_tensor_info(f, ctx))         return 1;
-    std::cout << "✓ Info tensori lette\n";
     if (!gguf_load_tensors(f, ctx))             return 1;
-    std::cout << "✓ Pesi caricati in RAM\n";
+    std::cout << "✓ Modello caricato\n";
 
     Tokenizer tok;
     if (!tokenizer_init(tok, ctx))              return 1;
-    std::cout << "✓ Tokenizer inizializzato\n";
+    std::cout << "✓ Tokenizer pronto\n";
 
-    // ── Carica il modello ──
     Model model;
     if (!model_load_config(model.config, ctx))  return 1;
-    model_print_config(model.config);
-
     if (!model_load_weights(model, ctx))        return 1;
-    std::cout << "✓ Pesi modello caricati\n";
-
     model_init_kvcache(model);
-    std::cout << "✓ KV cache inizializzata\n";
+    std::cout << "✓ Modello pronto\n\n";
 
-    // ── Test embedding lookup ──
-    std::cout << "\n── Test embedding lookup ──\n";
-    const ModelConfig& cfg = model.config;
-    std::vector<float> embd(cfg.n_embd);
+    // ── Tokenizza il prompt ───────────────────
+    auto input_ids = tokenizer_encode(tok, prompt);
+    std::cout << "Prompt : \"" << prompt << "\"\n";
+    std::cout << "Tokens : " << input_ids.size() << "\n\n";
 
-    // Token ID 15496 = "Hello" in GPT-2
-    int test_token = 15496;
-    int test_pos   = 0;
-    embedding_lookup(model.weights.token_embd.data(),
-                     model.weights.pos_embd.data(),
-                     test_token, test_pos,
-                     embd.data(), cfg.n_embd);
+    // ── Generazione ───────────────────────────
+    //
+    // Il loop di generazione funziona in 2 fasi:
+    //
+    // FASE 1 — Prefill (processa il prompt)
+    //   Passiamo tutti i token del prompt al modello
+    //   uno per uno per riempire la KV cache.
+    //   Solo i logits dell'ultimo token ci interessano.
+    //
+    // FASE 2 — Generazione (token per token)
+    //   Ad ogni step:
+    //   1) Forward pass con il token corrente
+    //   2) Campiona il token successivo dai logits
+    //   3) Decodifica e stampa il token
+    //   4) Usa il token campionato come input
+    //      del prossimo step
 
-    std::cout << "  Token " << test_token
-              << " @ pos " << test_pos << "\n";
-    std::cout << "  Primi 4 valori embedding: ";
-    for (int i = 0; i < 4; i++)
-        std::cout << std::fixed << std::setprecision(6)
-                  << embd[i] << " ";
-    std::cout << "\n";
+    srand(static_cast<unsigned>(time(nullptr)));
 
-    // ── Test layer norm ──
-    std::cout << "\n── Test layer norm ──\n";
-    std::vector<float> norm_out(cfg.n_embd);
-    layer_norm(embd.data(),
-               model.weights.layers[0].ln1_w.data(),
-               model.weights.layers[0].ln1_b.data(),
-               norm_out.data(), cfg.n_embd);
+    std::vector<float> logits;
+    std::cout << "Output : \"" << prompt;
+    std::cout.flush();
 
-    std::cout << "  Primi 4 valori dopo LN: ";
-    for (int i = 0; i < 4; i++)
-        std::cout << std::fixed << std::setprecision(6)
-                  << norm_out[i] << " ";
-    std::cout << "\n";
-    std::cout << "✓ LayerNorm applicata correttamente\n";
+    // Fase 1: prefill del prompt
+    int pos = 0;
+    for (int id : input_ids) {
+        forward(model, id, pos, logits);
+        pos++;
+    }
+    // Aggiorna la cache
+    model.kv_cache.n_cached = pos;
 
-    // ── Test self-attention ──
-    std::cout << "\n── Test self-attention ──\n";
+    // Fase 2: generazione
+    int next_token = sample_argmax(logits);
 
-    // Simula il primo step del forward pass:
-    // embedding lookup + layer norm + attention
-    std::vector<float> x(cfg.n_embd);
-    std::vector<float> ln_out(cfg.n_embd);
-    std::vector<float> attn_out(cfg.n_embd);
+    for (int i = 0; i < n_tokens; i++) {
+        // Decodifica e stampa il token appena generato
+        std::string token_str = tokenizer_decode(tok, {next_token});
+        std::cout << token_str;
+        std::cout.flush();
 
-    // Token "Hello" alla posizione 0
-    embedding_lookup(model.weights.token_embd.data(),
-                     model.weights.pos_embd.data(),
-                     15496, 0, x.data(), cfg.n_embd);
+        // Stop se generiamo il token di fine testo
+        // In GPT-2 il token EOS ha ID 50256
+        if (next_token == 50256) break;
 
-    // Layer norm prima dell'attention
-    layer_norm(x.data(),
-               model.weights.layers[0].ln1_w.data(),
-               model.weights.layers[0].ln1_b.data(),
-               ln_out.data(), cfg.n_embd);
+        // Forward pass con il token appena generato
+        forward(model, next_token, pos, logits);
+        pos++;
 
-    // Self-attention layer 0, posizione 0
-    self_attention(ln_out.data(), attn_out.data(),
-                   model.weights.layers[0],
-                   model.kv_cache,
-                   model.config, 0, 0);
+        // Campiona il prossimo token
+        // Puoi cambiare con sample_temperature(logits, 0.8f)
+        // per output più vari
+        next_token = sample_argmax(logits);
+    }
 
-    std::cout << "  Primi 4 valori attention output: ";
-    for (int i = 0; i < 4; i++)
-        std::cout << std::fixed << std::setprecision(6)
-                  << attn_out[i] << " ";
-    std::cout << "\n";
-    std::cout << "  KV cache pos 0 salvata: "
-              << (model.kv_cache.k[0][0] != 0.0f ? "✓" : "✗")
-              << "\n";
-    std::cout << "✓ Self-attention completata\n";
-    
+    std::cout << "\"\n\n";
+    std::cout << "✓ Generazione completata (" << n_tokens << " token)\n";
+
     return 0;
 }
