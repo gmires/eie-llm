@@ -183,6 +183,8 @@ eie-llm/
 │   ├── main.cpp        — punto di ingresso, sceglie shell/server/bench
 │   ├── gguf.cpp        — legge il file .gguf (header, metadata, tensori)
 │   ├── ops.cpp         — operazioni matematiche (matmul, softmax, RoPE…)
+│   ├── ops_avx2.cpp    — kernel matvec ottimizzati AVX2+FMA (opzionale)
+│   ├── cpuinfo.cpp     — rilevamento runtime delle capability SIMD
 │   ├── tokenizer.cpp   — converte testo ↔ ID numerici
 │   ├── model.cpp       — forward pass (calcola i logits da un token)
 │   ├── shell.cpp       — shell interattiva
@@ -313,15 +315,55 @@ Per ogni token generato, TinyLlama esegue circa **970 milioni di multiply-accumu
 | ffn gate + up + down (×22 layer) | ~760M |
 | **Totale** | **~970M** |
 
-Con il `matvec` scalare attuale (~1 GFLOPS) → circa **1 secondo/token**.
+Con il `matvec` scalare (~1 GFLOPS) → circa **1 secondo/token**.
+Con il kernel AVX2 attivo, il throughput sale significativamente grazie all'elaborazione SIMD a 256 bit.
 
-**Miglioramenti possibili, dal più semplice al più complesso:**
+**Stato delle ottimizzazioni:**
 
-| Intervento | Come | Guadagno atteso |
+| Intervento | Stato | Guadagno |
 |---|---|---|
-| Build Release + `-march=native` | `cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=native"` | 2-4x (SIMD automatico) |
-| OpenMP su `matvec_quant` | `#pragma omp parallel for` sul loop esterno + `-fopenmp` | Nx (N = core) |
-| AVX2 esplicito | Intrinsics `_mm256_*` nei kernel Q4\_K/Q6\_K | 6-8x |
+| Build Release (`-O3`) | ✅ Attivo | 2-4× (inlining, SIMD automatico) |
+| AVX2/FMA esplicito | ✅ Attivo (tutti i formati) | 4-8× sul matvec |
+| OpenMP su `matvec_quant` | 🚧 Non implementato | N× (N = core fisici) |
+
+---
+
+## Ottimizzazioni SIMD — come funzionano
+
+### Perché non `-march=native` su tutto?
+
+Se compilassimo l'intero progetto con `-march=native`, il compilatore inserirebbe istruzioni AVX2 ovunque: in `main()`, in `gguf.cpp`, persino nei costruttori di `std::vector`. Questo renderebbe il binario **incompatibile con CPU senza AVX2** (crash all'avvio).
+
+La soluzione usata qui è il **dispatcher runtime**:
+
+1. **`cpuinfo.cpp`** interroga la CPU via `CPUID` per sapere se AVX2, FMA e F16C sono presenti. Verifica anche che l'OS abbia abilitato lo stato YMM (registro `XCR0`), altrimenti le istruzioni AVX causerebbero un `SIGILL`.
+
+2. **`ops_avx2.cpp`** è compilato **solo** con `-mavx2 -mfma` (tramite `set_source_files_properties` in CMake). Tutte le funzioni qui dentro usano intrinsics esplicite (`_mm256_fmadd_ps`, `_mm256_cvtph_ps`, ecc.).
+
+3. **`ops.cpp`** contiene le versioni scalari di riferimento. All'inizio di ogni kernel (`matvec`, `matvec_f16`, `matvec_q8_0`, `matvec_q4k`, `matvec_q6k`) c'è un dispatcher:
+
+```cpp
+static CPUFeatures f = cpu_features();
+if (f.avx2 && f.fma) {
+    matvec_xxx_avx2(A, x, y, out_dim, in_dim);
+    return;
+}
+// ... fallback scalare
+```
+
+Il `static` garantisce che il rilevamento avvenga una sola volta, alla prima chiamata. Se la CPU non ha AVX2, il programma continua tranquillamente con i loop scalari.
+
+### Kernel AVX2 implementati
+
+| Formato | Tecnica SIMD | Note |
+|---|---|---|
+| **F32** | `_mm256_loadu_ps` + `_mm256_fmadd_ps` | 8 float per ciclo, riduzione orizzontale finale |
+| **F16** | `_mm256_cvtph_ps` (F16C) + FMADD | Converte 8 half → float in un'istruzione |
+| **Q8_0** | `_mm256_cvtepi8_epi32` + broadcast scale | Scompatta 32 int8 in 4× __m256 float |
+| **Q4_K** | Dequant + FMADD su buffer allineato | Dequantizza sub-block 32 elem, poi 4 FMADD |
+| **Q6_K** | Dequant + FMADD su buffer allineato | Stessa strategia di Q4_K, buffer 64 float |
+
+La strategia "dequantizza-then-dot" per Q4_K e Q6_K è un compromesso tra velocità e complessità: invece di fare masking e shift bit-a-bit in-SIMD (complessissimo per i nibble), dequantizziamo ogni sub-block in un `float[32]` temporaneo sullo stack, poi usiamo gli stessi FMADD del caso F32. Questo elimina il loop scalare interno di 32 iterazioni, che era il vero collo di bottiglia.
 
 ---
 
@@ -341,8 +383,9 @@ Con il `matvec` scalare attuale (~1 GFLOPS) → circa **1 secondo/token**.
 - [x] Fase 12 — Chat template (shell + server HTTP)
 - [x] Fase 13 — Buffer di inferenza pre-allocati (eliminazione malloc nel hot path)
 - [x] Fase 14 — Dequantizzazione lazy: `QuantTensor` + kernel `matvec_quant` (−3.5 GB RAM, F32/F16/Q8\_0/Q4\_K/Q6\_K)
-- [ ] Fase 15 — Ottimizzazioni matmul (AVX2/NEON, OpenMP)
-- [ ] Fase 16 — Streaming HTTP (Server-Sent Events, token per token)
+- [x] Fase 15 — Ottimizzazioni matvec AVX2+FMA con dispatcher runtime (tutti i formati quantizzati)
+- [ ] Fase 16 — OpenMP sul loop esterno dei matvec
+- [ ] Fase 17 — Streaming HTTP (Server-Sent Events, token per token)
 
 ---
 

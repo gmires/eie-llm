@@ -1,4 +1,6 @@
 #include "ops.hpp"
+#include "cpuinfo.hpp"
+#include "ops_avx2.hpp"
 #include <cstring>
 #include <algorithm>
 #include <cassert>
@@ -324,8 +326,18 @@ std::vector<float> tensor_to_float(const GGUFTensor& t) {
 //    decodifica nibbles + scale/min e accumula
 //    il prodotto scalare con la finestra di x
 //    corrispondente — senza materializzare float.
+//
+//  Dispatcher SIMD: se la CPU supporta AVX2+FMA,
+//  delega a matvec_q4k_avx2 in ops_avx2.cpp.
+//  Il rilevamento avviene una sola volta via
+//  CPUFeatures cached in una static locale.
 // ─────────────────────────────────────────────
 void matvec_q4k(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    static CPUFeatures f = cpu_features();
+    if (f.avx2 && f.fma) {
+        matvec_q4k_avx2(A, x, y, out_dim, in_dim);
+        return;
+    }
     static constexpr int SUPER_BLOCK = 256;
     static constexpr int SUPER_BYTES = 144;
     static constexpr int N_SUB       = 8;
@@ -384,8 +396,16 @@ void matvec_q4k(const uint8_t* A, const float* x, float* y, int out_dim, int in_
 
 // ─────────────────────────────────────────────
 //  matvec_q6k — y = A × x, A quantizzata Q6_K
+//
+//  Dispatcher SIMD: se AVX2+FMA sono disponibili,
+//  delega al kernel AVX2 in ops_avx2.cpp.
 // ─────────────────────────────────────────────
 void matvec_q6k(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    static CPUFeatures f = cpu_features();
+    if (f.avx2 && f.fma) {
+        matvec_q6k_avx2(A, x, y, out_dim, in_dim);
+        return;
+    }
     static constexpr int SUPER_BLOCK = 256;
     static constexpr int SUPER_BYTES = 210;
 
@@ -434,8 +454,16 @@ void matvec_q6k(const uint8_t* A, const float* x, float* y, int out_dim, int in_
 
 // ─────────────────────────────────────────────
 //  matvec_q8_0 — y = A × x, A quantizzata Q8_0
+//
+//  Dispatcher SIMD: se AVX2+FMA sono disponibili,
+//  delega al kernel AVX2 in ops_avx2.cpp.
 // ─────────────────────────────────────────────
 void matvec_q8_0(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    static CPUFeatures f = cpu_features();
+    if (f.avx2 && f.fma) {
+        matvec_q8_0_avx2(A, x, y, out_dim, in_dim);
+        return;
+    }
     static constexpr int BLOCK_SIZE  = 32;
     static constexpr int BLOCK_BYTES = 34;
 
@@ -464,9 +492,17 @@ void matvec_q8_0(const uint8_t* A, const float* x, float* y, int out_dim, int in
 
 // ─────────────────────────────────────────────
 //  matvec_f16 — y = A × x, A in float16
-//  Converte ogni elemento inline durante il dot
+//  Converte ogni elemento inline durante il dot.
+//
+//  Dispatcher SIMD: se AVX2+FMA+F16C sono disponibili,
+//  delega al kernel AVX2 che usa _mm256_cvtph_ps.
 // ─────────────────────────────────────────────
 void matvec_f16(const uint16_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    static CPUFeatures f = cpu_features();
+    if (f.avx2 && f.fma && f.f16c) {
+        matvec_f16_avx2(A, x, y, out_dim, in_dim);
+        return;
+    }
     for (int i = 0; i < out_dim; i++) {
         const uint16_t* row = A + i * in_dim;
         float sum = 0.0f;
@@ -592,9 +628,17 @@ void matmul(const float* A, const float* B, float* C,
 //
 //  Caso molto frequente nel transformer:
 //  proiezioni Q/K/V, FFN, lm_head
+//
+//  Dispatcher SIMD: se AVX2+FMA sono disponibili,
+//  delega a matvec_avx2 in ops_avx2.cpp.
 // ─────────────────────────────────────────────
 void matvec(const float* A, const float* x, float* y,
             int out_dim, int in_dim) {
+    static CPUFeatures f = cpu_features();
+    if (f.avx2 && f.fma) {
+        matvec_avx2(A, x, y, out_dim, in_dim);
+        return;
+    }
     for (int i = 0; i < out_dim; i++) {
         float sum = 0.0f;
         const float* row = A + i * in_dim;
