@@ -435,77 +435,82 @@ void feed_forward(const float* x, float* out,
 //  lm_head è la STESSA di token_embd trasposta.
 //  Questo riduce i parametri e migliora la qualità.
 // ─────────────────────────────────────────────
-void forward(Model& model, int token_id, int pos, std::vector<float>& logits) {
+void forward(Model& model,
+             int token_id, int pos,
+             std::vector<float>& logits,
+             bool bench_mode) {
 
     const ModelConfig& cfg = model.config;
     const ModelWeights& w  = model.weights;
     const int n_embd        = cfg.n_embd;
 
-    // Buffer principale — contiene lo stato
-    // del token mentre attraversa i layer
     std::vector<float> x(n_embd);
-
-    // Buffer temporanei riusati ad ogni layer
     std::vector<float> residual(n_embd);
     std::vector<float> ln_out(n_embd);
     std::vector<float> attn_out(n_embd);
     std::vector<float> ffn_out(n_embd);
 
-    // ── Step 1: embedding lookup ──────────────
-    // Combina token embedding e positional embedding
-    embedding_lookup(w.token_embd.data(), w.pos_embd.data(), token_id, pos, x.data(), n_embd);
+    // ── Embedding ─────────────────────────────
+    auto t0 = now();
+    embedding_lookup(w.token_embd.data(),
+                     w.pos_embd.data(),
+                     token_id, pos,
+                     x.data(), n_embd);
+    auto t1 = now();
 
-    // ── Step 2: loop sui layer ─────────────────
+    // ── Loop layer ────────────────────────────
+    double attn_ms_step = 0.0;
+    double ffn_ms_step  = 0.0;
+
     for (int l = 0; l < cfg.n_layer; l++) {
         const LayerWeights& lw = w.layers[l];
 
-        // Salva il residual prima dell'attention
         vec_copy(x.data(), residual.data(), n_embd);
 
-        // LayerNorm 1 → Attention
+        // Attention
+        auto ta0 = now();
         layer_norm(x.data(), lw.ln1_w.data(),
                    lw.ln1_b.data(), ln_out.data(), n_embd);
         self_attention(ln_out.data(), attn_out.data(),
                        lw, model.kv_cache, cfg, l, pos);
-
-        // Residual connection 1: x = attn_out + x_prima
         vec_add(attn_out.data(), residual.data(),
                 x.data(), n_embd);
+        auto ta1 = now();
 
-        // Salva il residual prima del FFN
         vec_copy(x.data(), residual.data(), n_embd);
 
-        // LayerNorm 2 → FFN
+        // FFN
+        auto tf0 = now();
         layer_norm(x.data(), lw.ln2_w.data(),
                    lw.ln2_b.data(), ln_out.data(), n_embd);
         feed_forward(ln_out.data(), ffn_out.data(), lw, cfg);
-
-        // Residual connection 2: x = ffn_out + x_prima
         vec_add(ffn_out.data(), residual.data(),
                 x.data(), n_embd);
+        auto tf1 = now();
+
+        attn_ms_step += ms_between(ta0, ta1);
+        ffn_ms_step  += ms_between(tf0, tf1);
     }
 
-    // ── Step 3: LayerNorm finale ──────────────
+    // ── LayerNorm finale + lm_head ────────────
     std::vector<float> ln_final(n_embd);
     layer_norm(x.data(), w.ln_f_w.data(),
                w.ln_f_b.data(), ln_final.data(), n_embd);
 
-    // ── Step 4: lm_head → logits ──────────────
-    //
-    // GPT-2 usa weight tying: la matrice lm_head
-    // è la trasposta di token_embd.
-    // Per ogni token del vocabolario calcoliamo
-    // il dot product con il vettore finale:
-    //   logits[v] = ln_final · token_embd[v]
-    //
-    // La riga v di token_embd è già il vettore
-    // embedding del token v — il dot product
-    // misura quanto il nostro stato è "simile"
-    // all'embedding del token v.
     logits.resize(cfg.n_vocab);
-    matvec(w.token_embd.data(), ln_final.data(), logits.data(), cfg.n_vocab, n_embd);
-}
+    matvec(w.token_embd.data(), ln_final.data(),
+           logits.data(), cfg.n_vocab, n_embd);
 
+    auto t2 = now();
+
+    // ── Accumula tempi se in modalità bench ───
+    if (bench_mode) {
+        model.bench.embed_ms  += ms_between(t0, t1);
+        model.bench.attn_ms   += attn_ms_step;
+        model.bench.ffn_ms    += ffn_ms_step;
+        model.bench.n_steps++;
+    }
+}
 // ─────────────────────────────────────────────
 //  Sampling greedy (argmax)
 //

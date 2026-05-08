@@ -3,6 +3,7 @@
 #include <string>
 #include "gguf.hpp"
 #include "ops.hpp"
+#include "bench.hpp"
 
 // ─────────────────────────────────────────────
 //  Iperparametri del modello
@@ -114,6 +115,7 @@ struct Model {
     ModelConfig  config;
     ModelWeights weights;
     KVCache      kv_cache;
+    BenchAccum   bench;
 };
 
 // ─────────────────────────────────────────────
@@ -190,7 +192,7 @@ void feed_forward(const float* x, float* out, const LayerWeights& lw, const Mode
 // token_id : ID del token corrente
 // pos      : posizione nella sequenza
 // logits   : output [n_vocab] — probabilità grezze
-void forward(Model& model, int token_id, int pos, std::vector<float>& logits);
+void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bool bench_mode = false);
 
 // ─────────────────────────────────────────────
 //  Parametri di sampling raggruppati
@@ -275,3 +277,4 @@ void apply_repetition_penalty(std::vector<float>& logits, const std::vector<int>
 //  k = 0   → disabilitato (tutti i token)
 // ─────────────────────────────────────────────
 int sample_topk_topp(std::vector<float> logits, int   top_k, float top_p, float temperature);
+

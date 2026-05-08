@@ -55,6 +55,21 @@ else
     echo "✓ httplib.h scaricato"
 fi
 
+# ── linenoise (readline replacement) ─────────
+if [ -f "$THIRD_PARTY/linenoise.hpp" ]; then
+    echo "✓ linenoise.hpp già presente"
+else
+    echo "→ Download cpp-linenoise..."
+    if command -v wget &> /dev/null; then
+        wget -O "$THIRD_PARTY/linenoise.hpp" \
+          "https://raw.githubusercontent.com/yhirose/cpp-linenoise/master/linenoise.hpp"
+    elif command -v curl &> /dev/null; then
+        curl -L -o "$THIRD_PARTY/linenoise.hpp" \
+          "https://raw.githubusercontent.com/yhirose/cpp-linenoise/master/linenoise.hpp"
+    fi
+    echo "✓ linenoise.hpp scaricato"
+fi
+
 echo ""
 echo "✓ Setup completato. Ora:"
 echo "  cmake -B build && cmake --build build"

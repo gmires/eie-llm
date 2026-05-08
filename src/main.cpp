@@ -1,20 +1,25 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <iomanip>
 #include "gguf.hpp"
 #include "tokenizer.hpp"
 #include "model.hpp"
 #include "shell.hpp"
 #include "server.hpp"
+#include "bench.hpp"
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Uso:\n"
-                  << "  eie-llm <model.gguf>              → shell\n"
-                  << "  eie-llm <model.gguf> --server      → server :8080\n"
-                  << "  eie-llm <model.gguf> --server 9090 → server :9090\n";
+                  << "  eie-llm <model.gguf>                   → shell\n"
+                  << "  eie-llm <model.gguf> --server [porta]  → server\n"
+                  << "  eie-llm <model.gguf> --bench [n_tok]   → benchmark\n";
         return 1;
     }
+
+    // ── Caricamento con timing ─────────────────
+    auto t_load_start = now();
 
     std::ifstream f(argv[1], std::ios::binary);
     if (!f) {
@@ -22,7 +27,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // ── Caricamento ───────────────────────────
     std::cerr << "Caricamento modello...\n";
 
     GGUFContext ctx;
@@ -39,15 +43,34 @@ int main(int argc, char* argv[]) {
     if (!model_load_weights(model, ctx))        return 1;
     model_init_kvcache(model);
 
-    std::cerr << "✓ Pronto!\n";
+    auto t_load_end = now();
+    double load_ms = ms_between(t_load_start, t_load_end);
 
-    // ── Modalità: server o shell ───────────────
-    bool server_mode = (argc >= 3 &&
-                        std::string(argv[2]) == "--server");
+    std::cerr << "✓ Pronto! (caricamento: "
+              << std::fixed << std::setprecision(0)
+              << load_ms << " ms)\n";
 
-    if (server_mode) {
+    // ── Modalità ──────────────────────────────
+    std::string mode = argc >= 3 ? argv[2] : "";
+
+    if (mode == "--server") {
         int port = (argc >= 4) ? std::atoi(argv[3]) : 8080;
         server_run(model, tok, port);
+
+    } else if (mode == "--bench") {
+        int n_tokens = (argc >= 4) ? std::atoi(argv[3]) : 50;
+
+        std::string prompt = "The history of artificial intelligence "
+                             "began in the early days of computing";
+
+        std::cerr << "Benchmark in corso...\n";
+        std::cerr << "  Prompt  : \"" << prompt << "\"\n";
+        std::cerr << "  Genera  : " << n_tokens << " token\n\n";
+
+        BenchResult r = bench_run(model, tok, prompt, n_tokens);
+        r.load_ms = load_ms;
+        bench_print(r);
+
     } else {
         shell_run(model, tok);
     }

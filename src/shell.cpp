@@ -6,7 +6,111 @@
 #include <string>
 #include <cstdlib>
 #include <ctime>
+#include "linenoise.hpp"
 
+// ─────────────────────────────────────────────
+//  File dove salviamo la history tra sessioni
+//  Viene caricato all'avvio e salvato all'uscita
+// ─────────────────────────────────────────────
+static const char* HISTORY_FILE = ".eie_history";
+
+// ─────────────────────────────────────────────
+//  Sanitizza l'output del modello
+//
+//  GPT-2 BPE byte-level mappa i 256 byte a
+//  caratteri Unicode specifici. In particolare
+//  i byte 0x00-0x20 e 0x7F vengono mappati al
+//  blocco Unicode U+0100-U+017F (Latin Extended)
+//  invece di usare i caratteri di controllo diretti.
+//
+//  Esempio:
+//    byte 0x0A (\n) → U+010A (Ċ) nel vocabolario GPT-2
+//    byte 0x20 ( )  → U+0120 (Ġ) → già gestito dal decoder
+//
+//  Strategia:
+//  - ASCII stampabile [0x20-0x7E] → passa
+//  - Newline 0x0A → passa (utile per la formattazione)
+//  - Caratteri Latin Extended U+0100-U+017F →
+//    potrebbero essere byte rimappati da GPT-2,
+//    li convertiamo al byte originale se stampabile
+//    altrimenti li scartiamo
+//  - Resto del Unicode → passa (emoji, CJK, ecc.
+//    potrebbero essere intenzionali)
+//  - Byte di controllo → scarta
+// ─────────────────────────────────────────────
+static std::string sanitize_output(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+
+        // ── ASCII stampabile → passa direttamente ──
+        if (c >= 0x20 && c <= 0x7E) {
+            out += s[i++];
+            continue;
+        }
+
+        // ── Newline → passa ──
+        if (c == 0x0A) {
+            out += s[i++];
+            continue;
+        }
+
+        // ── Sequenza UTF-8 a 2 byte ──────────────
+        // Formato: [110xxxxx][10xxxxxx]
+        // Copriamo U+0080 .. U+07FF
+        if (c >= 0xC0 && c <= 0xDF && i + 1 < s.size()) {
+            unsigned char c2 = static_cast<unsigned char>(s[i+1]);
+
+            if ((c2 & 0xC0) == 0x80) {
+                // Ricostruisci il codepoint Unicode
+                uint32_t cp = ((c & 0x1F) << 6) | (c2 & 0x3F);
+
+                // U+0100–U+017F = Latin Extended-A
+                // GPT-2 usa questo blocco per rimappare
+                // i byte 0x00-0x7F non stampabili.
+                // Recuperiamo il byte originale:
+                //   byte_originale = codepoint - 0x100 + 0x00
+                // ma solo se il risultato è stampabile
+                if (cp >= 0x0100 && cp <= 0x017F) {
+                    uint8_t original_byte = static_cast<uint8_t>(cp - 0x100);
+                    // Tieni solo se stampabile o newline
+                    if (original_byte >= 0x20 && original_byte <= 0x7E)
+                        out += static_cast<char>(original_byte);
+                    else if (original_byte == 0x0A)
+                        out += '\n';
+                    // altrimenti scarta silenziosamente
+                } else {
+                    // Altro carattere a 2 byte — passa così com'è
+                    out += s[i];
+                    out += s[i+1];
+                }
+                i += 2;
+                continue;
+            }
+        }
+
+        // ── Sequenze UTF-8 a 3-4 byte → passa ────
+        // (es. emoji, CJK — probabilmente intenzionali)
+        if (c >= 0xE0 && c <= 0xEF && i + 2 < s.size()) {
+            out += s[i]; out += s[i+1]; out += s[i+2];
+            i += 3;
+            continue;
+        }
+        if (c >= 0xF0 && c <= 0xF7 && i + 3 < s.size()) {
+            out += s[i]; out += s[i+1]; out += s[i+2]; out += s[i+3];
+            i += 4;
+            continue;
+        }
+
+        // ── Tutto il resto (byte di controllo, ecc.) → scarta ──
+        i++;
+    }
+
+    return out;
+}
 // ─────────────────────────────────────────────
 //  Stampa i comandi disponibili
 // ─────────────────────────────────────────────
@@ -16,15 +120,21 @@ static void print_help() {
         << "  :help                mostra questo messaggio\n"
         << "  :tokens <n>          max token da generare (default 200)\n"
         << "  :temp <f>            temperatura, es. 0.8  (default 1.0)\n"
+        << "  :topk <n>            top-k sampling        (default 40)\n"
         << "  :topp <f>            nucleus sampling p    (default 0.9)\n"
-        << "  :topk <n>            top-k sampling, 0=disabilitato (default 40)\n"        
         << "  :penalty <f>         repetition penalty    (default 1.1)\n"
         << "  :greedy              attiva sampling greedy (argmax)\n"
-        << "  :sample              attiva top-p sampling\n"
+        << "  :sample              attiva top-k + top-p sampling\n"
         << "  :params              mostra parametri correnti\n"
         << "  :reset               azzera la KV cache\n"
         << "  :quit                esci\n"
-        << "  qualsiasi testo      genera completamento\n\n";
+        << "  qualsiasi testo      genera completamento\n"
+        << "\n  Scorciatoie tastiera:\n"
+        << "  ↑ ↓                  naviga la history\n"
+        << "  Ctrl+R               cerca nella history\n"
+        << "  Ctrl+A / Ctrl+E      inizio / fine riga\n"
+        << "  Ctrl+C               annulla riga corrente\n"
+        << "  Ctrl+D               esci\n\n";
 }
 
 // ─────────────────────────────────────────────
@@ -32,46 +142,37 @@ static void print_help() {
 // ─────────────────────────────────────────────
 static void print_params(const SamplingParams& p, int max_tokens) {
     std::cout << "\n  Parametri correnti:\n"
-              << "  modalità   : " << (p.greedy ? "greedy" : "top-p") << "\n"
+              << "  modalità   : " << (p.greedy ? "greedy" : "top-k+top-p") << "\n"
               << "  temperature: " << p.temperature  << "\n"
-              << "  top_p      : " << p.top_p        << "\n"
               << "  top_k      : " << p.top_k        << "\n"
+              << "  top_p      : " << p.top_p        << "\n"
               << "  rep_penalty: " << p.rep_penalty  << "\n"
               << "  max_tokens : " << max_tokens     << "\n\n";
 }
 
 // ─────────────────────────────────────────────
-//  Generazione con streaming
-//
-//  Mantiene un vettore context_ids che cresce
-//  ad ogni token generato — serve per la
-//  repetition penalty che ha bisogno di sapere
-//  quali token sono già stati prodotti.
+//  Generazione con streaming e sanitizzazione
 // ─────────────────────────────────────────────
 static void generate(Model& model,
                      const Tokenizer& tok,
                      const std::string& prompt,
                      const SamplingParams& params,
                      int max_tokens) {
-    // Reset KV cache per ogni nuova generazione
     model_init_kvcache(model);
 
-    // Tokenizza il prompt
     auto input_ids = tokenizer_encode(tok, prompt);
     if (input_ids.empty()) {
         std::cout << "[AVVISO] Prompt vuoto\n";
         return;
     }
 
-    // context_ids tiene traccia di tutti i token
-    // visti (prompt + generati) per la rep penalty
     std::vector<int> context_ids = input_ids;
-
     std::vector<float> logits;
+
     std::cout << "\n" << prompt;
     std::cout.flush();
 
-    // ── Fase 1: prefill ───────────────────────
+    // Prefill
     int pos = 0;
     for (int id : input_ids) {
         forward(model, id, pos, logits);
@@ -79,33 +180,29 @@ static void generate(Model& model,
     }
     model.kv_cache.n_cached = pos;
 
-    // ── Fase 2: generazione streaming ─────────
+    // Generazione
     int generated = 0;
     while (generated < max_tokens) {
-
-        // Applica repetition penalty prima del sampling
         apply_repetition_penalty(logits, context_ids,
                                  params.rep_penalty);
 
-        // Campiona il prossimo token
         int next_token;
-        if (params.greedy) {
+        if (params.greedy)
             next_token = sample_argmax(logits);
-        } else {
-            next_token = params.greedy
-                ? sample_argmax(logits)
-                : sample_topk_topp(logits, params.top_k, params.top_p, params.temperature);
-        }
+        else
+            next_token = sample_topk_topp(logits,
+                                          params.top_k,
+                                          params.top_p,
+                                          params.temperature);
 
-        // Token EOS di GPT-2
         if (next_token == 50256) break;
 
-        // Stampa e aggiorna il contesto
-        std::cout << tokenizer_decode(tok, {next_token});
+        // Sanitizza prima di stampare
+        std::string raw = tokenizer_decode(tok, {next_token});
+        std::cout << sanitize_output(raw);
         std::cout.flush();
-        context_ids.push_back(next_token);
 
-        // Forward pass per il prossimo token
+        context_ids.push_back(next_token);
         forward(model, next_token, pos, logits);
         pos++;
         generated++;
@@ -116,11 +213,22 @@ static void generate(Model& model,
 
 // ─────────────────────────────────────────────
 //  Loop principale della shell
+//
+//  Usiamo linenoise invece di std::getline:
+//  - history con ↑↓
+//  - Ctrl+R per ricerca
+//  - editing inline completo
+//  - history persistente su file tra sessioni
 // ─────────────────────────────────────────────
 void shell_run(Model& model, const Tokenizer& tok) {
     SamplingParams params;
     int max_tokens = 200;
     srand(static_cast<unsigned>(time(nullptr)));
+
+    // Configura linenoise
+    linenoise::SetMultiLine(false);
+    linenoise::SetHistoryMaxLen(100);
+    linenoise::LoadHistory(HISTORY_FILE);  // carica history precedente
 
     std::cout << "\n";
     std::cout << "╔═══════════════════════════════════════╗\n";
@@ -129,13 +237,21 @@ void shell_run(Model& model, const Tokenizer& tok) {
     std::cout << "╚═══════════════════════════════════════╝\n";
     print_help();
 
-    std::string line;
     while (true) {
-        std::cout << "eie> ";
-        std::cout.flush();
+        std::string line;
 
-        if (!std::getline(std::cin, line)) break;
+        // linenoise gestisce il prompt, la history e l'editing
+        // Ritorna true se l'utente ha premuto Ctrl+D (EOF)
+        bool quit = linenoise::Readline("eie> ", line);
+        if (quit) {
+            std::cout << "Arrivederci!\n";
+            break;
+        }
+
         if (line.empty()) continue;
+
+        // Aggiungi alla history (evita duplicati consecutivi)
+        linenoise::AddHistory(line.c_str());
 
         if (line[0] == ':') {
             if (line == ":quit" || line == ":q") {
@@ -155,7 +271,7 @@ void shell_run(Model& model, const Tokenizer& tok) {
             }
             else if (line == ":sample") {
                 params.greedy = false;
-                std::cout << "  Modalità: top-p sampling\n\n";
+                std::cout << "  Modalità: top-k + top-p sampling\n\n";
             }
             else if (line == ":params") {
                 print_params(params, max_tokens);
@@ -178,24 +294,22 @@ void shell_run(Model& model, const Tokenizer& tok) {
                     std::cout << "  Uso: :temp <float>\n\n";
                 }
             }
+            else if (line.substr(0, 5) == ":topk") {
+                try {
+                    params.top_k = std::stoi(line.substr(6));
+                    params.greedy = false;
+                    std::cout << "  Top-k: " << params.top_k << "\n\n";
+                } catch (...) {
+                    std::cout << "  Uso: :topk <intero>\n\n";
+                }
+            }
             else if (line.substr(0, 5) == ":topp") {
                 try {
                     params.top_p = std::stof(line.substr(6));
                     params.greedy = false;
                     std::cout << "  Top-p: " << params.top_p << "\n\n";
                 } catch (...) {
-                    std::cout << "  Uso: :topp <float 0.0-1.0>\n\n";
-                }
-            }
-            else if (line.substr(0, 5) == ":topk") {
-                try {
-                    params.top_k = std::stoi(line.substr(6));
-                    params.greedy = false;
-                    std::cout << "  Top-k: " << params.top_k
-                              << (params.top_k == 0 ?
-                                  " (disabilitato)\n\n" : "\n\n");
-                } catch (...) {
-                    std::cout << "  Uso: :topk <intero >= 0>\n\n";
+                    std::cout << "  Uso: :topp <float>\n\n";
                 }
             }
             else if (line.substr(0, 8) == ":penalty") {
@@ -204,7 +318,7 @@ void shell_run(Model& model, const Tokenizer& tok) {
                     std::cout << "  Repetition penalty: "
                               << params.rep_penalty << "\n\n";
                 } catch (...) {
-                    std::cout << "  Uso: :penalty <float >= 1.0>\n\n";
+                    std::cout << "  Uso: :penalty <float>\n\n";
                 }
             }
             else {
@@ -215,4 +329,7 @@ void shell_run(Model& model, const Tokenizer& tok) {
             generate(model, tok, line, params, max_tokens);
         }
     }
+
+    // Salva la history su file prima di uscire
+    linenoise::SaveHistory(HISTORY_FILE);
 }

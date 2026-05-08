@@ -17,6 +17,7 @@ add_executable(eie-llm
   src/model.cpp
   src/shell.cpp
   src/server.cpp
+  src/bench.cpp
 )
 
 # Ora gli header stanno in include/ separati dai sorgenti
