@@ -317,6 +317,244 @@ std::vector<float> tensor_to_float(const GGUFTensor& t) {
 }
 
 // ─────────────────────────────────────────────
+//  matvec_q4k — y = A × x, A quantizzata Q4_K
+//
+//  Per ogni riga i di A (= output y[i]):
+//    itera sui super-block lungo la riga,
+//    decodifica nibbles + scale/min e accumula
+//    il prodotto scalare con la finestra di x
+//    corrispondente — senza materializzare float.
+// ─────────────────────────────────────────────
+void matvec_q4k(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    static constexpr int SUPER_BLOCK = 256;
+    static constexpr int SUPER_BYTES = 144;
+    static constexpr int N_SUB       = 8;
+    static constexpr int BLOCK_SIZE  = 32;
+
+    int n_super_per_row = in_dim / SUPER_BLOCK;
+    int row_bytes       = n_super_per_row * SUPER_BYTES;
+
+    for (int i = 0; i < out_dim; i++) {
+        const uint8_t* row = A + i * row_bytes;
+        float sum = 0.0f;
+
+        for (int s = 0; s < n_super_per_row; s++) {
+            const uint8_t* sb  = row + s * SUPER_BYTES;
+            const float*   xb  = x   + s * SUPER_BLOCK;
+
+            uint16_t d_bits, dmin_bits;
+            memcpy(&d_bits,    sb,     2);
+            memcpy(&dmin_bits, sb + 2, 2);
+            float d    = fp16_to_fp32(d_bits);
+            float dmin = fp16_to_fp32(dmin_bits);
+
+            const uint8_t* sc_bytes = sb + 4;
+
+            auto get_scale_min = [&](int j) -> std::pair<float, float> {
+                uint8_t sv, mv;
+                if (j < 4) {
+                    sv = sc_bytes[j]   & 0x3F;
+                    mv = sc_bytes[j+4] & 0x3F;
+                } else {
+                    sv = (sc_bytes[j+4] & 0x0F) | ((sc_bytes[j-4] >> 6) << 4);
+                    mv = (sc_bytes[j+4] >>   4) | ((sc_bytes[j  ] >> 6) << 4);
+                }
+                return {sv * d, mv * dmin};
+            };
+
+            const uint8_t* nibbles = sb + 16;
+
+            for (int b = 0; b < N_SUB / 2; b++) {
+                auto [sc0, min0] = get_scale_min(b * 2);
+                auto [sc1, min1] = get_scale_min(b * 2 + 1);
+
+                const uint8_t* q  = nibbles + b * BLOCK_SIZE;
+                const float*   x0 = xb + b * 2 * BLOCK_SIZE;
+                const float*   x1 = x0 + BLOCK_SIZE;
+
+                for (int l = 0; l < BLOCK_SIZE; l++) {
+                    sum += ((q[l] & 0xF) * sc0 - min0) * x0[l];
+                    sum += ((q[l] >>  4) * sc1 - min1) * x1[l];
+                }
+            }
+        }
+        y[i] = sum;
+    }
+}
+
+// ─────────────────────────────────────────────
+//  matvec_q6k — y = A × x, A quantizzata Q6_K
+// ─────────────────────────────────────────────
+void matvec_q6k(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    static constexpr int SUPER_BLOCK = 256;
+    static constexpr int SUPER_BYTES = 210;
+
+    int n_super_per_row = in_dim / SUPER_BLOCK;
+    int row_bytes       = n_super_per_row * SUPER_BYTES;
+
+    for (int i = 0; i < out_dim; i++) {
+        const uint8_t* row = A + i * row_bytes;
+        float sum = 0.0f;
+
+        for (int s = 0; s < n_super_per_row; s++) {
+            const uint8_t* sb  = row + s * SUPER_BYTES;
+            const float*   xb  = x   + s * SUPER_BLOCK;
+
+            const uint8_t* ql = sb;
+            const uint8_t* qh = sb + 128;
+            const int8_t*  sc = reinterpret_cast<const int8_t*>(sb + 192);
+
+            uint16_t d_bits;
+            memcpy(&d_bits, sb + 208, 2);
+            float d = fp16_to_fp32(d_bits);
+
+            for (int n = 0; n < 2; n++) {
+                const uint8_t* ql_n = ql + n * 64;
+                const uint8_t* qh_n = qh + n * 32;
+                const int8_t*  sc_n = sc  + n * 8;
+                const float*   xn   = xb  + n * 128;
+
+                for (int l = 0; l < 32; l++) {
+                    int is = l / 16;
+                    int8_t q1 = (int8_t)((ql_n[l]    & 0xF) | (((qh_n[l] >> 0) & 3) << 4)) - 32;
+                    int8_t q2 = (int8_t)((ql_n[l+32] & 0xF) | (((qh_n[l] >> 2) & 3) << 4)) - 32;
+                    int8_t q3 = (int8_t)((ql_n[l]    >>  4) | (((qh_n[l] >> 4) & 3) << 4)) - 32;
+                    int8_t q4 = (int8_t)((ql_n[l+32] >>  4) | (((qh_n[l] >> 6) & 3) << 4)) - 32;
+
+                    sum += (d * sc_n[is + 0] * q1) * xn[l +  0];
+                    sum += (d * sc_n[is + 2] * q2) * xn[l + 32];
+                    sum += (d * sc_n[is + 4] * q3) * xn[l + 64];
+                    sum += (d * sc_n[is + 6] * q4) * xn[l + 96];
+                }
+            }
+        }
+        y[i] = sum;
+    }
+}
+
+// ─────────────────────────────────────────────
+//  matvec_q8_0 — y = A × x, A quantizzata Q8_0
+// ─────────────────────────────────────────────
+void matvec_q8_0(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    static constexpr int BLOCK_SIZE  = 32;
+    static constexpr int BLOCK_BYTES = 34;
+
+    int n_blocks_per_row = in_dim / BLOCK_SIZE;
+    int row_bytes        = n_blocks_per_row * BLOCK_BYTES;
+
+    for (int i = 0; i < out_dim; i++) {
+        const uint8_t* row = A + i * row_bytes;
+        float sum = 0.0f;
+
+        for (int b = 0; b < n_blocks_per_row; b++) {
+            const uint8_t* block = row + b * BLOCK_BYTES;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, block, sizeof(scale_bits));
+            float scale = fp16_to_fp32(scale_bits);
+
+            const int8_t* quants = reinterpret_cast<const int8_t*>(block + 2);
+            const float*  xb     = x + b * BLOCK_SIZE;
+
+            for (int j = 0; j < BLOCK_SIZE; j++)
+                sum += quants[j] * scale * xb[j];
+        }
+        y[i] = sum;
+    }
+}
+
+// ─────────────────────────────────────────────
+//  matvec_f16 — y = A × x, A in float16
+//  Converte ogni elemento inline durante il dot
+// ─────────────────────────────────────────────
+void matvec_f16(const uint16_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    for (int i = 0; i < out_dim; i++) {
+        const uint16_t* row = A + i * in_dim;
+        float sum = 0.0f;
+        for (int j = 0; j < in_dim; j++)
+            sum += fp16_to_fp32(row[j]) * x[j];
+        y[i] = sum;
+    }
+}
+
+// ─────────────────────────────────────────────
+//  matvec_quant — dispatch sul tipo di QuantTensor
+// ─────────────────────────────────────────────
+void matvec_quant(const QuantTensor& A, const float* x, float* y) {
+    int out_dim = static_cast<int>(A.n_rows);
+    int in_dim  = static_cast<int>(A.n_cols);
+
+    switch (A.type) {
+        case GGMLType::F32:
+            matvec(reinterpret_cast<const float*>(A.data.data()), x, y, out_dim, in_dim);
+            break;
+        case GGMLType::F16:
+            matvec_f16(reinterpret_cast<const uint16_t*>(A.data.data()), x, y, out_dim, in_dim);
+            break;
+        case GGMLType::Q8_0:
+            matvec_q8_0(A.data.data(), x, y, out_dim, in_dim);
+            break;
+        case GGMLType::Q4_K:
+            matvec_q4k(A.data.data(), x, y, out_dim, in_dim);
+            break;
+        case GGMLType::Q6_K:
+            matvec_q6k(A.data.data(), x, y, out_dim, in_dim);
+            break;
+        default:
+            std::cerr << "[ERRORE] matvec_quant: tipo non supportato: "
+                      << ggml_type_name(A.type) << "\n";
+            std::fill(y, y + out_dim, 0.0f);
+    }
+}
+
+// ─────────────────────────────────────────────
+//  dequant_row — dequantizza una singola riga
+//
+//  Usata per l'embedding lookup dove serve
+//  solo una riga alla volta (non un matvec).
+// ─────────────────────────────────────────────
+void dequant_row(const QuantTensor& A, int row_idx, float* out) {
+    uint64_t n_cols = A.n_cols;
+
+    switch (A.type) {
+        case GGMLType::F32: {
+            const float* src = reinterpret_cast<const float*>(A.data.data())
+                               + row_idx * n_cols;
+            memcpy(out, src, n_cols * sizeof(float));
+            break;
+        }
+        case GGMLType::F16: {
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(A.data.data())
+                                  + row_idx * n_cols;
+            for (uint64_t j = 0; j < n_cols; j++)
+                out[j] = fp16_to_fp32(src[j]);
+            break;
+        }
+        case GGMLType::Q4_K: {
+            int n_super = static_cast<int>(n_cols / 256);
+            const uint8_t* row = A.data.data() + row_idx * n_super * 144;
+            dequantize_q4_k(row, out, n_cols);
+            break;
+        }
+        case GGMLType::Q6_K: {
+            int n_super = static_cast<int>(n_cols / 256);
+            const uint8_t* row = A.data.data() + row_idx * n_super * 210;
+            dequantize_q6_k(row, out, n_cols);
+            break;
+        }
+        case GGMLType::Q8_0: {
+            int n_blocks = static_cast<int>(n_cols / 32);
+            const uint8_t* row = A.data.data() + row_idx * n_blocks * 34;
+            dequantize_q8_0(row, out, n_cols);
+            break;
+        }
+        default:
+            std::cerr << "[ERRORE] dequant_row: tipo non supportato: "
+                      << ggml_type_name(A.type) << "\n";
+            std::fill(out, out + n_cols, 0.0f);
+    }
+}
+
+// ─────────────────────────────────────────────
 //  Matrix multiplication C = A × B
 //
 //  A[m×k], B[k×n], C[m×n]

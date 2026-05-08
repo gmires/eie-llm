@@ -209,17 +209,17 @@ I modelli sono distribuiti nel formato **GGUF** (un file binario strutturato). C
 
 Un modello con 1.1 miliardi di parametri in float32 occuperebbe ~4.4 GB. TinyLlama in Q4\_K\_M pesa ~638 MB perché ogni peso è compresso a ~4 bit invece di 32.
 
-`ops.cpp` decomprime i pesi al volo prima di usarli. I formati supportati:
+`ops.cpp` decomprime i pesi al volo, **riga per riga durante il forward pass**, senza mai materializzare l'intera matrice in float32. I formati supportati:
 
 | Formato | Bit/peso | Usato da |
 |---------|----------|----------|
-| F32 | 32 | embedding di GPT-2 |
+| F32 | 32 | norme, bias, positional embedding |
 | F16 | 16 | alcuni layer |
 | Q8\_0 | 8 | GPT-2 |
 | Q4\_K | 4 | TinyLlama (pesi principali) |
 | Q6\_K | 6 | TinyLlama (output e attention V) |
 
-> **Nota:** nella versione attuale tutti i pesi vengono dequantizzati in float32 **al caricamento**, occupando circa 4.2 GB in RAM. Vedi la sezione [Prestazioni e limiti](#prestazioni-e-limiti) per i dettagli.
+I pesi sono rappresentati in memoria dal tipo `QuantTensor` (raw bytes + tipo + shape). Il dispatch avviene in `matvec_quant()`: per F32 fa un cast diretto, per F16/Q8\_0/Q4\_K/Q6\_K dequantizza un super-block alla volta accumulando il prodotto scalare.
 
 ### 3. Il Tokenizer
 
@@ -288,18 +288,20 @@ Il modello produce un vettore di ~32000 logit (uno per token). Per scegliere il 
 
 Questa è un'implementazione **didattica**: correttezza e leggibilità del codice vengono prima delle prestazioni. Detto questo, è utile capire dove va il tempo e la memoria.
 
-### Memoria — il problema della dequantizzazione anticipata
+### Memoria — dequantizzazione lazy
 
-Il file GGUF di TinyLlama occupa 638 MB su disco (Q4\_K\_M, ~4.5 bit/peso). Nella versione attuale tutti i pesi vengono convertiti in float32 al caricamento:
+I pesi sono mantenuti nel formato quantizzato originale (`QuantTensor`) e dequantizzati riga per riga durante ogni `matvec_quant`. Non viene mai allocata in RAM la versione float32 dell'intera matrice.
 
-| Tensore | float32 |
-|---|---|
-| token\_embd + output.weight | ~512 MB |
-| 22 × (attn Q/K/V/out) | ~440 MB |
-| 22 × (ffn gate + up + down) | ~2.9 GB |
-| **Totale** | **~4.2 GB** |
+| | Disco (quantizzato) | RAM pesi (prima) | RAM pesi (ora) |
+|---|---|---|---|
+| token\_embd + output.weight | ~110 MB | ~512 MB | ~110 MB |
+| 22 × (attn Q/K/V/out) | ~120 MB | ~440 MB | ~120 MB |
+| 22 × (ffn gate + up + down) | ~408 MB | ~2.9 GB | ~408 MB |
+| **Totale pesi** | **~638 MB** | **~4.2 GB** | **~638 MB** |
 
-La soluzione corretta è **mantenere i pesi nel formato quantizzato originale** e dequantizzare per super-block durante il forward pass. In questo modo si occuperebbero solo ~638 MB e il forward sarebbe anche più veloce (meno dati da leggere dalla RAM, il bandwidth è spesso il vero collo di bottiglia).
+In pratica il processo occupa ~700–800 MB totali (pesi + KV cache + buffer attivazioni), contro i ~4.5 GB precedenti.
+
+Un ulteriore vantaggio è la **cache efficiency**: una riga di `ffn_gate_w` in Q4\_K è 1152 byte (entra in L2), contro 8 KB in float32. Ciò riduce la pressione sul memory bandwidth, che era il vero collo di bottiglia.
 
 ### Velocità — il collo di bottiglia è `matvec`
 
@@ -318,9 +320,8 @@ Con il `matvec` scalare attuale (~1 GFLOPS) → circa **1 secondo/token**.
 | Intervento | Come | Guadagno atteso |
 |---|---|---|
 | Build Release + `-march=native` | `cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=native"` | 2-4x (SIMD automatico) |
-| OpenMP su `matvec` | `#pragma omp parallel for` sul loop esterno + `-fopenmp` | Nx (N = core) |
-| AVX2 esplicito | Intrinsics `_mm256_*` nel loop interno di `matvec` | 6-8x |
-| Pesi quantizzati in RAM | Riscrivere `matvec` per lavorare su byte Q4\_K/Q6\_K | −3.6 GB RAM + 20-40% velocità |
+| OpenMP su `matvec_quant` | `#pragma omp parallel for` sul loop esterno + `-fopenmp` | Nx (N = core) |
+| AVX2 esplicito | Intrinsics `_mm256_*` nei kernel Q4\_K/Q6\_K | 6-8x |
 
 ---
 
@@ -339,7 +340,7 @@ Con il `matvec` scalare attuale (~1 GFLOPS) → circa **1 secondo/token**.
 - [x] Fase 11 — Tokenizer SentencePiece Viterbi unigram
 - [x] Fase 12 — Chat template (shell + server HTTP)
 - [x] Fase 13 — Buffer di inferenza pre-allocati (eliminazione malloc nel hot path)
-- [ ] Fase 14 — Pesi quantizzati in RAM (−3.6 GB, matvec su Q4\_K/Q6\_K)
+- [x] Fase 14 — Dequantizzazione lazy: `QuantTensor` + kernel `matvec_quant` (−3.5 GB RAM, F32/F16/Q8\_0/Q4\_K/Q6\_K)
 - [ ] Fase 15 — Ottimizzazioni matmul (AVX2/NEON, OpenMP)
 - [ ] Fase 16 — Streaming HTTP (Server-Sent Events, token per token)
 

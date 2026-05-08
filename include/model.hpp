@@ -41,15 +41,14 @@ struct ModelConfig {
 // ─────────────────────────────────────────────
 //  Pesi di un singolo layer transformer
 //
-//  Ogni layer ha 8 tensori di pesi:
-//  - 2 per la layer norm prima dell'attention
-//  - 4 per le proiezioni Q/K/V e output
-//  - 2 per la layer norm prima del FFN
-//  - 4 per il feed-forward network (fc1, fc2
-//    con bias rispettivi)
+//  Le matrici di peso grandi (attn, FFN) sono
+//  mantenute nel formato GGUF originale come
+//  QuantTensor — la dequantizzazione avviene
+//  riga per riga durante matvec_quant().
 //
-//  I tensori sono già dequantizzati in float32
-//  pronti per il calcolo.
+//  Norme e bias restano float32: sono piccoli
+//  (n_embd float = 8 KB) e generalmente già F32
+//  nel file GGUF.
 // ─────────────────────────────────────────────
 struct LayerWeights {
     // ── Norm prima dell'attention ─────────────
@@ -58,16 +57,16 @@ struct LayerWeights {
 
     // ── Self-attention ────────────────────────
     // GPT2: unica matrice QKV combinata
-    std::vector<float> attn_qkv_w;
+    QuantTensor        attn_qkv_w;
     std::vector<float> attn_qkv_b;
 
     // LLaMA: Q, K, V separati (K e V più piccoli con GQA)
-    std::vector<float> attn_q_w;
-    std::vector<float> attn_k_w;
-    std::vector<float> attn_v_w;
+    QuantTensor attn_q_w;
+    QuantTensor attn_k_w;
+    QuantTensor attn_v_w;
 
     // Output projection (comune a entrambi)
-    std::vector<float> attn_out_w;
+    QuantTensor        attn_out_w;
     std::vector<float> attn_out_b;  // GPT2 ha il bias, LLaMA no
 
     // ── Norm prima del FFN ────────────────────
@@ -76,15 +75,15 @@ struct LayerWeights {
 
     // ── FFN ───────────────────────────────────
     // GPT2: fc1 (up) + fc2 (down) con GELU
-    std::vector<float> ffn_fc1_w;
+    QuantTensor        ffn_fc1_w;
     std::vector<float> ffn_fc1_b;
-    std::vector<float> ffn_fc2_w;
+    QuantTensor        ffn_fc2_w;
     std::vector<float> ffn_fc2_b;
 
     // LLaMA: gate + up + down con SwiGLU (no bias)
-    std::vector<float> ffn_gate_w;  // W1 — passa per SiLU
-    std::vector<float> ffn_up_w;    // W3 — moltiplicato col gate
-    std::vector<float> ffn_down_w;  // W2 — proiezione finale
+    QuantTensor ffn_gate_w;  // W1 — passa per SiLU
+    QuantTensor ffn_up_w;    // W3 — moltiplicato col gate
+    QuantTensor ffn_down_w;  // W2 — proiezione finale
 };
 
 // ─────────────────────────────────────────────
@@ -94,18 +93,19 @@ struct LayerWeights {
 //  una sola volta (non per ogni layer)
 // ─────────────────────────────────────────────
 struct ModelWeights {
-    // Token embedding (comune)
-    std::vector<float> token_embd;
+    // Token embedding — grande (n_vocab × n_embd), rimane quantizzato
+    // Usato sia come embedding lookup (dequant_row) sia come lm_head (matvec_quant)
+    QuantTensor token_embd;
 
-    // GPT2: positional embedding assoluto
+    // GPT2: positional embedding assoluto — piccolo (n_ctx × n_embd), float32
     std::vector<float> pos_embd;
 
-    // LayerNorm/RMSNorm finale
+    // LayerNorm/RMSNorm finale — piccolo, float32
     std::vector<float> ln_f_w;
     std::vector<float> ln_f_b;   // LLaMA: non usato
 
-    // LLaMA: lm_head separato (non usa weight tying)
-    std::vector<float> output_w;
+    // LLaMA: lm_head separato — grande (n_vocab × n_embd), rimane quantizzato
+    QuantTensor output_w;
 
     std::vector<LayerWeights> layers;
 };

@@ -5,6 +5,32 @@
 #include "gguf.hpp"
 
 // ─────────────────────────────────────────────
+//  Tensore quantizzato — dequantizzazione lazy
+//
+//  Mantiene i pesi nel formato originale GGUF
+//  senza espanderli in float32 al caricamento.
+//
+//  Convenzione shape (stessa di GGUF/ggml):
+//    n_cols = shape[0] = in_dim  (dimensione più veloce)
+//    n_rows = shape[1] = out_dim
+//
+//  Layout byte per riga (row-major):
+//    F32  : n_cols × 4 byte
+//    F16  : n_cols × 2 byte
+//    Q4_K : (n_cols / 256) × 144 byte
+//    Q6_K : (n_cols / 256) × 210 byte
+//    Q8_0 : (n_cols / 32)  × 34  byte
+// ─────────────────────────────────────────────
+struct QuantTensor {
+    GGMLType             type   = GGMLType::F32;
+    uint64_t             n_rows = 0;
+    uint64_t             n_cols = 0;
+    std::vector<uint8_t> data;
+
+    bool empty() const { return data.empty(); }
+};
+
+// ─────────────────────────────────────────────
 //  Operazioni primitive sui tensori
 //
 //  Tutte le operazioni lavorano su float32
@@ -206,3 +232,30 @@ void rope(float* x, int pos, int n_heads, int d_head, int rope_dim, float freq_b
 //  Modifica il vettore in-place.
 // ─────────────────────────────────────────────
 void silu(float* x, int n);
+
+// ─────────────────────────────────────────────
+//  Kernel matvec quantizzati: y = A × x
+//
+//  Ogni kernel dequantizza una riga di A alla
+//  volta e accumula il prodotto scalare con x,
+//  senza mai materializzare la matrice in float32.
+//
+//  Parametri:
+//    A       : pesi raw nel formato specifico
+//    x       : vettore input  [in_dim]
+//    y       : vettore output [out_dim]
+//    out_dim : numero di righe di A
+//    in_dim  : numero di colonne di A (= len di x)
+// ─────────────────────────────────────────────
+void matvec_q4k (const uint8_t*   A, const float* x, float* y, int out_dim, int in_dim);
+void matvec_q6k (const uint8_t*   A, const float* x, float* y, int out_dim, int in_dim);
+void matvec_q8_0(const uint8_t*   A, const float* x, float* y, int out_dim, int in_dim);
+void matvec_f16 (const uint16_t*  A, const float* x, float* y, int out_dim, int in_dim);
+
+// Dispatch automatico sul tipo di QuantTensor
+// — usa A.n_rows come out_dim, A.n_cols come in_dim
+void matvec_quant(const QuantTensor& A, const float* x, float* y);
+
+// Dequantizza la riga row_idx di A in out[0..n_cols-1]
+// Usata per l'embedding lookup (accesso singola riga)
+void dequant_row(const QuantTensor& A, int row_idx, float* out);

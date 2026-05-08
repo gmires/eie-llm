@@ -20,10 +20,9 @@ static uint32_t get_u32(const GGUFContext& ctx,
 }
 
 // ─────────────────────────────────────────────
-//  Helper: carica un tensore per nome
-//  e dequantizza in float32.
-//  Termina il programma se non trovato —
-//  un tensore mancante è un errore fatale.
+//  Helper: carica un tensore e dequantizza in float32.
+//  Usato per tensori piccoli (norme, bias) che
+//  vengono sempre acceduti come float32.
 // ─────────────────────────────────────────────
 static std::vector<float> load_tensor(const GGUFContext& ctx,
                                       const std::string& name) {
@@ -33,6 +32,28 @@ static std::vector<float> load_tensor(const GGUFContext& ctx,
         return {};
     }
     return tensor_to_float(*t);
+}
+
+// ─────────────────────────────────────────────
+//  Helper: carica un tensore mantenendo il
+//  formato quantizzato originale (QuantTensor).
+//  Usato per le matrici di peso grandi —
+//  la dequantizzazione avviene riga per riga
+//  durante matvec_quant() al momento del calcolo.
+// ─────────────────────────────────────────────
+static QuantTensor load_quant_tensor(const GGUFContext& ctx,
+                                     const std::string& name) {
+    const GGUFTensor* t = gguf_find_tensor(ctx, name);
+    if (!t) {
+        std::cerr << "[ERRORE] Tensore non trovato: " << name << "\n";
+        return {};
+    }
+    QuantTensor qt;
+    qt.type   = t->info.type;
+    qt.n_cols = t->info.shape[0];                                      // in_dim
+    qt.n_rows = (t->info.n_dims >= 2) ? t->info.shape[1] : 1;         // out_dim
+    qt.data   = t->data;
+    return qt;
 }
 
 // ─────────────────────────────────────────────
@@ -136,7 +157,7 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
     std::cout << "  Caricamento pesi globali...\n";
 
     // ── Pesi globali comuni ───────────────────
-    w.token_embd = load_tensor(ctx, "token_embd.weight");
+    w.token_embd = load_quant_tensor(ctx, "token_embd.weight");
     if (w.token_embd.empty()) return false;
 
     w.ln_f_w = load_tensor(ctx, "output_norm.weight");
@@ -152,7 +173,7 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
 
     } else {
         // LLaMA: lm_head separato, no positional embedding
-        w.output_w = load_tensor(ctx, "output.weight");
+        w.output_w = load_quant_tensor(ctx, "output.weight");
         if (w.output_w.empty()) return false;
         // ln_f_b non esiste in LLaMA — lascia vuoto
     }
@@ -166,18 +187,18 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
         LayerWeights& lw = w.layers[i];
 
         if (cfg.arch == ArchType::GPT2) {
-            lw.ln1_w      = load_tensor(ctx, p + "attn_norm.weight");
-            lw.ln1_b      = load_tensor(ctx, p + "attn_norm.bias");
-            lw.attn_qkv_w = load_tensor(ctx, p + "attn_qkv.weight");
-            lw.attn_qkv_b = load_tensor(ctx, p + "attn_qkv.bias");
-            lw.attn_out_w = load_tensor(ctx, p + "attn_output.weight");
-            lw.attn_out_b = load_tensor(ctx, p + "attn_output.bias");
-            lw.ln2_w      = load_tensor(ctx, p + "ffn_norm.weight");
-            lw.ln2_b      = load_tensor(ctx, p + "ffn_norm.bias");
-            lw.ffn_fc1_w  = load_tensor(ctx, p + "ffn_up.weight");
-            lw.ffn_fc1_b  = load_tensor(ctx, p + "ffn_up.bias");
-            lw.ffn_fc2_w  = load_tensor(ctx, p + "ffn_down.weight");
-            lw.ffn_fc2_b  = load_tensor(ctx, p + "ffn_down.bias");
+            lw.ln1_w      = load_tensor      (ctx, p + "attn_norm.weight");
+            lw.ln1_b      = load_tensor      (ctx, p + "attn_norm.bias");
+            lw.attn_qkv_w = load_quant_tensor(ctx, p + "attn_qkv.weight");
+            lw.attn_qkv_b = load_tensor      (ctx, p + "attn_qkv.bias");
+            lw.attn_out_w = load_quant_tensor(ctx, p + "attn_output.weight");
+            lw.attn_out_b = load_tensor      (ctx, p + "attn_output.bias");
+            lw.ln2_w      = load_tensor      (ctx, p + "ffn_norm.weight");
+            lw.ln2_b      = load_tensor      (ctx, p + "ffn_norm.bias");
+            lw.ffn_fc1_w  = load_quant_tensor(ctx, p + "ffn_up.weight");
+            lw.ffn_fc1_b  = load_tensor      (ctx, p + "ffn_up.bias");
+            lw.ffn_fc2_w  = load_quant_tensor(ctx, p + "ffn_down.weight");
+            lw.ffn_fc2_b  = load_tensor      (ctx, p + "ffn_down.bias");
 
             if (lw.attn_qkv_w.empty() || lw.ffn_fc1_w.empty()) {
                 std::cerr << "[ERRORE] GPT2 layer " << i << " incompleto\n";
@@ -186,15 +207,15 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
 
         } else {
             // LLaMA: no bias, Q/K/V separati
-            lw.ln1_w      = load_tensor(ctx, p + "attn_norm.weight");
-            lw.attn_q_w   = load_tensor(ctx, p + "attn_q.weight");
-            lw.attn_k_w   = load_tensor(ctx, p + "attn_k.weight");
-            lw.attn_v_w   = load_tensor(ctx, p + "attn_v.weight");
-            lw.attn_out_w = load_tensor(ctx, p + "attn_output.weight");
-            lw.ln2_w      = load_tensor(ctx, p + "ffn_norm.weight");
-            lw.ffn_gate_w = load_tensor(ctx, p + "ffn_gate.weight");
-            lw.ffn_up_w   = load_tensor(ctx, p + "ffn_up.weight");
-            lw.ffn_down_w = load_tensor(ctx, p + "ffn_down.weight");
+            lw.ln1_w      = load_tensor      (ctx, p + "attn_norm.weight");
+            lw.attn_q_w   = load_quant_tensor(ctx, p + "attn_q.weight");
+            lw.attn_k_w   = load_quant_tensor(ctx, p + "attn_k.weight");
+            lw.attn_v_w   = load_quant_tensor(ctx, p + "attn_v.weight");
+            lw.attn_out_w = load_quant_tensor(ctx, p + "attn_output.weight");
+            lw.ln2_w      = load_tensor      (ctx, p + "ffn_norm.weight");
+            lw.ffn_gate_w = load_quant_tensor(ctx, p + "ffn_gate.weight");
+            lw.ffn_up_w   = load_quant_tensor(ctx, p + "ffn_up.weight");
+            lw.ffn_down_w = load_quant_tensor(ctx, p + "ffn_down.weight");
 
             if (lw.attn_q_w.empty() || lw.ffn_gate_w.empty()) {
                 std::cerr << "[ERRORE] LLaMA layer " << i << " incompleto\n";
@@ -375,7 +396,7 @@ void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache&
     // come vettore locale. Solo per GPT-2, che ha n_embd
     // piccolo (768), l'overhead è trascurabile.
     std::vector<float> qkv(3 * n_embd);
-    matvec(lw.attn_qkv_w.data(), x, qkv.data(), 3 * n_embd, n_embd);
+    matvec_quant(lw.attn_qkv_w, x, qkv.data());
     vec_add(qkv.data(), lw.attn_qkv_b.data(), qkv.data(), 3 * n_embd);
 
     const float* Q = qkv.data();
@@ -421,7 +442,7 @@ void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache&
 
     // ── Step 4: proiezione output ──────────────
     // Legge da attn_acc, scrive in out (bufs.attn_out) — no aliasing.
-    matvec(lw.attn_out_w.data(), bufs.attn_acc.data(), out, n_embd, n_embd);
+    matvec_quant(lw.attn_out_w, bufs.attn_acc.data(), out);
     vec_add(out, lw.attn_out_b.data(), out, n_embd);
 }
 
@@ -453,14 +474,14 @@ void feed_forward(const float* x, float* out,
 
     // Riusa bufs.gate come buffer intermedio per la proiezione up.
     // Step 1: proiezione up x → gate [n_embd → n_ff]
-    matvec(lw.ffn_fc1_w.data(), x, bufs.gate.data(), n_ff, n_embd);
+    matvec_quant(lw.ffn_fc1_w, x, bufs.gate.data());
     vec_add(bufs.gate.data(), lw.ffn_fc1_b.data(), bufs.gate.data(), n_ff);
 
     // Step 2: attivazione GELU in-place
     gelu(bufs.gate.data(), n_ff);
 
     // Step 3: proiezione down → out [n_ff → n_embd]
-    matvec(lw.ffn_fc2_w.data(), bufs.gate.data(), out, n_embd, n_ff);
+    matvec_quant(lw.ffn_fc2_w, bufs.gate.data(), out);
     vec_add(out, lw.ffn_fc2_b.data(), out, n_embd);
 }
 
@@ -483,7 +504,6 @@ void feed_forward(const float* x, float* out,
 // ─────────────────────────────────────────────
 void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs) {
 
-    const int n_embd    = cfg.n_embd;
     const int n_head    = cfg.n_head;
     const int n_head_kv = cfg.n_head_kv;
     const int d_head    = cfg.d_head;
@@ -492,9 +512,9 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
 
     // ── Step 1: proiezione Q, K, V separata ──
     // Riusa i buffer pre-allocati invece di allocare vettori locali.
-    matvec(lw.attn_q_w.data(), x, bufs.Q.data(), n_embd, n_embd);
-    matvec(lw.attn_k_w.data(), x, bufs.K.data(), kv_dim, n_embd);
-    matvec(lw.attn_v_w.data(), x, bufs.V.data(), kv_dim, n_embd);
+    matvec_quant(lw.attn_q_w, x, bufs.Q.data());
+    matvec_quant(lw.attn_k_w, x, bufs.K.data());
+    matvec_quant(lw.attn_v_w, x, bufs.V.data());
 
     // ── Step 2: applica RoPE a Q e K ─────────
     //
@@ -550,7 +570,7 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
 
     // ── Step 5: proiezione output ─────────────
     // Legge da attn_acc, scrive in out (bufs.attn_out) — no aliasing.
-    matvec(lw.attn_out_w.data(), bufs.attn_acc.data(), out, n_embd, n_embd);
+    matvec_quant(lw.attn_out_w, bufs.attn_acc.data(), out);
 }
 
 // ─────────────────────────────────────────────
@@ -570,13 +590,12 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
 //  flusso del gradiente durante il training.
 // ─────────────────────────────────────────────
 void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg, InferBuffers& bufs) {
-    const int n_embd = cfg.n_embd;
-    const int n_ff   = cfg.n_ff;
+    const int n_ff = cfg.n_ff;
 
     // Riusa bufs.gate e bufs.up — nessuna allocazione heap.
     // Proiezione gate e up parallele
-    matvec(lw.ffn_gate_w.data(), x, bufs.gate.data(), n_ff, n_embd);
-    matvec(lw.ffn_up_w.data(),   x, bufs.up.data(),   n_ff, n_embd);
+    matvec_quant(lw.ffn_gate_w, x, bufs.gate.data());
+    matvec_quant(lw.ffn_up_w,   x, bufs.up.data());
 
     // SiLU sul gate, poi Hadamard: gate ⊙ up
     silu(bufs.gate.data(), n_ff);
@@ -584,7 +603,7 @@ void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, cons
         bufs.gate[i] *= bufs.up[i];
 
     // Proiezione down: n_ff → n_embd
-    matvec(lw.ffn_down_w.data(), bufs.gate.data(), out, n_embd, n_ff);
+    matvec_quant(lw.ffn_down_w, bufs.gate.data(), out);
 }
 
 // ─────────────────────────────────────────────
@@ -633,14 +652,12 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
     // ── Step 1: embedding lookup ──────────────
     auto t0 = now();
 
-    if (is_llama) {
-        const float* te = w.token_embd.data() + token_id * n_embd;
-        vec_copy(te, b.x.data(), n_embd);
-    } else {
-        embedding_lookup(w.token_embd.data(),
-                         w.pos_embd.data(),
-                         token_id, pos,
-                         b.x.data(), n_embd);
+    // Dequantizza solo la riga corrispondente al token corrente
+    dequant_row(w.token_embd, token_id, b.x.data());
+    if (!is_llama) {
+        // GPT2: somma il positional embedding (già float32)
+        const float* pe = w.pos_embd.data() + pos * n_embd;
+        vec_add(b.x.data(), pe, b.x.data(), n_embd);
     }
 
     auto t1 = now();
@@ -714,11 +731,9 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
 
     // ── Step 4: lm_head → logits ──────────────
     logits.resize(cfg.n_vocab);
-    const float* lm_head = is_llama
-        ? w.output_w.data()
-        : w.token_embd.data();
-
-    matvec(lm_head, b.ln_final.data(), logits.data(), cfg.n_vocab, n_embd);
+    // LLaMA: lm_head separato | GPT2: weight tying con token_embd
+    const QuantTensor& lm_head = is_llama ? w.output_w : w.token_embd;
+    matvec_quant(lm_head, b.ln_final.data(), logits.data());
 
     // ── Accumula tempi benchmark ───────────────
     if (bench_mode) {
