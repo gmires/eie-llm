@@ -2,7 +2,7 @@
 
 Motore di inferenza per modelli linguistici (LLM) scritto in **C++17 da zero**, con scopo **didattico**.
 
-L'obiettivo non è la velocità o la completezza: è capire dall'interno come funziona un LLM, costruendo pezzo per pezzo tutto il necessario — dalla lettura del file binario fino alla generazione di testo nella shell.
+L'obiettivo non è la velocità o la completezza: è **capire dall'interno** come funziona un LLM, costruendo pezzo per pezzo tutto il necessario — dalla lettura del file binario fino alla generazione di testo nella shell.
 
 ---
 
@@ -22,8 +22,8 @@ Puoi:
 
 | Modello | Stato | File |
 |---------|-------|------|
-| **GPT-2 small** (124M, Q8\_0) | Funzionante | `models/gpt2.Q8_0.gguf` |
-| **TinyLlama 1.1B Chat** (Q4\_K\_M) | Funzionante | `models/tinyllama.Q4_K_M.gguf` |
+| **GPT-2 small** (124M, Q8_0) | Funzionante | `models/gpt2.Q8_0.gguf` |
+| **TinyLlama 1.1B Chat** (Q4_K_M) | Funzionante | `models/tinyllama.Q4_K_M.gguf` |
 
 ---
 
@@ -209,7 +209,7 @@ I modelli sono distribuiti nel formato **GGUF** (un file binario strutturato). C
 
 ### 2. Quantizzazione — perché i modelli sono così piccoli
 
-Un modello con 1.1 miliardi di parametri in float32 occuperebbe ~4.4 GB. TinyLlama in Q4\_K\_M pesa ~638 MB perché ogni peso è compresso a ~4 bit invece di 32.
+Un modello con 1.1 miliardi di parametri in float32 occuperebbe ~4.4 GB. TinyLlama in Q4_K_M pesa ~638 MB perché ogni peso è compresso a ~4 bit invece di 32.
 
 `ops.cpp` decomprime i pesi al volo, **riga per riga durante il forward pass**, senza mai materializzare l'intera matrice in float32. I formati supportati:
 
@@ -217,11 +217,11 @@ Un modello con 1.1 miliardi di parametri in float32 occuperebbe ~4.4 GB. TinyLla
 |---------|----------|----------|
 | F32 | 32 | norme, bias, positional embedding |
 | F16 | 16 | alcuni layer |
-| Q8\_0 | 8 | GPT-2 |
-| Q4\_K | 4 | TinyLlama (pesi principali) |
-| Q6\_K | 6 | TinyLlama (output e attention V) |
+| Q8_0 | 8 | GPT-2 |
+| Q4_K | 4 | TinyLlama (pesi principali) |
+| Q6_K | 6 | TinyLlama (output e attention V) |
 
-I pesi sono rappresentati in memoria dal tipo `QuantTensor` (raw bytes + tipo + shape). Il dispatch avviene in `matvec_quant()`: per F32 fa un cast diretto, per F16/Q8\_0/Q4\_K/Q6\_K dequantizza un super-block alla volta accumulando il prodotto scalare.
+I pesi sono rappresentati in memoria dal tipo `QuantTensor` (raw bytes + tipo + shape). Il dispatch avviene in `matvec_quant()`: per F32 fa un cast diretto, per F16/Q8_0/Q4_K/Q6_K dequantizza un super-block alla volta accumulando il prodotto scalare.
 
 ### 3. Il Tokenizer
 
@@ -286,6 +286,92 @@ Il modello produce un vettore di ~32000 logit (uno per token). Per scegliere il 
 
 ---
 
+## Ottimizzazioni SIMD — una lezione pratica
+
+### Cosa sono AVX2 e FMA?
+
+Le CPU moderne hanno **registri SIMD** (Single Instruction, Multiple Data): invece di operare su un singolo numero alla volta, possono operare su un **vettore di numeri** con una sola istruzione.
+
+- **AVX2** (Advanced Vector Extensions 2) introduce registri a **256 bit**. Un registro `__m256` può contenere 8 float a 32 bit (o 4 double a 64 bit).
+- **FMA** (Fused Multiply-Add) permette di calcolare `a * b + c` in un'unica istruzione, con precisione maggiore rispetto a fare prima `a * b` e poi `+ c` separatamente.
+- **F16C** converte 8 numeri float16 → float32 (o viceversa) in un ciclo.
+
+Perché è importante? Nel transformer, il 90% del tempo è speso nel prodotto matrice-vettore (`matvec`). Con il codice scalare:
+```cpp
+for (int j = 0; j < in_dim; j++)
+    sum += row[j] * x[j];  // 1 multiply-add per ciclo
+```
+
+Con AVX2+FMA:
+```cpp
+__m256 a_vec = _mm256_loadu_ps(row + j);
+__m256 x_vec = _mm256_loadu_ps(x + j);
+sum_vec = _mm256_fmadd_ps(a_vec, x_vec, sum_vec);  // 8 multiply-add per ciclo
+```
+
+Teoricamente, questo è **8x più veloce**.
+
+### Perché non `-march=native` su tutto il binario?
+
+Se compilassimo l'intero progetto con `-march=native`, il compilatore inserirebbe istruzioni AVX2 ovunque: in `main()`, in `gguf.cpp`, persino nei costruttori di `std::vector`. Questo renderebbe il binario **incompatibile con CPU senza AVX2** (crash all'avvio con `SIGILL`).
+
+La soluzione usata qui è il **dispatcher runtime** — un pattern classico nei motori di calcolo:
+
+1. **`cpuinfo.cpp`** interroga la CPU via `CPUID` per sapere se AVX2, FMA e F16C sono presenti. Verifica anche che l'OS abbia abilitato lo stato YMM (registro `XCR0` via `XGETBV`), altrimenti le istruzioni AVX causerebbero un crash anche se la CPU le supporta.
+
+2. **`ops_avx2.cpp`** è compilato **solo** con `-mavx2 -mfma` (tramite `set_source_files_properties` in CMake). Tutte le funzioni qui dentro usano intrinsics esplicite.
+
+3. **`ops.cpp`** contiene le versioni scalari di riferimento. All'inizio di ogni kernel c'è un dispatcher:
+
+```cpp
+static CPUFeatures f = cpu_features();
+if (f.avx2 && f.fma && avx2_enabled()) {
+    matvec_xxx_avx2(A, x, y, out_dim, in_dim);
+    return;
+}
+// ... fallback scalare
+```
+
+Il `static` garantisce che il rilevamento avvenga una sola volta, alla prima chiamata. Se la CPU non ha AVX2, il programma continua tranquillamente con i loop scalari.
+
+**Disabilitare AVX2 manualmente** — se si sospetta un problema numerico o si vuole confrontare le prestazioni, è possibile forzare il fallback scalare:
+
+```bash
+EIE_NO_AVX2=1 ./build/eie-llm models/tinyllama.Q4_K_M.gguf
+```
+
+### Kernel AVX2 implementati
+
+| Formato | Tecnica SIMD | Note |
+|---|---|---|
+| **F32** | `_mm256_loadu_ps` + `_mm256_fmadd_ps` | 8 float per ciclo, riduzione orizzontale finale |
+| **F16** | `_mm256_cvtph_ps` (F16C) + FMADD | Converte 8 half → float in un'istruzione |
+| **Q8_0** | `_mm256_cvtepi8_epi32` + broadcast scale | Scompatta 32 int8 in 4× __m256 float |
+| **Q4_K** | Dequant + FMADD su buffer allineato | Dequantizza sub-block 32 elem, poi 4 FMADD |
+| **Q6_K** | Dequant + FMADD su buffer allineato | Stessa strategia di Q4_K, buffer 64 float |
+
+### La strategia "dequantizza-then-dot"
+
+Per i formati quantizzati (Q4_K, Q6_K), fare masking e shift bit-a-bit in-SIMD è complessissimo. I pesi sono compressi in nibble (4 bit), con scale e minimi condivisi tra gruppi. Invece di implementare la dequantizzazione puramente in assembly SIMD, usiamo una strategia ibrida:
+
+1. **Dequantizzazione scalare**: estraiamo i nibble, applichiamo scale e minimi, ottenendo 32 (o 64) float in un buffer temporaneo sullo stack.
+2. **Dot product SIMD**: usiamo gli stessi FMADD del caso F32 sul buffer temporaneo.
+
+Questo elimina il loop scalare interno di 32 iterazioni, che era il vero collo di bottiglia, mantenendo il codice leggibile e corretto.
+
+### Un bug reale: cosa succede quando manca un FMADD
+
+Durante lo sviluppo del kernel Q6_K, un errore di copia-incolla ha causato la mancata elaborazione di 64 elementi per super-block (il secondo gruppo di 32 elementi nella prima metà). Il risultato? Output completamente incoerente, caratteri strani, risposte senza senso.
+
+Questo accade perché i pesi Q6_K sono usati per `attn_v` (i valori dell'attention) e `output.weight` (la proiezione finale). Un errore del 25% su questi pesi si propaga in modo catastrofico attraverso i 22 layer del modello.
+
+**Morale**: le ottimizzazioni SIMD sono potenti ma fragili. Per questo il progetto include:
+- Test unitari che confrontano ogni kernel AVX2 con la versione scalare
+- La variabile `EIE_NO_AVX2` per fallback immediato
+- Commenti dettagliati che spiegano ogni passaggio SIMD
+
+---
+
 ## Prestazioni e limiti
 
 Questa è un'implementazione **didattica**: correttezza e leggibilità del codice vengono prima delle prestazioni. Detto questo, è utile capire dove va il tempo e la memoria.
@@ -296,14 +382,14 @@ I pesi sono mantenuti nel formato quantizzato originale (`QuantTensor`) e dequan
 
 | | Disco (quantizzato) | RAM pesi (prima) | RAM pesi (ora) |
 |---|---|---|---|
-| token\_embd + output.weight | ~110 MB | ~512 MB | ~110 MB |
+| token_embed + output.weight | ~110 MB | ~512 MB | ~110 MB |
 | 22 × (attn Q/K/V/out) | ~120 MB | ~440 MB | ~120 MB |
 | 22 × (ffn gate + up + down) | ~408 MB | ~2.9 GB | ~408 MB |
 | **Totale pesi** | **~638 MB** | **~4.2 GB** | **~638 MB** |
 
 In pratica il processo occupa ~700–800 MB totali (pesi + KV cache + buffer attivazioni), contro i ~4.5 GB precedenti.
 
-Un ulteriore vantaggio è la **cache efficiency**: una riga di `ffn_gate_w` in Q4\_K è 1152 byte (entra in L2), contro 8 KB in float32. Ciò riduce la pressione sul memory bandwidth, che era il vero collo di bottiglia.
+Un ulteriore vantaggio è la **cache efficiency**: una riga di `ffn_gate_w` in Q4_K è 1152 byte (entra in L2), contro 8 KB in float32. Ciò riduce la pressione sul memory bandwidth, che era il vero collo di bottiglia.
 
 ### Velocità — il collo di bottiglia è `matvec`
 
@@ -328,45 +414,6 @@ Con il kernel AVX2 attivo, il throughput sale significativamente grazie all'elab
 
 ---
 
-## Ottimizzazioni SIMD — come funzionano
-
-### Perché non `-march=native` su tutto?
-
-Se compilassimo l'intero progetto con `-march=native`, il compilatore inserirebbe istruzioni AVX2 ovunque: in `main()`, in `gguf.cpp`, persino nei costruttori di `std::vector`. Questo renderebbe il binario **incompatibile con CPU senza AVX2** (crash all'avvio).
-
-La soluzione usata qui è il **dispatcher runtime**:
-
-1. **`cpuinfo.cpp`** interroga la CPU via `CPUID` per sapere se AVX2, FMA e F16C sono presenti. Verifica anche che l'OS abbia abilitato lo stato YMM (registro `XCR0`), altrimenti le istruzioni AVX causerebbero un `SIGILL`.
-
-2. **`ops_avx2.cpp`** è compilato **solo** con `-mavx2 -mfma` (tramite `set_source_files_properties` in CMake). Tutte le funzioni qui dentro usano intrinsics esplicite (`_mm256_fmadd_ps`, `_mm256_cvtph_ps`, ecc.).
-
-3. **`ops.cpp`** contiene le versioni scalari di riferimento. All'inizio di ogni kernel (`matvec`, `matvec_f16`, `matvec_q8_0`, `matvec_q4k`, `matvec_q6k`) c'è un dispatcher:
-
-```cpp
-static CPUFeatures f = cpu_features();
-if (f.avx2 && f.fma) {
-    matvec_xxx_avx2(A, x, y, out_dim, in_dim);
-    return;
-}
-// ... fallback scalare
-```
-
-Il `static` garantisce che il rilevamento avvenga una sola volta, alla prima chiamata. Se la CPU non ha AVX2, il programma continua tranquillamente con i loop scalari.
-
-### Kernel AVX2 implementati
-
-| Formato | Tecnica SIMD | Note |
-|---|---|---|
-| **F32** | `_mm256_loadu_ps` + `_mm256_fmadd_ps` | 8 float per ciclo, riduzione orizzontale finale |
-| **F16** | `_mm256_cvtph_ps` (F16C) + FMADD | Converte 8 half → float in un'istruzione |
-| **Q8_0** | `_mm256_cvtepi8_epi32` + broadcast scale | Scompatta 32 int8 in 4× __m256 float |
-| **Q4_K** | Dequant + FMADD su buffer allineato | Dequantizza sub-block 32 elem, poi 4 FMADD |
-| **Q6_K** | Dequant + FMADD su buffer allineato | Stessa strategia di Q4_K, buffer 64 float |
-
-La strategia "dequantizza-then-dot" per Q4_K e Q6_K è un compromesso tra velocità e complessità: invece di fare masking e shift bit-a-bit in-SIMD (complessissimo per i nibble), dequantizziamo ogni sub-block in un `float[32]` temporaneo sullo stack, poi usiamo gli stessi FMADD del caso F32. Questo elimina il loop scalare interno di 32 iterazioni, che era il vero collo di bottiglia.
-
----
-
 ## Roadmap
 
 - [x] Fase 1 — Parser GGUF: header + metadata KV
@@ -376,13 +423,13 @@ La strategia "dequantizza-then-dot" per Q4_K e Q6_K è un compromesso tra veloci
 - [x] Fase 5 — Shell interattiva con linenoise
 - [x] Fase 6 — Server HTTP minimale
 - [x] Fase 7 — Sampling avanzato (top-k, top-p, repetition penalty)
-- [x] Fase 8 — Dequantizzazione Q4\_K e Q6\_K
+- [x] Fase 8 — Dequantizzazione Q4_K e Q6_K
 - [x] Fase 9 — Architettura LLaMA (RoPE, RMSNorm, SwiGLU, GQA)
-- [x] Fase 10 — Fix dequantizzazione Q6\_K (bug indici scale)
+- [x] Fase 10 — Fix dequantizzazione Q6_K (bug indici scale)
 - [x] Fase 11 — Tokenizer SentencePiece Viterbi unigram
 - [x] Fase 12 — Chat template (shell + server HTTP)
 - [x] Fase 13 — Buffer di inferenza pre-allocati (eliminazione malloc nel hot path)
-- [x] Fase 14 — Dequantizzazione lazy: `QuantTensor` + kernel `matvec_quant` (−3.5 GB RAM, F32/F16/Q8\_0/Q4\_K/Q6\_K)
+- [x] Fase 14 — Dequantizzazione lazy: `QuantTensor` + kernel `matvec_quant` (−3.5 GB RAM, F32/F16/Q8_0/Q4_K/Q6_K)
 - [x] Fase 15 — Ottimizzazioni matvec AVX2+FMA con dispatcher runtime (tutti i formati quantizzati)
 - [ ] Fase 16 — OpenMP sul loop esterno dei matvec
 - [ ] Fase 17 — Streaming HTTP (Server-Sent Events, token per token)

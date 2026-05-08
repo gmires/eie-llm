@@ -6,6 +6,9 @@
 #include <cpuid.h>
 #endif
 
+#include <cstdlib>
+#include <string>
+
 // ─────────────────────────────────────────────
 //  Wrapper cross-platform per l'istruzione CPUID
 //
@@ -96,4 +99,28 @@ CPUFeatures cpu_features() {
 
     initialized = true;
     return features;
+}
+
+// ─────────────────────────────────────────────
+//  Controllo override utente per AVX2
+//
+//  Se la variabile d'ambiente EIE_NO_AVX2 è
+//  impostata a "1", "true" o "yes", disabilita
+//  l'uso dei kernel AVX2 anche se la CPU li
+//  supporta. Utile per debug o se si sospetta
+//  un problema numerico con i kernel SIMD.
+// ─────────────────────────────────────────────
+bool avx2_enabled() {
+    static bool checked = false;
+    static bool enabled = true;
+    if (checked) return enabled;
+
+    const char* env = std::getenv("EIE_NO_AVX2");
+    if (env) {
+        std::string s(env);
+        if (s == "1" || s == "true" || s == "yes" || s == "TRUE" || s == "YES")
+            enabled = false;
+    }
+    checked = true;
+    return enabled;
 }

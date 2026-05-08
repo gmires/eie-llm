@@ -29,3 +29,8 @@ struct CPUFeatures {
 // Rileva le capability della CPU (AVX2, FMA, F16C).
 // Thread-safe dopo la prima chiamata; il risultato è cached.
 CPUFeatures cpu_features();
+
+// Controlla se l'utente ha disabilitato AVX2 via variabile d'ambiente
+// EIE_NO_AVX2=1. Questo permette di forzare il fallback scalare
+// per debug o compatibilità.
+bool avx2_enabled();

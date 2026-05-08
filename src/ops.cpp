@@ -334,7 +334,7 @@ std::vector<float> tensor_to_float(const GGUFTensor& t) {
 // ─────────────────────────────────────────────
 void matvec_q4k(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
     static CPUFeatures f = cpu_features();
-    if (f.avx2 && f.fma) {
+    if (f.avx2 && f.fma && avx2_enabled()) {
         matvec_q4k_avx2(A, x, y, out_dim, in_dim);
         return;
     }
@@ -402,7 +402,7 @@ void matvec_q4k(const uint8_t* A, const float* x, float* y, int out_dim, int in_
 // ─────────────────────────────────────────────
 void matvec_q6k(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
     static CPUFeatures f = cpu_features();
-    if (f.avx2 && f.fma) {
+    if (f.avx2 && f.fma && avx2_enabled()) {
         matvec_q6k_avx2(A, x, y, out_dim, in_dim);
         return;
     }
@@ -460,7 +460,7 @@ void matvec_q6k(const uint8_t* A, const float* x, float* y, int out_dim, int in_
 // ─────────────────────────────────────────────
 void matvec_q8_0(const uint8_t* A, const float* x, float* y, int out_dim, int in_dim) {
     static CPUFeatures f = cpu_features();
-    if (f.avx2 && f.fma) {
+    if (f.avx2 && f.fma && avx2_enabled()) {
         matvec_q8_0_avx2(A, x, y, out_dim, in_dim);
         return;
     }
@@ -499,7 +499,7 @@ void matvec_q8_0(const uint8_t* A, const float* x, float* y, int out_dim, int in
 // ─────────────────────────────────────────────
 void matvec_f16(const uint16_t* A, const float* x, float* y, int out_dim, int in_dim) {
     static CPUFeatures f = cpu_features();
-    if (f.avx2 && f.fma && f.f16c) {
+    if (f.avx2 && f.fma && f.f16c && avx2_enabled()) {
         matvec_f16_avx2(A, x, y, out_dim, in_dim);
         return;
     }
@@ -635,7 +635,7 @@ void matmul(const float* A, const float* B, float* C,
 void matvec(const float* A, const float* x, float* y,
             int out_dim, int in_dim) {
     static CPUFeatures f = cpu_features();
-    if (f.avx2 && f.fma) {
+    if (f.avx2 && f.fma && avx2_enabled()) {
         matvec_avx2(A, x, y, out_dim, in_dim);
         return;
     }

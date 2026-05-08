@@ -350,11 +350,17 @@ void matvec_q6k_avx2(const uint8_t* A, const float* x, float* y, int out_dim, in
                     dequant[l + 32] = d * sc_n[is + 2] * q2;
                 }
 
-                // Dot product AVX2 sui primi 32 elementi (0..31)
+                // Dot product AVX2 sui primi 32 elementi (0..31)  — q1
                 sum_vec = _mm256_fmadd_ps(_mm256_loadu_ps(dequant),     _mm256_loadu_ps(xn),      sum_vec);
                 sum_vec = _mm256_fmadd_ps(_mm256_loadu_ps(dequant + 8),  _mm256_loadu_ps(xn + 8),  sum_vec);
                 sum_vec = _mm256_fmadd_ps(_mm256_loadu_ps(dequant + 16), _mm256_loadu_ps(xn + 16), sum_vec);
                 sum_vec = _mm256_fmadd_ps(_mm256_loadu_ps(dequant + 24), _mm256_loadu_ps(xn + 24), sum_vec);
+
+                // Dot product AVX2 sugli elementi 32..63 — q2
+                sum_vec = _mm256_fmadd_ps(_mm256_loadu_ps(dequant + 32), _mm256_loadu_ps(xn + 32), sum_vec);
+                sum_vec = _mm256_fmadd_ps(_mm256_loadu_ps(dequant + 40), _mm256_loadu_ps(xn + 40), sum_vec);
+                sum_vec = _mm256_fmadd_ps(_mm256_loadu_ps(dequant + 48), _mm256_loadu_ps(xn + 48), sum_vec);
+                sum_vec = _mm256_fmadd_ps(_mm256_loadu_ps(dequant + 56), _mm256_loadu_ps(xn + 56), sum_vec);
 
                 // --- Secondi due gruppi di 32 elementi (q3 e q4) ---
                 for (int l = 0; l < 32; l++) {
