@@ -213,17 +213,48 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
 //    n_ctx × n_head × d_head = n_ctx × n_embd
 //  Inizializzati a zero.
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+//  Inizializza KV cache e buffer di inferenza
+//
+//  La KV cache viene azzerata ad ogni reset
+//  (nuova conversazione). I buffer di inferenza
+//  vengono allocati una sola volta e riusati
+//  ad ogni forward step — eliminano centinaia
+//  di malloc/free per token generato.
+//
+//  Se chiamata più volte, la KV cache viene
+//  resettata ma i buffer NON vengono riallocati
+//  (hanno già la dimensione giusta).
+// ─────────────────────────────────────────────
 void model_init_kvcache(Model& model) {
     const ModelConfig& cfg = model.config;
 
-    // LLaMA GQA: la cache KV usa n_head_kv, non n_head
-    // GPT-2: n_head_kv == n_head quindi formula uguale
-    int kv_dim    = cfg.n_head_kv * cfg.d_head;
+    // ── KV Cache ──────────────────────────────
+    // LLaMA GQA: la cache usa n_head_kv, non n_head
+    int kv_dim     = cfg.n_head_kv * cfg.d_head;
     int cache_size = cfg.n_ctx * kv_dim;
 
     model.kv_cache.k.assign(cfg.n_layer, std::vector<float>(cache_size, 0.0f));
     model.kv_cache.v.assign(cfg.n_layer, std::vector<float>(cache_size, 0.0f));
     model.kv_cache.n_cached = 0;
+
+    // ── Buffer di inferenza ───────────────────
+    // Alloca (o ridimensiona) i buffer una sola volta.
+    // resize() non riallocat se la size non cambia.
+    InferBuffers& b = model.bufs;
+    b.x       .resize(cfg.n_embd);
+    b.residual.resize(cfg.n_embd);
+    b.ln_out  .resize(cfg.n_embd);
+    b.attn_out.resize(cfg.n_embd);  // output FINALE attention (dopo matvec proj)
+    b.attn_acc.resize(cfg.n_embd);  // accumulatore INTERNO weighted sum V
+    b.ffn_out .resize(cfg.n_embd);
+    b.ln_final.resize(cfg.n_embd);
+    b.Q       .resize(cfg.n_embd);  // n_head × d_head
+    b.K       .resize(kv_dim);      // n_head_kv × d_head
+    b.V       .resize(kv_dim);
+    b.scores  .resize(cfg.n_ctx);   // worst case: contesto pieno
+    b.gate    .resize(cfg.n_ff);    // FFN SwiGLU
+    b.up      .resize(cfg.n_ff);
 }
 // ─────────────────────────────────────────────
 //  Stampa configurazione
@@ -328,7 +359,7 @@ void embedding_lookup(const float* token_embd, const float* pos_embd, int token_
 //  - al passo pos=n Q viene da pos n,
 //    ma K e V vengono da pos 0..n
 // ─────────────────────────────────────────────
-void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos) {
+void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs) {
 
     const int n_embd  = cfg.n_embd;
     const int n_head  = cfg.n_head;
@@ -338,97 +369,59 @@ void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache&
     //
     // La matrice attn_qkv_w ha shape [3*n_embd × n_embd]
     // e produce Q, K, V concatenati in un unico vettore.
-    // Lo splittiamo in 3 parti uguali da n_embd ciascuna.
+    // Usiamo bufs.Q come buffer temporaneo per [Q|K|V].
+    // bufs.Q ha dimensione n_embd — troppo piccolo per
+    // Q+K+V in GPT-2 (3*n_embd), quindi allochiamo qkv
+    // come vettore locale. Solo per GPT-2, che ha n_embd
+    // piccolo (768), l'overhead è trascurabile.
     std::vector<float> qkv(3 * n_embd);
     matvec(lw.attn_qkv_w.data(), x, qkv.data(), 3 * n_embd, n_embd);
-
-    // Aggiungi i bias
     vec_add(qkv.data(), lw.attn_qkv_b.data(), qkv.data(), 3 * n_embd);
 
-    // Puntatori alle 3 sezioni del vettore qkv
     const float* Q = qkv.data();
     const float* K = qkv.data() + n_embd;
     const float* V = qkv.data() + 2 * n_embd;
 
     // ── Step 2: salva K e V nella cache ───────
-    //
-    // Ogni posizione occupa n_embd float nella cache.
-    // Layout: cache[pos * n_embd + i]
     float* k_pos = cache.k[layer].data() + pos * n_embd;
     float* v_pos = cache.v[layer].data() + pos * n_embd;
     vec_copy(K, k_pos, n_embd);
     vec_copy(V, v_pos, n_embd);
 
     // ── Step 3: attention per ogni head ───────
-    //
-    // Ogni head lavora su una "fetta" di Q, K, V
-    // di dimensione d_head = n_embd / n_head.
-    // Head h lavora su indici [h*d_head, (h+1)*d_head)
-    std::vector<float> attn_out(n_embd, 0.0f);
+    // bufs.attn_acc = accumulatore interno della weighted sum di V.
+    // DEVE essere distinto da `out` (= bufs.attn_out nel chiamante)
+    // perché il matvec finale legge da attn_acc e scrive in out —
+    // se coincidessero ci sarebbe aliasing e il risultato sarebbe corrotto.
+    std::fill(bufs.attn_acc.begin(), bufs.attn_acc.end(), 0.0f);
 
-    // scores[t] conterrà il peso di attenzione
-    // del token corrente verso il token t
-    std::vector<float> scores(pos + 1);
+    float scale = 1.0f / sqrtf((float)d_head);
 
     for (int h = 0; h < n_head; h++) {
-        // Offset della fetta di questo head
         int h_off = h * d_head;
-
-        // Q per questo head
         const float* Qh = Q + h_off;
 
-        // ── Calcola scores = Q·Kᵀ / √d_head ──
-        //
-        // Per ogni posizione t già in cache
-        // calcoliamo il dot product di Qh con Kh[t].
-        // Dividiamo per √d_head per stabilità
-        // (evita che i dot product crescano troppo
-        //  con d_head grande, saturando il softmax)
-        float scale = 1.0f / sqrtf((float)d_head);
-
         for (int t = 0; t <= pos; t++) {
-            // K per il token t, head h dalla cache
-            const float* Kh_t = cache.k[layer].data()
-                                + t * n_embd + h_off;
-
-            // Dot product Q·K
+            const float* Kh_t = cache.k[layer].data() + t * n_embd + h_off;
             float dot = 0.0f;
             for (int d = 0; d < d_head; d++)
                 dot += Qh[d] * Kh_t[d];
-
-            scores[t] = dot * scale;
+            bufs.scores[t] = dot * scale;
         }
 
-        // ── Softmax sugli scores ───────────────
-        //
-        // Trasforma i punteggi grezzi in pesi
-        // di attenzione che sommano a 1.
-        // La maschera causale è implicita:
-        // iteriamo solo su t <= pos quindi non
-        // vediamo mai token futuri.
-        softmax(scores.data(), pos + 1);
+        softmax(bufs.scores.data(), pos + 1);
 
-        // ── Weighted sum dei V ─────────────────
-        //
-        // L'output di questo head è la somma
-        // pesata dei vettori V di tutti i token,
-        // dove i pesi sono gli attention scores.
-        float* out_h = attn_out.data() + h_off;
-
+        float* acc_h = bufs.attn_acc.data() + h_off;
         for (int t = 0; t <= pos; t++) {
-            const float* Vh_t = cache.v[layer].data()
-                                + t * n_embd + h_off;
+            const float* Vh_t = cache.v[layer].data() + t * n_embd + h_off;
             for (int d = 0; d < d_head; d++)
-                out_h[d] += scores[t] * Vh_t[d];
+                acc_h[d] += bufs.scores[t] * Vh_t[d];
         }
     }
 
     // ── Step 4: proiezione output ──────────────
-    //
-    // Riproietta il risultato dell'attention
-    // nello spazio n_embd con una matrice lineare.
-    // attn_out_w: [n_embd × n_embd]
-    matvec(lw.attn_out_w.data(), attn_out.data(), out, n_embd, n_embd);
+    // Legge da attn_acc, scrive in out (bufs.attn_out) — no aliasing.
+    matvec(lw.attn_out_w.data(), bufs.attn_acc.data(), out, n_embd, n_embd);
     vec_add(out, lw.attn_out_b.data(), out, n_embd);
 }
 
@@ -453,22 +446,21 @@ void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache&
 // ─────────────────────────────────────────────
 void feed_forward(const float* x, float* out,
                   const LayerWeights& lw,
-                  const ModelConfig& cfg) {
+                  const ModelConfig& cfg,
+                  InferBuffers& bufs) {
     const int n_embd = cfg.n_embd;
     const int n_ff   = cfg.n_ff;
 
-    // Buffer intermedio per la proiezione up
-    std::vector<float> h(n_ff);
-
-    // Step 1: proiezione up x → h [n_embd → n_ff]
-    matvec(lw.ffn_fc1_w.data(), x, h.data(), n_ff, n_embd);
-    vec_add(h.data(), lw.ffn_fc1_b.data(), h.data(), n_ff);
+    // Riusa bufs.gate come buffer intermedio per la proiezione up.
+    // Step 1: proiezione up x → gate [n_embd → n_ff]
+    matvec(lw.ffn_fc1_w.data(), x, bufs.gate.data(), n_ff, n_embd);
+    vec_add(bufs.gate.data(), lw.ffn_fc1_b.data(), bufs.gate.data(), n_ff);
 
     // Step 2: attivazione GELU in-place
-    gelu(h.data(), n_ff);
+    gelu(bufs.gate.data(), n_ff);
 
-    // Step 3: proiezione down h → out [n_ff → n_embd]
-    matvec(lw.ffn_fc2_w.data(), h.data(), out, n_embd, n_ff);
+    // Step 3: proiezione down → out [n_ff → n_embd]
+    matvec(lw.ffn_fc2_w.data(), bufs.gate.data(), out, n_embd, n_ff);
     vec_add(out, lw.ffn_fc2_b.data(), out, n_embd);
 }
 
@@ -489,26 +481,20 @@ void feed_forward(const float* x, float* out,
 //     condivide lo stesso head K e V
 //     kv_head = q_head / (n_head / n_head_kv)
 // ─────────────────────────────────────────────
-void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos) {
+void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs) {
 
     const int n_embd    = cfg.n_embd;
     const int n_head    = cfg.n_head;
     const int n_head_kv = cfg.n_head_kv;
     const int d_head    = cfg.d_head;
     const int rope_dim  = cfg.rope_dim;
-
-    // Dimensione totale K e V (n_head_kv × d_head)
-    const int kv_dim = n_head_kv * d_head;
+    const int kv_dim    = n_head_kv * d_head;
 
     // ── Step 1: proiezione Q, K, V separata ──
-    std::vector<float> Q(n_embd);          // n_head × d_head
-    std::vector<float> K(kv_dim);          // n_head_kv × d_head
-    std::vector<float> V(kv_dim);          // n_head_kv × d_head
-
-    matvec(lw.attn_q_w.data(), x, Q.data(), n_embd,  n_embd);
-    matvec(lw.attn_k_w.data(), x, K.data(), kv_dim,  n_embd);
-    matvec(lw.attn_v_w.data(), x, V.data(), kv_dim,  n_embd);
-    // LLaMA non ha bias nelle proiezioni attention
+    // Riusa i buffer pre-allocati invece di allocare vettori locali.
+    matvec(lw.attn_q_w.data(), x, bufs.Q.data(), n_embd, n_embd);
+    matvec(lw.attn_k_w.data(), x, bufs.K.data(), kv_dim, n_embd);
+    matvec(lw.attn_v_w.data(), x, bufs.V.data(), kv_dim, n_embd);
 
     // ── Step 2: applica RoPE a Q e K ─────────
     //
@@ -517,61 +503,54 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
     // in cache in modo che la cache contenga già
     // i vettori ruotati — non bisogna ricalcolare
     // la rotazione per i token già in cache.
-    rope(Q.data(), pos, n_head,    d_head, rope_dim, cfg.rope_freq_base);
-    rope(K.data(), pos, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+    rope(bufs.Q.data(), pos, n_head,    d_head, rope_dim, cfg.rope_freq_base);
+    rope(bufs.K.data(), pos, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
 
     // ── Step 3: salva K e V nella cache ──────
     float* k_pos = cache.k[layer].data() + pos * kv_dim;
     float* v_pos = cache.v[layer].data() + pos * kv_dim;
-    vec_copy(K.data(), k_pos, kv_dim);
-    vec_copy(V.data(), v_pos, kv_dim);
+    vec_copy(bufs.K.data(), k_pos, kv_dim);
+    vec_copy(bufs.V.data(), v_pos, kv_dim);
 
     // ── Step 4: attention con GQA ─────────────
     //
     // GQA: n_head Q head sono divisi in n_head_kv gruppi.
     // Ogni gruppo condivide un head K e V.
-    // Gruppo di head Q h → kv_head = h / (n_head / n_head_kv)
+    // Head Q h → kv_head = h / (n_head / n_head_kv)
     int gqa_ratio = n_head / n_head_kv;
 
-    std::vector<float> attn_out(n_embd, 0.0f);
-    std::vector<float> scores(pos + 1);
+    // Usa attn_acc come accumulatore (separato da out = bufs.attn_out).
+    std::fill(bufs.attn_acc.begin(), bufs.attn_acc.end(), 0.0f);
     float scale = 1.0f / sqrtf((float)d_head);
 
     for (int h = 0; h < n_head; h++) {
-        // Head K/V corrispondente per GQA
         int kv_h   = h / gqa_ratio;
         int h_off  = h    * d_head;
         int kv_off = kv_h * d_head;
 
-        const float* Qh = Q.data() + h_off;
+        const float* Qh = bufs.Q.data() + h_off;
 
-        // Calcola scores = Q·K / √d_head
         for (int t = 0; t <= pos; t++) {
-            const float* Kh_t = cache.k[layer].data()
-                                + t * kv_dim + kv_off;
+            const float* Kh_t = cache.k[layer].data() + t * kv_dim + kv_off;
             float dot = 0.0f;
             for (int d = 0; d < d_head; d++)
                 dot += Qh[d] * Kh_t[d];
-            scores[t] = dot * scale;
+            bufs.scores[t] = dot * scale;
         }
 
-        // Softmax
-        softmax(scores.data(), pos + 1);
+        softmax(bufs.scores.data(), pos + 1);
 
-        // Weighted sum dei V
-        float* out_h = attn_out.data() + h_off;
+        float* acc_h = bufs.attn_acc.data() + h_off;
         for (int t = 0; t <= pos; t++) {
-            const float* Vh_t = cache.v[layer].data()
-                                + t * kv_dim + kv_off;
+            const float* Vh_t = cache.v[layer].data() + t * kv_dim + kv_off;
             for (int d = 0; d < d_head; d++)
-                out_h[d] += scores[t] * Vh_t[d];
+                acc_h[d] += bufs.scores[t] * Vh_t[d];
         }
     }
 
     // ── Step 5: proiezione output ─────────────
-    // LLaMA non ha bias nella proiezione output
-    matvec(lw.attn_out_w.data(), attn_out.data(),
-           out, n_embd, n_embd);
+    // Legge da attn_acc, scrive in out (bufs.attn_out) — no aliasing.
+    matvec(lw.attn_out_w.data(), bufs.attn_acc.data(), out, n_embd, n_embd);
 }
 
 // ─────────────────────────────────────────────
@@ -590,27 +569,22 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
 //  SiLU è più smooth di ReLU e migliora il
 //  flusso del gradiente durante il training.
 // ─────────────────────────────────────────────
-void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg) {
+void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg, InferBuffers& bufs) {
     const int n_embd = cfg.n_embd;
     const int n_ff   = cfg.n_ff;
 
-    std::vector<float> gate(n_ff);
-    std::vector<float> up(n_ff);
-
+    // Riusa bufs.gate e bufs.up — nessuna allocazione heap.
     // Proiezione gate e up parallele
-    matvec(lw.ffn_gate_w.data(), x, gate.data(), n_ff, n_embd);
-    matvec(lw.ffn_up_w.data(),   x, up.data(),   n_ff, n_embd);
+    matvec(lw.ffn_gate_w.data(), x, bufs.gate.data(), n_ff, n_embd);
+    matvec(lw.ffn_up_w.data(),   x, bufs.up.data(),   n_ff, n_embd);
 
-    // Applica SiLU al gate
-    silu(gate.data(), n_ff);
-
-    // Hadamard product: gate ⊙ up
+    // SiLU sul gate, poi Hadamard: gate ⊙ up
+    silu(bufs.gate.data(), n_ff);
     for (int i = 0; i < n_ff; i++)
-        gate[i] *= up[i];
+        bufs.gate[i] *= bufs.up[i];
 
     // Proiezione down: n_ff → n_embd
-    matvec(lw.ffn_down_w.data(), gate.data(), out, n_embd, n_ff);
-    // LLaMA non ha bias nel FFN
+    matvec(lw.ffn_down_w.data(), bufs.gate.data(), out, n_embd, n_ff);
 }
 
 // ─────────────────────────────────────────────
@@ -652,28 +626,21 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
     const int n_embd        = cfg.n_embd;
     const bool is_llama     = (cfg.arch == ArchType::LLAMA);
 
-    // Buffer principale — stato del token
-    std::vector<float> x(n_embd);
-
-    // Buffer temporanei
-    std::vector<float> residual(n_embd);
-    std::vector<float> ln_out(n_embd);
-    std::vector<float> attn_out(n_embd);
-    std::vector<float> ffn_out(n_embd);
+    // Tutti i buffer temporanei sono pre-allocati in model.bufs —
+    // nessuna allocazione heap durante il forward pass.
+    InferBuffers& b = model.bufs;
 
     // ── Step 1: embedding lookup ──────────────
     auto t0 = now();
 
     if (is_llama) {
-        // LLaMA: solo token embedding, niente positional
         const float* te = w.token_embd.data() + token_id * n_embd;
-        vec_copy(te, x.data(), n_embd);
+        vec_copy(te, b.x.data(), n_embd);
     } else {
-        // GPT-2: token embedding + positional embedding
         embedding_lookup(w.token_embd.data(),
                          w.pos_embd.data(),
                          token_id, pos,
-                         x.data(), n_embd);
+                         b.x.data(), n_embd);
     }
 
     auto t1 = now();
@@ -686,81 +653,72 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
         const LayerWeights& lw = w.layers[l];
 
         // ── Salva residual ────────────────────
-        vec_copy(x.data(), residual.data(), n_embd);
+        vec_copy(b.x.data(), b.residual.data(), n_embd);
 
         // ── Norm 1 ────────────────────────────
         auto ta0 = now();
         if (is_llama)
-            rms_norm(x.data(), lw.ln1_w.data(),
-                     ln_out.data(), n_embd, cfg.norm_eps);
+            rms_norm(b.x.data(), lw.ln1_w.data(),
+                     b.ln_out.data(), n_embd, cfg.norm_eps);
         else
-            layer_norm(x.data(), lw.ln1_w.data(),
-                       lw.ln1_b.data(), ln_out.data(), n_embd);
+            layer_norm(b.x.data(), lw.ln1_w.data(),
+                       lw.ln1_b.data(), b.ln_out.data(), n_embd);
 
         // ── Self-Attention ────────────────────
         if (is_llama)
-            self_attention_llama(ln_out.data(), attn_out.data(),
-                                 lw, model.kv_cache, cfg, l, pos);
+            self_attention_llama(b.ln_out.data(), b.attn_out.data(),
+                                 lw, model.kv_cache, cfg, l, pos, b);
         else
-            self_attention(ln_out.data(), attn_out.data(),
-                           lw, model.kv_cache, cfg, l, pos);
+            self_attention(b.ln_out.data(), b.attn_out.data(),
+                           lw, model.kv_cache, cfg, l, pos, b);
 
         auto ta1 = now();
 
         // ── Residual connection 1 ─────────────
-        vec_add(attn_out.data(), residual.data(),
-                x.data(), n_embd);
+        vec_add(b.attn_out.data(), b.residual.data(), b.x.data(), n_embd);
 
         // ── Salva residual ────────────────────
-        vec_copy(x.data(), residual.data(), n_embd);
+        vec_copy(b.x.data(), b.residual.data(), n_embd);
 
         // ── Norm 2 ────────────────────────────
         auto tf0 = now();
         if (is_llama)
-            rms_norm(x.data(), lw.ln2_w.data(),
-                     ln_out.data(), n_embd, cfg.norm_eps);
+            rms_norm(b.x.data(), lw.ln2_w.data(),
+                     b.ln_out.data(), n_embd, cfg.norm_eps);
         else
-            layer_norm(x.data(), lw.ln2_w.data(),
-                       lw.ln2_b.data(), ln_out.data(), n_embd);
+            layer_norm(b.x.data(), lw.ln2_w.data(),
+                       lw.ln2_b.data(), b.ln_out.data(), n_embd);
 
         // ── FFN ───────────────────────────────
         if (is_llama)
-            feed_forward_llama(ln_out.data(), ffn_out.data(),
-                               lw, cfg);
+            feed_forward_llama(b.ln_out.data(), b.ffn_out.data(), lw, cfg, b);
         else
-            feed_forward(ln_out.data(), ffn_out.data(),
-                         lw, cfg);
+            feed_forward(b.ln_out.data(), b.ffn_out.data(), lw, cfg, b);
 
         auto tf1 = now();
 
         // ── Residual connection 2 ─────────────
-        vec_add(ffn_out.data(), residual.data(),
-                x.data(), n_embd);
+        vec_add(b.ffn_out.data(), b.residual.data(), b.x.data(), n_embd);
 
         attn_ms_step += ms_between(ta0, ta1);
         ffn_ms_step  += ms_between(tf0, tf1);
     }
 
     // ── Step 3: norm finale ───────────────────
-    std::vector<float> ln_final(n_embd);
     if (is_llama)
-        rms_norm(x.data(), w.ln_f_w.data(),
-                 ln_final.data(), n_embd, cfg.norm_eps);
+        rms_norm(b.x.data(), w.ln_f_w.data(),
+                 b.ln_final.data(), n_embd, cfg.norm_eps);
     else
-        layer_norm(x.data(), w.ln_f_w.data(),
-                   w.ln_f_b.data(), ln_final.data(), n_embd);
+        layer_norm(b.x.data(), w.ln_f_w.data(),
+                   w.ln_f_b.data(), b.ln_final.data(), n_embd);
 
     // ── Step 4: lm_head → logits ──────────────
-    //
-    // GPT-2: weight tying — usa token_embd trasposta
-    // LLaMA: output.weight separato
     logits.resize(cfg.n_vocab);
     const float* lm_head = is_llama
         ? w.output_w.data()
         : w.token_embd.data();
 
-    matvec(lm_head, ln_final.data(),
-           logits.data(), cfg.n_vocab, n_embd);
+    matvec(lm_head, b.ln_final.data(), logits.data(), cfg.n_vocab, n_embd);
 
     // ── Accumula tempi benchmark ───────────────
     if (bench_mode) {

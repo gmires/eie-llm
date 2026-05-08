@@ -133,12 +133,54 @@ struct KVCache {
 };
 
 // ─────────────────────────────────────────────
+//  Buffer temporanei per l'inferenza
+//
+//  Ogni forward step alloca e dealloca decine di
+//  vettori temporanei (Q, K, V, gate, up, scores…).
+//  Pre-allocarli una sola volta elimina centinaia
+//  di malloc/free per token generato.
+//
+//  Dimensioni al worst case (LLaMA):
+//    x, residual, ln_out, attn_out, ffn_out, ln_final → n_embd (2048)
+//    Q                                                 → n_embd (2048)
+//    K, V                                              → kv_dim (256)
+//    gate, up                                          → n_ff   (5632)
+//    scores                                            → n_ctx  (2048)
+// ─────────────────────────────────────────────
+struct InferBuffers {
+    // ── Buffer del forward pass ───────────────
+    std::vector<float> x;        // stato corrente del token [n_embd]
+    std::vector<float> residual; // salvataggio residual connection [n_embd]
+    std::vector<float> ln_out;   // output della norm (prima di attention o FFN) [n_embd]
+    std::vector<float> attn_out; // output FINALE dell'attention (dopo proiezione) [n_embd]
+    std::vector<float> ffn_out;  // output del FFN [n_embd]
+    std::vector<float> ln_final; // output della norm finale [n_embd]
+
+    // ── Buffer interni dell'attention ─────────
+    // ATTENZIONE: attn_acc e attn_out sono buffer DISTINTI.
+    // attn_acc = accumulatore della weighted sum di V (dentro self_attention)
+    // attn_out = output della proiezione finale (scritto da matvec su attn_acc)
+    // Devono essere separati perché il matvec finale legge da attn_acc
+    // e scrive in attn_out: se coincidessero si avrebbe aliasing.
+    std::vector<float> attn_acc; // accumulatore weighted sum V [n_embd]
+    std::vector<float> Q;        // query vettori [n_embd]
+    std::vector<float> K;        // key vettori [kv_dim]
+    std::vector<float> V;        // value vettori [kv_dim]
+    std::vector<float> scores;   // attention scores [n_ctx]
+
+    // ── Buffer interni del FFN ────────────────
+    std::vector<float> gate;     // gate SwiGLU dopo SiLU [n_ff]
+    std::vector<float> up;       // up projection SwiGLU [n_ff]
+};
+
+// ─────────────────────────────────────────────
 //  Modello completo
 // ─────────────────────────────────────────────
 struct Model {
     ModelConfig  config;
     ModelWeights weights;
     KVCache      kv_cache;
+    InferBuffers bufs;     // buffer pre-allocati per l'inferenza
     BenchAccum   bench;
 };
 
@@ -153,7 +195,9 @@ bool model_load_config(ModelConfig& cfg, const GGUFContext& ctx);
 // dequantizzando in float32
 bool model_load_weights(Model& model, const GGUFContext& ctx);
 
-// Inizializza la KV cache (alloca la memoria)
+// Inizializza la KV cache e pre-alloca i buffer di inferenza.
+// Deve essere chiamata dopo model_load_config.
+// Chiamarla di nuovo resetta la KV cache (nuova conversazione).
 void model_init_kvcache(Model& model);
 
 // Stampa la configurazione del modello
@@ -193,31 +237,22 @@ void embedding_lookup(const float* token_embd, const float* pos_embd, int token_
 // cfg     : configurazione del modello
 // layer   : indice del layer (per la KV cache)
 // pos     : posizione del token corrente
-void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos);
+// Self-attention GPT-2.
+// Usa bufs.scores come buffer temporaneo per gli attention scores.
+void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs);
 
-// Feed-Forward Network
-//
-// Applica il blocco FFN di GPT-2:
-//   h  = GELU(x · fc1_w + fc1_b)   [n_embd → n_ff]
-//   out = h · fc2_w + fc2_b         [n_ff → n_embd]
-//
-// x   : input  [n_embd]
-// out : output [n_embd]
-// lw  : pesi del layer corrente
-// cfg : configurazione del modello
-void feed_forward(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg);
+// Feed-Forward Network GPT-2.
+// Usa bufs.gate come buffer intermedio (proiezione up).
+void feed_forward(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg, InferBuffers& bufs);
 
-// Self-attention LLaMA
-// Differenze rispetto a GPT-2:
-//   - Q/K/V proiettati separatamente
-//   - RoPE applicato a Q e K
-//   - GQA: n_head_kv < n_head, K/V condivisi tra gruppi
-//   - nessun bias
-void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos);
+// Self-attention LLaMA con GQA e RoPE.
+// Usa bufs.Q, bufs.K, bufs.V, bufs.scores come buffer temporanei.
+void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs);
 
-// Feed-forward LLaMA con SwiGLU
-// out = (W2) * ( SiLU(W1·x) ⊙ (W3·x) )
-void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg);
+// Feed-forward LLaMA con SwiGLU.
+// Usa bufs.gate e bufs.up come buffer temporanei.
+// out = ffn_down_w · ( SiLU(ffn_gate_w·x) ⊙ (ffn_up_w·x) )
+void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg, InferBuffers& bufs);
 
 // Forward pass completo per un singolo token
 //

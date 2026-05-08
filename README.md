@@ -1,30 +1,333 @@
 # EIE-LLM — Educational Inference Engine
 
-Motore di inferenza LLM scritto in **C++17 da zero**, con scopo didattico.
-Costruito passo passo: dal parsing del file GGUF fino a un server HTTP
-compatibile con l'API OpenAI. Zero dipendenze pesanti, solo stdlib + httplib.
+Motore di inferenza per modelli linguistici (LLM) scritto in **C++17 da zero**, con scopo **didattico**.
+
+L'obiettivo non è la velocità o la completezza: è capire dall'interno come funziona un LLM, costruendo pezzo per pezzo tutto il necessario — dalla lettura del file binario fino alla generazione di testo nella shell.
 
 ---
 
-## Stato del progetto
+## Cosa fa questo progetto
 
-| Architettura | Stato |
+Prende un file `.gguf` (il formato usato da llama.cpp per distribuire modelli) e lo esegue interamente in C++, senza dipendere da framework come PyTorch o ONNX.
+
+Puoi:
+- **Chattare** con TinyLlama dalla riga di comando
+- **Completare testo** con GPT-2
+- **Interrogarlo via HTTP** con un'API compatibile OpenAI
+- **Misurare le prestazioni** con la modalità benchmark
+
+---
+
+## Modelli supportati
+
+| Modello | Stato | File |
+|---------|-------|------|
+| **GPT-2 small** (124M, Q8\_0) | Funzionante | `models/gpt2.Q8_0.gguf` |
+| **TinyLlama 1.1B Chat** (Q4\_K\_M) | Funzionante | `models/tinyllama.Q4_K_M.gguf` |
+
+---
+
+## Requisiti
+
+- CMake ≥ 3.16
+- GCC ≥ 13 oppure Clang ≥ 15 (serve C++17)
+- `wget` o `curl` per il download dei modelli
+
+---
+
+## Setup e build
+
+```bash
+# 1. Scarica GPT-2 (~176 MB) e la libreria httplib
+chmod +x scripts/setup.sh && ./scripts/setup.sh
+
+# 2. Scarica TinyLlama (~638 MB)
+wget -P models/ \
+  https://huggingface.co/second-state/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  -O models/tinyllama.Q4_K_M.gguf
+
+# 3. Compila in Release (necessario per prestazioni accettabili)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+> **Nota:** compilare in **Release** invece di Debug dà un guadagno immediato di 2-4x grazie alle ottimizzazioni del compilatore (SIMD automatico, inlining, eliminazione dei controlli di debug).
+
+---
+
+## Utilizzo
+
+### Shell interattiva
+
+```bash
+./build/eie-llm models/tinyllama.Q4_K_M.gguf
+./build/eie-llm models/gpt2.Q8_0.gguf
+```
+
+TinyLlama si avvia automaticamente in **modalità chat** perché ha un template nel file GGUF. GPT-2 parte in modalità raw (completamento libero).
+
+**Comandi disponibili:**
+
+| Comando | Descrizione |
+|---------|-------------|
+| `:chat` | Modalità chat — avvolge l'input nel template `<\|user\|>` |
+| `:raw` | Modalità raw — prompt passato direttamente al modello |
+| `:tokens <n>` | Max token da generare (default: 200) |
+| `:temp <f>` | Temperatura del sampling, es. `0.8` (default: 1.0) |
+| `:topk <n>` | Top-k sampling — mantieni solo i k token più probabili (default: 40) |
+| `:topp <f>` | Nucleus sampling — taglia al p% cumulativo (default: 0.9) |
+| `:penalty <f>` | Repetition penalty — scoraggia le ripetizioni (default: 1.1) |
+| `:greedy` | Sampling deterministico (sceglie sempre il token più probabile) |
+| `:sample` | Sampling stocastico — top-k + top-p (default) |
+| `:params` | Mostra i parametri correnti |
+| `:reset` | Svuota la KV cache (ricomincia da capo) |
+| `:quit` | Esci |
+
+**Esempio:**
+```
+eie> Qual è la capitale della Francia?
+Assistente: La capitale della Francia è Parigi.
+```
+
+### Benchmark
+
+```bash
+./build/eie-llm models/tinyllama.Q4_K_M.gguf --bench 50
+```
+
+Genera 50 token e misura token/sec, latenza del prefill e tempo di caricamento.
+
+### Server HTTP
+
+```bash
+# Porta default 8080
+./build/eie-llm models/tinyllama.Q4_K_M.gguf --server
+
+# Porta custom
+./build/eie-llm models/tinyllama.Q4_K_M.gguf --server 9090
+```
+
+---
+
+## API HTTP
+
+### `GET /health`
+
+Controlla che il server sia attivo.
+
+```bash
+curl http://localhost:8080/health
+# {"status":"ok"}
+```
+
+### `POST /v1/completions`
+
+Completamento di testo. Con `"chat": true` applica il template del modello.
+
+```bash
+# Modalità raw (GPT-2, completamento libero)
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"The capital of France is","max_tokens":20}'
+
+# Modalità chat (TinyLlama)
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Qual è la capitale della Francia?","chat":true,"max_tokens":50}'
+```
+
+**Parametri:**
+
+| Campo | Tipo | Default | Descrizione |
+|-------|------|---------|-------------|
+| `prompt` | stringa | — | Testo di input (obbligatorio) |
+| `chat` | booleano | `false` | Se `true`, applica il chat template del modello |
+| `max_tokens` | intero | 50 | Token massimi (limite: 500) |
+| `temperature` | float | 1.0 | Temperatura del sampling |
+| `top_k` | intero | 40 | Top-k (0 = disabilitato) |
+| `top_p` | float | 0.9 | Nucleus sampling |
+| `repetition_penalty` | float | 1.1 | Penalità ripetizioni (1.0 = nessuna) |
+
+### `POST /v1/chat/completions`
+
+Endpoint compatibile con l'API OpenAI. Accetta un array di messaggi ed estrae automaticamente l'ultimo messaggio `user`.
+
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "Qual è la capitale della Francia?"}
+    ],
+    "max_tokens": 100
+  }'
+```
+
+**Risposta (entrambi gli endpoint):**
+
+```json
+{
+  "object": "text_completion",
+  "choices": [{"text": "La capitale della Francia è Parigi.", "index": 0, "finish_reason": "stop"}],
+  "usage": {"prompt_tokens": 12, "completion_tokens": 9, "total_tokens": 21}
+}
+```
+
+---
+
+## Struttura del codice
+
+```
+eie-llm/
+├── src/
+│   ├── main.cpp        — punto di ingresso, sceglie shell/server/bench
+│   ├── gguf.cpp        — legge il file .gguf (header, metadata, tensori)
+│   ├── ops.cpp         — operazioni matematiche (matmul, softmax, RoPE…)
+│   ├── tokenizer.cpp   — converte testo ↔ ID numerici
+│   ├── model.cpp       — forward pass (calcola i logits da un token)
+│   ├── shell.cpp       — shell interattiva
+│   └── server.cpp      — server HTTP
+├── include/            — header corrispondenti
+├── models/             — file .gguf (non inclusi nel repo)
+├── scripts/setup.sh    — download modelli e dipendenze
+└── tools/              — script Python per debug e ispezione GGUF
+```
+
+---
+
+## Come funziona internamente
+
+### 1. Il file GGUF
+
+I modelli sono distribuiti nel formato **GGUF** (un file binario strutturato). Contiene:
+- **Metadata**: architettura, dimensioni, tipo di tokenizer, chat template…
+- **Tensori**: i pesi del modello, eventualmente compressi (quantizzati)
+
+`gguf.cpp` legge tutto questo e lo carica in RAM.
+
+### 2. Quantizzazione — perché i modelli sono così piccoli
+
+Un modello con 1.1 miliardi di parametri in float32 occuperebbe ~4.4 GB. TinyLlama in Q4\_K\_M pesa ~638 MB perché ogni peso è compresso a ~4 bit invece di 32.
+
+`ops.cpp` decomprime i pesi al volo prima di usarli. I formati supportati:
+
+| Formato | Bit/peso | Usato da |
+|---------|----------|----------|
+| F32 | 32 | embedding di GPT-2 |
+| F16 | 16 | alcuni layer |
+| Q8\_0 | 8 | GPT-2 |
+| Q4\_K | 4 | TinyLlama (pesi principali) |
+| Q6\_K | 6 | TinyLlama (output e attention V) |
+
+> **Nota:** nella versione attuale tutti i pesi vengono dequantizzati in float32 **al caricamento**, occupando circa 4.2 GB in RAM. Vedi la sezione [Prestazioni e limiti](#prestazioni-e-limiti) per i dettagli.
+
+### 3. Il Tokenizer
+
+Il modello non capisce le parole, solo numeri. Il tokenizer converte testo → lista di ID interi.
+
+**GPT-2** usa un algoritmo BPE (Byte Pair Encoding): le parole vengono spezzate in pezzi frequenti, es. "playing" → ["play", "ing"].
+
+**TinyLlama** usa SentencePiece con algoritmo **Viterbi unigram**: invece di applicare regole di merge fisse, trova la segmentazione che massimizza la somma delle log-probabilità di ogni token. Ogni token ha uno "score" (log-prob) nei metadata GGUF; il Viterbi trova il percorso ottimale con programmazione dinamica.
+
+Entrambi aggiungono un simbolo speciale per gli spazi: GPT-2 usa `Ġ` (U+0120), TinyLlama usa `▁` (U+2581).
+
+### 4. Il Forward Pass — come il modello produce il testo
+
+Dato un token (un numero), il modello produce una distribuzione di probabilità sul prossimo token. Questo avviene in più "layer" sovrapposti, ognuno composto da:
+
+**Self-Attention** — ogni token "guarda" i token precedenti e decide cosa è rilevante.
+
+**Feed-Forward Network (FFN)** — elabora l'informazione raccolta dall'attention.
+
+I due modelli differiscono nei dettagli:
+
+| Componente | GPT-2 | TinyLlama |
+|---|---|---|
+| Normalizzazione | LayerNorm | RMSNorm |
+| Positional encoding | Embedding assoluto | RoPE (rotazionale) |
+| Attention | Multi-Head (MHA) | Grouped Query (GQA, 32Q/4KV) |
+| Attivazione FFN | GELU | SiLU + gate (SwiGLU) |
+
+#### La KV Cache
+
+Senza ottimizzazioni, per generare il token in posizione N bisognerebbe ricalcolare l'attention su tutti gli N token precedenti — costo O(N²). La **KV cache** salva le chiavi (K) e i valori (V) già calcolati, così ogni nuovo token costa O(1) invece di O(N).
+
+#### Buffer di inferenza pre-allocati
+
+Ogni forward step necessita di vettori temporanei: Q, K, V, gate, up, scores… Allocarli e deallocarli ad ogni token significherebbe centinaia di `malloc`/`free` per token generato. La struct `InferBuffers` in `model.hpp` li pre-alloca una sola volta all'avvio e li riusa ad ogni step.
+
+Un dettaglio importante: l'accumulatore interno della attention (`attn_acc`, che raccoglie la weighted sum dei V) e il buffer di output finale (`attn_out`, scritto dal `matvec` di proiezione) **devono essere buffer distinti**. Se coincidessero, il `matvec` scriverebbe sull'input mentre lo legge ancora, corrompendo il risultato (aliasing).
+
+### 5. Il Chat Template
+
+TinyLlama è un modello addestrato per le conversazioni. Si aspetta un formato preciso:
+
+```
+<|user|>
+{messaggio dell'utente}</s>
+<|assistant|>
+```
+
+Il file GGUF include il template in formato Jinja2. `apply_chat_template` in `tokenizer.cpp` rileva il formato dal template e lo applica senza dover implementare un interprete Jinja2 completo. Supporta anche il formato ChatML (`<|im_start|>`) usato da Mistral e Qwen.
+
+### 6. Il Sampling — come si sceglie il prossimo token
+
+Il modello produce un vettore di ~32000 logit (uno per token). Per scegliere il prossimo token:
+
+**Greedy**: prende il massimo. Deterministico, tende a ripetersi.
+
+**Top-k**: mantiene solo i k token più probabili, campiona da questi. Evita token improbabili senza essere deterministico.
+
+**Top-p (nucleus)**: mantiene il sottoinsieme minimo di token la cui probabilità cumulativa supera p. Adattivo: quando c'è un token molto probabile, il nucleus è piccolo; quando la distribuzione è uniforme, il nucleus è più ampio.
+
+**Repetition penalty**: penalizza i token già apparsi nel contesto, dividendo/moltiplicando il loro logit per un fattore > 1.
+
+---
+
+## Prestazioni e limiti
+
+Questa è un'implementazione **didattica**: correttezza e leggibilità del codice vengono prima delle prestazioni. Detto questo, è utile capire dove va il tempo e la memoria.
+
+### Memoria — il problema della dequantizzazione anticipata
+
+Il file GGUF di TinyLlama occupa 638 MB su disco (Q4\_K\_M, ~4.5 bit/peso). Nella versione attuale tutti i pesi vengono convertiti in float32 al caricamento:
+
+| Tensore | float32 |
 |---|---|
-| **GPT-2** (Q8\_0) | Funzionante |
-| **LLaMA / TinyLLaMA** (Q4\_K\_M) | **Work in progress — output non corretto** |
+| token\_embd + output.weight | ~512 MB |
+| 22 × (attn Q/K/V/out) | ~440 MB |
+| 22 × (ffn gate + up + down) | ~2.9 GB |
+| **Totale** | **~4.2 GB** |
 
-> **Nota LLaMA**: il codice per l'architettura LLaMA è presente (RoPE, RMSNorm,
-> SwiGLU, GQA, dequantizzazione Q4\_K e Q6\_K) ma il modello non produce ancora
-> testo coerente. Le dequantizzazioni sono state corrette e verificate contro
-> ggml-quants.c, ma rimane almeno un bug nel forward pass o nel tokenizer
-> SentencePiece da individuare.
+La soluzione corretta è **mantenere i pesi nel formato quantizzato originale** e dequantizzare per super-block durante il forward pass. In questo modo si occuperebbero solo ~638 MB e il forward sarebbe anche più veloce (meno dati da leggere dalla RAM, il bandwidth è spesso il vero collo di bottiglia).
+
+### Velocità — il collo di bottiglia è `matvec`
+
+Per ogni token generato, TinyLlama esegue circa **970 milioni di multiply-accumulate** solo nelle proiezioni lineari (Q/K/V, FFN):
+
+| Operazione | MAC per token |
+|---|---|
+| attn Q + K + V + out (×22 layer) | ~200M |
+| ffn gate + up + down (×22 layer) | ~760M |
+| **Totale** | **~970M** |
+
+Con il `matvec` scalare attuale (~1 GFLOPS) → circa **1 secondo/token**.
+
+**Miglioramenti possibili, dal più semplice al più complesso:**
+
+| Intervento | Come | Guadagno atteso |
+|---|---|---|
+| Build Release + `-march=native` | `cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=native"` | 2-4x (SIMD automatico) |
+| OpenMP su `matvec` | `#pragma omp parallel for` sul loop esterno + `-fopenmp` | Nx (N = core) |
+| AVX2 esplicito | Intrinsics `_mm256_*` nel loop interno di `matvec` | 6-8x |
+| Pesi quantizzati in RAM | Riscrivere `matvec` per lavorare su byte Q4\_K/Q6\_K | −3.6 GB RAM + 20-40% velocità |
 
 ---
 
 ## Roadmap
 
 - [x] Fase 1 — Parser GGUF: header + metadata KV
-- [x] Fase 2 — Lettura info tensori
+- [x] Fase 2 — Lettura info tensori e pesi
 - [x] Fase 3 — Tokenizer BPE (GPT-2 byte-level)
 - [x] Fase 4 — Forward pass GPT-2 (LayerNorm, GELU, MHA)
 - [x] Fase 5 — Shell interattiva con linenoise
@@ -32,427 +335,13 @@ compatibile con l'API OpenAI. Zero dipendenze pesanti, solo stdlib + httplib.
 - [x] Fase 7 — Sampling avanzato (top-k, top-p, repetition penalty)
 - [x] Fase 8 — Dequantizzazione Q4\_K e Q6\_K
 - [x] Fase 9 — Architettura LLaMA (RoPE, RMSNorm, SwiGLU, GQA)
-- [ ] Fase 10 — **Debug forward pass LLaMA** *(in corso)*
-
----
-
-## Cosa abbiamo costruito
-
-| Modulo | File | Cosa fa |
-|--------|------|---------|
-| Parser GGUF | `gguf.hpp/cpp` | Legge header, metadata KV, info tensori, dati raw dal file binario |
-| Tensor ops | `ops.hpp/cpp` | Dequantizzazione F16/Q8\_0/Q4\_K/Q6\_K, fp16→fp32, matmul, matvec, softmax, RMSNorm, RoPE, GELU, SiLU |
-| Tokenizer | `tokenizer.hpp/cpp` | BPE encode/decode per GPT-2 (byte-level) e LLaMA (SentencePiece) |
-| Modello | `model.hpp/cpp` | Config, pesi, KV cache, LayerNorm/RMSNorm, Self-Attention (MHA e GQA), FFN (GELU e SwiGLU), forward pass |
-| Shell | `shell.hpp/cpp` | REPL interattiva con comandi e streaming token per token |
-| Server | `server.hpp/cpp` | HTTP server con endpoint `/v1/completions` |
-
----
-
-## Requisiti
-
-- CMake >= 3.16
-- GCC >= 13 oppure Clang >= 15
-- C++17
-- `wget` oppure `curl` (per lo script di setup)
-
----
-
-## Setup
-
-Lo script scarica il modello GPT-2 (~176 MB) e la libreria httplib:
-
-```bash
-chmod +x scripts/setup.sh
-./scripts/setup.sh
-```
-
-Per TinyLLaMA (~638 MB), scaricare manualmente:
-
-```bash
-wget -P models/ https://huggingface.co/second-state/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-     -O models/tinyllama.Q4_K_M.gguf
-```
-
----
-
-## Build
-
-```bash
-# Debug (default)
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-
-# Release (più veloce)
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-> **Nota build**: se si modificano file sorgente e i cambiamenti non vengono
-> rilevati, usare `cmake --build build --clean-first` per forzare la
-> ricompilazione completa.
-
----
-
-## Uso
-
-### Shell interattiva
-
-```bash
-# GPT-2 (funzionante)
-./build/eie-llm models/gpt2.Q8_0.gguf
-
-# TinyLLaMA (WIP — output non corretto)
-./build/eie-llm models/tinyllama.Q4_K_M.gguf
-```
-
-Comandi disponibili nella shell:
-
-| Comando | Descrizione |
-|---------|-------------|
-| `:help` | Mostra la lista dei comandi |
-| `:tokens <n>` | Max token da generare (default 200) |
-| `:temp <f>` | Temperatura, es. `0.8` (default 1.0) |
-| `:topk <n>` | Top-k sampling, `0` = disabilitato (default 40) |
-| `:topp <f>` | Nucleus sampling p, es. `0.9` (default 0.9) |
-| `:penalty <f>` | Repetition penalty, es. `1.3` (default 1.1) |
-| `:greedy` | Attiva sampling greedy (argmax) |
-| `:sample` | Attiva top-k + top-p sampling |
-| `:params` | Mostra parametri correnti |
-| `:reset` | Azzera la KV cache |
-| `:quit` | Esci |
-| `qualsiasi testo` | Genera il completamento |
-
-**Configurazione consigliata per output bilanciato:**
-
-```
-eie> :topk 40
-eie> :topp 0.9
-eie> :temp 0.8
-eie> :penalty 1.2
-```
-
-### Server HTTP
-
-```bash
-# Porta default 8080
-./build/eie-llm models/gpt2.Q8_0.gguf --server
-
-# Porta custom
-./build/eie-llm models/gpt2.Q8_0.gguf --server 9090
-```
-
----
-
-## API
-
-### `GET /health`
-
-```bash
-curl http://localhost:8080/health
-```
-
-```json
-{"status":"ok","model":"gpt2"}
-```
-
-### `POST /v1/completions`
-
-Formato compatibile con l'API OpenAI.
-
-```bash
-curl -X POST http://localhost:8080/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "The meaning of life is",
-    "max_tokens": 50,
-    "temperature": 0.8,
-    "top_k": 40,
-    "top_p": 0.9,
-    "repetition_penalty": 1.2
-  }'
-```
-
-**Parametri della richiesta:**
-
-| Campo | Tipo | Default | Descrizione |
-|-------|------|---------|-------------|
-| `prompt` | string | — | Testo di input (obbligatorio) |
-| `max_tokens` | int | 50 | Token massimi da generare (max 500) |
-| `temperature` | float | 1.0 | Temperatura del sampling |
-| `top_k` | int | 40 | Mantieni i k token più probabili (0 = disabilitato) |
-| `top_p` | float | 0.9 | Nucleus sampling — taglia al p% cumulativo |
-| `repetition_penalty` | float | 1.1 | Penalizza token già generati (1.0 = disabilitato) |
-
-**Risposta:**
-
-```json
-{
-  "object": "text_completion",
-  "model": "gpt2",
-  "choices": [
-    {
-      "text": "...testo generato...",
-      "index": 0,
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 5,
-    "completion_tokens": 50,
-    "total_tokens": 55
-  }
-}
-```
-
----
-
-## Sampling — come funziona
-
-### Greedy (argmax)
-Sceglie sempre il token con probabilità massima. Deterministico ma tende
-a produrre testo ripetitivo.
-
-### Top-k
-Mantiene solo i `k` token con logit più alto, azzera tutti gli altri.
-Riduce il rischio di campionare token improbabili.
-
-```
-k = 40, logits ordinati:
-[0.15, 0.12, 0.09, ..., 0.001, 0.0001, ...]
- ──────────────────────────────────────
- tieni solo i primi 40 → campiona da questi
-```
-
-### Top-p (nucleus sampling)
-Mantiene il sottoinsieme minimo di token la cui probabilità cumulativa
-raggiunge `p`. Si adatta dinamicamente alla distribuzione.
-
-```
-p = 0.9, probs ordinate:
-[0.40, 0.30, 0.15, 0.08, 0.04, 0.02, ...]
- ─────────────────────────
- somma = 0.93 >= 0.9 → taglia qui (4 token)
-```
-
-### Top-k + Top-p combinati (default)
-Prima applica top-k (tetto duro), poi top-p (affina la distribuzione).
-È la configurazione usata da GPT-2 originale.
-
-### Repetition penalty
-Penalizza i token già apparsi nel contesto dividendo o moltiplicando
-il loro logit per il fattore `penalty`.
-
-```
-penalty = 1.3
-token già visto con logit +2.0 → +2.0 / 1.3 = +1.54
-token già visto con logit -1.0 → -1.0 * 1.3 = -1.30
-```
-
----
-
-## Architettura interna
-
-### Forward pass GPT-2
-
-```
-token ID
-    │
-    ▼
-[embedding lookup]
-    token_embd[token_id] + pos_embd[pos]
-    │
-    ▼  × 12 layer
-┌─────────────────────────────────────────┐
-│                                         │
-│  x ──► LayerNorm1 ──► Self-Attention    │
-│  │                         │            │
-│  └─────────── + ◄──────────┘            │  residual connection
-│               │                         │
-│  x ──► LayerNorm2 ──► FFN (GELU)        │
-│  │                     │                │
-│  └─────────── + ◄──────┘                │  residual connection
-│                                         │
-└─────────────────────────────────────────┘
-    │
-    ▼
-[LayerNorm finale]
-    │
-    ▼
-[lm_head = token_embd^T]    logits [50257]
-    │
-    ▼
-sampling → token successivo
-```
-
-### Forward pass LLaMA (implementato, WIP)
-
-```
-token ID
-    │
-    ▼
-[embedding lookup]          solo token embedding (no positional)
-    │
-    ▼  × 22 layer (TinyLLaMA)
-┌─────────────────────────────────────────┐
-│                                         │
-│  x ──► RMSNorm1 ──► Self-Attention      │
-│  │         RoPE su Q e K                │
-│  │         GQA: 32 head Q / 4 head KV   │
-│  │                         │            │
-│  └─────────── + ◄──────────┘            │  residual connection
-│               │                         │
-│  x ──► RMSNorm2 ──► FFN (SwiGLU)        │
-│  │         gate = SiLU(W1·x)            │
-│  │         out  = (gate ⊙ W3·x) · W2    │
-│  └─────────── + ◄──────────┘            │  residual connection
-│                                         │
-└─────────────────────────────────────────┘
-    │
-    ▼
-[RMSNorm finale]
-    │
-    ▼
-[output.weight]             lm_head separato (no weight tying)
-    │
-    ▼
-logits [32000] → sampling → token successivo
-```
-
-### Self-Attention con KV Cache (GPT-2)
-
-```
-x [n_embd=768]
-    │
-    ▼
-QKV projection [3×768]
-    │
-    ├── Q [768] ──────────────────────────────────┐
-    ├── K [768] → salva in kv_cache.k[layer][pos] │
-    └── V [768] → salva in kv_cache.v[layer][pos] │
-                                                   │
-    per ogni head h (12 heads × 64 dim):           │
-        scores[t] = Q_h · K_h[t] / √64  t∈[0,pos] │
-        scores    = softmax(scores)                 │
-        out_h     = Σ scores[t] * V_h[t] ◄─────────┘
-    │
-    ▼
-concatena heads → output projection [768]
-```
-
-### Quantizzazione — formati supportati
-
-**Q8\_0** (usato da GPT-2):
-```
-Blocco: 2 byte scale (float16) + 32 byte int8
-Dequantizzazione: val = int8 * scale
-```
-
-**Q4\_K** (usato da TinyLLaMA):
-```
-Super-block: 256 elementi, 144 byte
-  2 byte d (scale globale scales), 2 byte dmin (scale globale minimi)
-  12 byte: 8 scale + 8 minimi compressi a 6 bit ciascuno
-  128 byte qs: nibble 4 bit, due sub-block per ogni 32 byte
-    low nibble  → sub-block pari,  elemento l
-    high nibble → sub-block dispari, elemento l
-Dequantizzazione: val = nibble * (sv * d) - (mv * dmin)
-```
-
-**Q6\_K** (usato da TinyLLaMA per output.weight e attn_v):
-```
-Super-block: 256 elementi, 210 byte
-  128 byte ql: 4 bit bassi di ogni elemento
-   64 byte qh: 2 bit alti per 4 elementi/byte (stride 32)
-   16 byte scales: int8 × 16 scale
-    2 byte d: super-scale float16
-Dequantizzazione: q6 = (low4 | high2<<4) - 32
-                  val = d * scale[k] * q6
-```
-
----
-
-## Struttura del progetto
-
-```
-eie-llm/
-├── CMakeLists.txt
-├── README.md
-├── include/
-│   ├── gguf.hpp          # Strutture e funzioni GGUF
-│   ├── ops.hpp           # Operazioni primitive sui tensori
-│   ├── tokenizer.hpp     # Tokenizer BPE (GPT-2 e SentencePiece)
-│   ├── model.hpp         # Strutture modello e forward pass
-│   ├── shell.hpp         # Shell interattiva
-│   └── server.hpp        # Server HTTP
-├── src/
-│   ├── main.cpp          # Entry point
-│   ├── gguf.cpp          # Parser GGUF
-│   ├── ops.cpp           # Dequantizzazione e operazioni vettoriali
-│   ├── tokenizer.cpp     # BPE encode/decode
-│   ├── model.cpp         # Forward pass GPT-2 e LLaMA
-│   ├── shell.cpp         # Shell interattiva
-│   └── server.cpp        # Server HTTP
-├── models/               # Modelli GGUF (non inclusi nel repo)
-│   └── .gitkeep
-├── scripts/
-│   └── setup.sh          # Download modello + dipendenze
-├── tools/
-│   ├── inspect_gguf.py   # Ispezione file GGUF
-│   ├── debug_q4k.py      # Debug dequantizzazione Q4_K
-│   └── verify_q4k.py     # Verifica Q4_K contro riferimento ggml
-└── third_party/          # httplib.h (non incluso nel repo)
-```
-
----
-
-## Modelli
-
-### GPT-2 small (funzionante)
-
-124M parametri, architettura transformer decoder-only.
-
-| Parametro | Valore |
-|-----------|--------|
-| `n_vocab` | 50257 |
-| `n_ctx` | 1024 |
-| `n_embd` | 768 |
-| `n_head` | 12 |
-| `n_layer` | 12 |
-| `n_ff` | 3072 |
-| `d_head` | 64 |
-| Quantizzazione | Q8\_0 |
-| Dimensione file | ~176 MB |
-
-### TinyLLaMA 1.1B Chat (WIP)
-
-1.1B parametri, architettura LLaMA con GQA.
-
-| Parametro | Valore |
-|-----------|--------|
-| `n_vocab` | 32000 |
-| `n_ctx` | 2048 |
-| `n_embd` | 2048 |
-| `n_head` | 32 |
-| `n_head_kv` | 4 (GQA) |
-| `n_layer` | 22 |
-| `n_ff` | 5632 |
-| `d_head` | 64 |
-| `rope_dim` | 64 |
-| Quantizzazione | Q4\_K\_M |
-| Dimensione file | ~638 MB |
-
----
-
-## Prossimi passi
-
-| Obiettivo | Priorità |
-|-----------|----------|
-| **Debug LLaMA** — individuare il bug nel forward pass | Alta |
-| **Tokenizer SentencePiece** — verificare encoding LLaMA | Alta |
-| **Performance** — AVX2/NEON per matmul, thread pool | Media |
-| **Streaming HTTP** — Server-Sent Events per output token per token | Bassa |
-| **Memoria** — Quantizzazione KV cache, sliding window attention | Bassa |
+- [x] Fase 10 — Fix dequantizzazione Q6\_K (bug indici scale)
+- [x] Fase 11 — Tokenizer SentencePiece Viterbi unigram
+- [x] Fase 12 — Chat template (shell + server HTTP)
+- [x] Fase 13 — Buffer di inferenza pre-allocati (eliminazione malloc nel hot path)
+- [ ] Fase 14 — Pesi quantizzati in RAM (−3.6 GB, matvec su Q4\_K/Q6\_K)
+- [ ] Fase 15 — Ottimizzazioni matmul (AVX2/NEON, OpenMP)
+- [ ] Fase 16 — Streaming HTTP (Server-Sent Events, token per token)
 
 ---
 

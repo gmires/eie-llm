@@ -32,11 +32,13 @@ struct Tokenizer {
     std::vector<std::string>             id_to_token;
     std::unordered_map<std::string, int> token_to_id;
 
-    // Regole BPE
+    // Regole BPE (usate solo per GPT-2)
     std::vector<BPEMerge>                merges;
     std::unordered_map<std::string, int> merge_rank;
 
-    // Scores (SentencePiece) — log-prob di ogni token
+    // Scores (SentencePiece unigram) — log-prob di ogni token.
+    // Usati dall'algoritmo Viterbi per trovare la segmentazione
+    // a massima verosimiglianza.
     std::vector<float> scores;
 
     // Tipi token (SentencePiece)
@@ -49,6 +51,22 @@ struct Tokenizer {
     int unk_id     = 0;   // Unknown
 
     int vocab_size = 0;
+
+    // Lunghezza massima di un token in byte — calcolata a init time
+    // per limitare la finestra di ricerca del Viterbi.
+    int max_token_len = 64;
+
+    // ── Chat template ─────────────────────────
+    // Template Jinja2 grezzo letto dal campo GGUF "tokenizer.chat_template".
+    // Non viene interpretato: serve solo per rilevare il formato.
+    std::string chat_template;
+
+    // Stringa EOS, es. "</s>" per LLaMA. Inserita nel template tra
+    // il messaggio utente e il tag <|assistant|>.
+    std::string eos_token_str;
+
+    // true se il GGUF contiene un chat template riconoscibile.
+    bool has_chat_template = false;
 };
 
 // Inizializza il tokenizer dai metadata GGUF
@@ -62,6 +80,20 @@ std::vector<int> tokenizer_encode(const Tokenizer& tok,
 // Decode: ID → testo
 std::string tokenizer_decode(const Tokenizer& tok,
                              const std::vector<int>& ids);
+
+// Applica il chat template al messaggio utente.
+//
+// Legge il pattern dal campo chat_template del tokenizer e
+// costruisce il prompt completo pronto per la tokenizzazione.
+// Supporta TinyLlama (<|user|>) e ChatML (<|im_start|>).
+// Se system_msg è vuoto viene omesso.
+//
+// Esempio TinyLlama:
+//   user_msg = "Ciao"
+//   → "<|user|>\nCiao</s>\n<|assistant|>\n"
+std::string apply_chat_template(const Tokenizer& tok,
+                                const std::string& user_msg,
+                                const std::string& system_msg = "");
 
 // Info debug
 void tokenizer_print_info(const Tokenizer& tok);
