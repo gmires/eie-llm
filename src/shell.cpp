@@ -231,7 +231,7 @@ void shell_run(Model& model, const Tokenizer& tok) {
     linenoise::SetHistoryMaxLen(100);
     linenoise::LoadHistory(HISTORY_FILE);  // carica history precedente
 
-std::string model_name = model.config.arch == ArchType::LLAMA
+    std::string model_name = model.config.arch == ArchType::LLAMA
         ? "TinyLlama 1.1B" : "GPT-2 small";
 
     std::cout << "╔═══════════════════════════════════════╗\n";
