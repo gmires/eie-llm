@@ -7,56 +7,53 @@
 // ─────────────────────────────────────────────
 //  Conversione float16 → float32
 //
-//  IEEE 754 half precision (16 bit):
-//    [s][eeeee][mmmmmmmmmm]
-//     1    5        10
+//  IEEE 754 float16: 1 bit segno, 5 bit esponente (bias 15),
+//  10 bit mantissa. Tre casi distinti:
 //
-//  Casi speciali:
-//    esponente = 0,    mantissa = 0 → zero
-//    esponente = 0,    mantissa ≠ 0 → subnormale
-//    esponente = 31,   mantissa = 0 → infinito
-//    esponente = 31,   mantissa ≠ 0 → NaN
+//  1) Esponente = 0, mantissa = 0 → ±zero
+//
+//  2) Esponente = 0, mantissa ≠ 0 → subnormale fp16
+//     Valore = 2^(-14) * mantissa/1024
+//     Si normalizza shiftando la mantissa a sinistra finché
+//     il bit 10 è settato (trovando l'1 implicito), poi si
+//     ribiasa per fp32 con: exponent_fp32 = 113 - k
+//     dove k è il numero di shift eseguiti.
+//     (113 = 127_bias_fp32 - 14_esponente_denormale_fp16)
+//
+//  3) Esponente = 31 → ±infinito o NaN
+//
+//  4) Caso normale: ribiasa l'esponente (bias 15 → bias 127)
+//     ed estende la mantissa da 10 a 23 bit con shift di 13.
 // ─────────────────────────────────────────────
 float fp16_to_fp32(uint16_t h) {
-    // Estrai i 3 campi dal float16
     uint32_t sign     = (h >> 15) & 0x1;
     uint32_t exponent = (h >> 10) & 0x1F;
     uint32_t mantissa = h & 0x3FF;
-
     uint32_t result;
-
     if (exponent == 0) {
         if (mantissa == 0) {
-            // Zero (positivo o negativo)
+            // ±zero
             result = sign << 31;
         } else {
-            // Numero subnormale → normalizza per float32
-            // Trova la posizione del bit più significativo
-            exponent = 1;
-            while (!(mantissa & 0x400)) {
-                mantissa <<= 1;
-                exponent--;
-            }
-            mantissa &= 0x3FF;
-            // Converti al bias float32 (127) da bias float16 (15)
-            exponent = exponent + 127 - 15;
+            // Subnormale: cerchiamo l'1 implicito shiftando a sinistra.
+            // Ogni shift decrementa l'esponente (parte da 0 → diventa negativo
+            // come uint32, poi viene ribilanciato nella formula).
+            while (!(mantissa & 0x400)) { mantissa <<= 1; exponent--; }
+            mantissa &= 0x3FF;           // rimuove il bit implicito
+            exponent = exponent + 127 - 14; // ribias: 113 - k (k shift eseguiti)
             result = (sign << 31) | (exponent << 23) | (mantissa << 13);
         }
     } else if (exponent == 31) {
-        // Infinito o NaN — propaga a float32
+        // Infinito o NaN: esponente fp32 tutto a 1 (0xFF)
         result = (sign << 31) | (0xFF << 23) | (mantissa << 13);
     } else {
-        // Numero normale: aggiusta il bias dell'esponente
-        // float16: bias = 15,  float32: bias = 127
+        // Normale: ribilancia il bias (15 → 127) ed estende la mantissa
         exponent = exponent + 127 - 15;
         result = (sign << 31) | (exponent << 23) | (mantissa << 13);
     }
-
-    // Reinterpreta i bit come float
-    float f;
-    memcpy(&f, &result, sizeof(f));
-    return f;
+    float f; memcpy(&f, &result, sizeof(f)); return f;
 }
+
 
 // ─────────────────────────────────────────────
 //  Dequantizzazione Q8_0
@@ -96,6 +93,159 @@ void dequantize_q8_0(const uint8_t* src, float* dst, uint64_t n_elem) {
 }
 
 // ─────────────────────────────────────────────
+//  Dequantizzazione Q4_K  (da ggml-quants.c)
+//
+//  Formato super-block (256 elementi, 144 byte):
+//
+//  Offset  Size  Contenuto
+//  0       2     d    — scale globale per gli scale dei sub-block (float16)
+//  2       2     dmin — scale globale per i minimi dei sub-block  (float16)
+//  4       12    scales: 8 scale + 8 minimi packed a 6 bit ciascuno
+//  16      128   qs: nibble 4 bit × 256 elementi
+//
+//  Il super-block è diviso in 8 sub-block da 32 elementi.
+//  Ogni coppia di sub-block (2j, 2j+1) condivide 32 byte di qs:
+//    - low nibble  di qs[j*32 + l] → elemento l       del sub-block 2j
+//    - high nibble di qs[j*32 + l] → elemento l       del sub-block 2j+1
+//
+//  Formula finale per ogni elemento:
+//    val = nibble * (sv * d) - (mv * dmin)
+//
+//  I 6 bit di scale e min per ogni sub-block vengono estratti
+//  con get_scale_min_k4, che usa i 12 byte di scala compressa.
+// ─────────────────────────────────────────────
+void dequantize_q4_k(const uint8_t* src, float* dst, uint64_t n_elem) {
+    static constexpr int SUPER_BLOCK = 256;
+    static constexpr int BLOCK_SIZE  = 32;
+    static constexpr int N_SUB       = 8;
+    static constexpr int SUPER_BYTES = 144;
+
+    uint64_t n_super = n_elem / SUPER_BLOCK;
+
+    for (uint64_t s = 0; s < n_super; s++) {
+        const uint8_t* sb = src + s * SUPER_BYTES;
+
+        uint16_t d_bits, dmin_bits;
+        memcpy(&d_bits,    sb,     2);
+        memcpy(&dmin_bits, sb + 2, 2);
+
+        float d    = fp16_to_fp32(d_bits);
+        float dmin = fp16_to_fp32(dmin_bits);
+
+        const uint8_t* sc = sb + 4;
+        float scales[N_SUB], mins[N_SUB];
+
+        // Estrae scale e min per il sub-block j dal campo scales compresso a 6 bit.
+        // Per j < 4: i bit 0-5 del byte j sono lo scale, i bit 0-5 del byte j+4 il min.
+        // Per j >= 4: i bit 6-7 dei byte precedenti forniscono i 2 bit alti.
+        // Formula identica a get_scale_min_k4 in ggml-quants.c.
+        auto get_scale_min = [&](int j) -> std::pair<float,float> {
+            uint8_t sv, mv;
+            if (j < 4) {
+                sv = sc[j]   & 0x3F;
+                mv = sc[j+4] & 0x3F;
+            } else {
+                sv = (sc[j+4] & 0x0F) | ((sc[j-4] >> 6) << 4);
+                mv = (sc[j+4] >>   4) | ((sc[j  ] >> 6) << 4);
+            }
+            return {sv * d, mv * dmin};
+        };
+
+        for (int b = 0; b < N_SUB; b++) {
+            auto [sc_b, min_b] = get_scale_min(b);
+            scales[b] = sc_b;
+            mins[b]   = min_b;
+        }
+
+        // Dequantizza i nibbles secondo il layout ggml Q4_K.
+        // I 128 byte di qs sono divisi in 4 gruppi da 32 byte.
+        // Il gruppo j copre i sub-block 2j e 2j+1 (64 elementi totali):
+        //   elementi 0..31  → low nibble  di qs[j*32 + l]  (sub-block 2j)
+        //   elementi 32..63 → high nibble di qs[j*32 + l]  (sub-block 2j+1)
+        const uint8_t* nibbles = sb + 16;
+        float* out = dst + s * SUPER_BLOCK;
+
+        for (int j = 0; j < N_SUB / 2; j++) {
+            float sc0 = scales[j * 2],     min0 = mins[j * 2];
+            float sc1 = scales[j * 2 + 1], min1 = mins[j * 2 + 1];
+            const uint8_t* q = nibbles + j * BLOCK_SIZE;
+            float* o = out + j * 2 * BLOCK_SIZE;
+            for (int l = 0; l < BLOCK_SIZE; l++) {
+                o[l]              = (q[l] & 0xF) * sc0 - min0;  // sub-block 2j
+                o[l + BLOCK_SIZE] = (q[l] >>  4) * sc1 - min1;  // sub-block 2j+1
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Dequantizzazione Q6_K  (da ggml-quants.c)
+//
+//  Formato super-block (256 elementi, 210 byte):
+//
+//  Offset  Size  Contenuto
+//  0       128   ql: 4 bit bassi di ogni elemento (nibble packed)
+//  128     64    qh: 2 bit alti di ogni elemento  (2 bit × 4 elem/byte)
+//  192     16    scales: int8 × 8 gruppi × 2 scale/gruppo = 16 valori
+//  208     2     d: super-scale float16
+//
+//  Il super-block è diviso in 2 metà da 128 elementi ciascuna (n=0,1).
+//  Ogni metà usa 64 byte di ql, 32 byte di qh e 4 scale.
+//
+//  Per ogni l in [0,31] dentro una metà, i 4 valori ricostruiti sono:
+//    q1 = (ql[l]    & 0xF) | ((qh[l] >> 0) & 3) << 4  → elem  l+ 0
+//    q2 = (ql[l+32] & 0xF) | ((qh[l] >> 2) & 3) << 4  → elem  l+32
+//    q3 = (ql[l]    >> 4)  | ((qh[l] >> 4) & 3) << 4  → elem  l+64
+//    q4 = (ql[l+32] >> 4)  | ((qh[l] >> 6) & 3) << 4  → elem  l+96
+//  Valore finale: d * scale[k] * (q - 32)
+//
+//  Ogni byte di ql porta 4 bit bassi di due elementi a distanza 32.
+//  Ogni byte di qh porta i 2 bit alti di quattro elementi a distanza 32.
+// ─────────────────────────────────────────────
+void dequantize_q6_k(const uint8_t* src, float* dst, uint64_t n_elem) {
+    static constexpr int SUPER_BLOCK = 256;
+    static constexpr int SUPER_BYTES = 210;
+
+    uint64_t n_super = n_elem / SUPER_BLOCK;
+
+    for (uint64_t s = 0; s < n_super; s++) {
+        const uint8_t* sb = src + s * SUPER_BYTES;
+        const uint8_t* ql = sb;
+        const uint8_t* qh = sb + 128;
+        const int8_t*  sc = reinterpret_cast<const int8_t*>(sb + 192);
+
+        uint16_t d_bits;
+        memcpy(&d_bits, sb + 208, 2);
+        float d = fp16_to_fp32(d_bits);
+
+        float* out = dst + s * SUPER_BLOCK;
+
+        // Due metà da 128 elementi ciascuna. Ogni metà:
+        //   ql_n: 64 byte → nibble bassi (4 bit) per 128 elementi
+        //   qh_n: 32 byte → bit alti   (2 bit) per 128 elementi
+        //   sc_n: 4 scale int8 (una per ciascuno dei 4 gruppi da 32)
+        // La stride è 32: ql[l] e ql[l+32] coprono elementi a distanza 32.
+        for (int n = 0; n < 2; n++) {
+            const uint8_t* ql_n = ql + n * 64;
+            const uint8_t* qh_n = qh + n * 32;
+            const int8_t*  sc_n = sc  + n * 4;
+            float*          y   = out + n * 128;
+
+            for (int l = 0; l < 32; l++) {
+                int8_t q1 = (int8_t)((ql_n[l]    & 0xF) | (((qh_n[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql_n[l+32] & 0xF) | (((qh_n[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql_n[l]    >>  4) | (((qh_n[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql_n[l+32] >>  4) | (((qh_n[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = d * sc_n[0] * q1;
+                y[l + 32] = d * sc_n[1] * q2;
+                y[l + 64] = d * sc_n[2] * q3;
+                y[l + 96] = d * sc_n[3] * q4;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
 //  Ottieni tensore come vettore float32
 //
 //  Gestisce i diversi tipi di quantizzazione.
@@ -112,8 +262,6 @@ std::vector<float> tensor_to_float(const GGUFTensor& t) {
             break;
 
         case GGMLType::F16: {
-            // Ogni elemento è un uint16 — convertiamo uno per uno
-            // usando fp16_to_fp32 che abbiamo già implementato
             const uint16_t* src = reinterpret_cast<const uint16_t*>
                                   (t.data.data());
             for (uint64_t i = 0; i < n_elem; i++)
@@ -123,6 +271,14 @@ std::vector<float> tensor_to_float(const GGUFTensor& t) {
 
         case GGMLType::Q8_0:
             dequantize_q8_0(t.data.data(), out.data(), n_elem);
+            break;
+
+        case GGMLType::Q4_K:
+            dequantize_q4_k(t.data.data(), out.data(), n_elem);
+            break;
+
+        case GGMLType::Q6_K:
+            dequantize_q6_k(t.data.data(), out.data(), n_elem);
             break;
 
         default:
@@ -245,4 +401,69 @@ void gelu(float* x, int n) {
         // GELU(x) = 0.5 * x * (1 + tanh(inner))
         x[i] = 0.5f * v * (1.0f + tanhf(inner));
     }
+}
+
+// ─────────────────────────────────────────────
+//  RMSNorm
+// ─────────────────────────────────────────────
+void rms_norm(const float* x, const float* w,
+              float* out, int n, float eps) {
+    // Calcola la mean square
+    float ms = 0.0f;
+    for (int i = 0; i < n; i++)
+        ms += x[i] * x[i];
+    ms /= n;
+
+    // Normalizza e scala
+    float inv_rms = 1.0f / sqrtf(ms + eps);
+    for (int i = 0; i < n; i++)
+        out[i] = w[i] * x[i] * inv_rms;
+}
+
+// ─────────────────────────────────────────────
+//  RoPE
+//
+//  Per ogni head h e ogni coppia di dimensioni i:
+//    θ = pos / (freq_base ^ (2i / rope_dim))
+//    x[h*d_head + 2i]   =  x[...] * cos(θ) - x[...+1] * sin(θ)
+//    x[h*d_head + 2i+1] =  x[...] * sin(θ) + x[...+1] * cos(θ)
+//
+//  Applichiamo RoPE solo alle prime rope_dim
+//  dimensioni di ogni head — le restanti
+//  rimangono invariate.
+// ─────────────────────────────────────────────
+void rope(float* x, int pos,
+          int n_heads, int d_head,
+          int rope_dim, float freq_base) {
+    // Numero di coppie su cui applicare RoPE
+    int half_dim = rope_dim / 2;
+
+    for (int h = 0; h < n_heads; h++) {
+        float* xh = x + h * d_head;
+
+        for (int i = 0; i < half_dim; i++) {
+            // Calcola l'angolo per questa coppia
+            float theta = (float)pos /
+                powf(freq_base, (2.0f * i) / (float)rope_dim);
+
+            float cos_t = cosf(theta);
+            float sin_t = sinf(theta);
+
+            // Leggi la coppia
+            float x0 = xh[2 * i];
+            float x1 = xh[2 * i + 1];
+
+            // Applica la rotazione
+            xh[2 * i]     = x0 * cos_t - x1 * sin_t;
+            xh[2 * i + 1] = x0 * sin_t + x1 * cos_t;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+//  SiLU activation
+// ─────────────────────────────────────────────
+void silu(float* x, int n) {
+    for (int i = 0; i < n; i++)
+        x[i] = x[i] / (1.0f + expf(-x[i]));
 }

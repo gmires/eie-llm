@@ -124,6 +124,12 @@ const char* ggml_type_name(GGMLType type) {
         case GGMLType::Q4_1: return "Q4_1";
         case GGMLType::Q8_0: return "Q8_0";
         case GGMLType::Q8_1: return "Q8_1";
+        case GGMLType::Q2_K: return "Q2_K";
+        case GGMLType::Q3_K: return "Q3_K";
+        case GGMLType::Q4_K: return "Q4_K";
+        case GGMLType::Q5_K: return "Q5_K";
+        case GGMLType::Q6_K: return "Q6_K";
+        case GGMLType::Q8_K: return "Q8_K";
         case GGMLType::I8:   return "I8";
         case GGMLType::I16:  return "I16";
         case GGMLType::I32:  return "I32";
@@ -155,13 +161,18 @@ uint64_t gguf_tensor_size_bytes(const GGUFTensorInfo& ti) {
     switch (ti.type) {
         case GGMLType::F32:  return n * 4;
         case GGMLType::F16:  return n * 2;
-        case GGMLType::Q8_0: return (n / 32) * 34;
-        case GGMLType::Q4_0: return (n / 32) * 18;
-        case GGMLType::Q4_1: return (n / 32) * 20;
+        case GGMLType::Q8_0: return (n / 32)  * 34;
+        case GGMLType::Q4_0: return (n / 32)  * 18;
+        case GGMLType::Q4_1: return (n / 32)  * 20;
+        // K-quants: super-block da 256 elementi
+        case GGMLType::Q4_K: return (n / 256) * 144;
+        case GGMLType::Q6_K: return (n / 256) * 210;
+        case GGMLType::Q2_K: return (n / 256) * 84;
+        case GGMLType::Q3_K: return (n / 256) * 110;
+        case GGMLType::Q5_K: return (n / 256) * 176;
         default:             return n * 4;
     }
 }
-
 // ─────────────────────────────────────────────
 //  Lettura info tensori
 //  Formato per ogni tensore:

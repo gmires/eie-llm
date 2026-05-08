@@ -46,6 +46,44 @@
 void dequantize_q8_0(const uint8_t* src, float* dst, uint64_t n_elem);
 
 // ─────────────────────────────────────────────
+//  Dequantizzazione Q4_K
+//
+//  Q4_K è un formato "K-quant" introdotto da
+//  llama.cpp. Ogni super-block contiene 256
+//  elementi organizzati in 8 sub-block da 32.
+//
+//  Struttura di ogni super-block (144 byte):
+//    [2 byte:  scale_min float16]
+//    [2 byte:  scale_max float16]
+//    [12 byte: scales per sub-block (6 bit × 8 × 2)]
+//    [128 byte: valori 4bit × 256]
+//
+//  Per ogni sub-block b:
+//    scale = scales[b]
+//    min   = mins[b]
+//    val   = (nibble * scale) - min
+// ─────────────────────────────────────────────
+void dequantize_q4_k(const uint8_t* src, float* dst, uint64_t n_elem);
+
+// ─────────────────────────────────────────────
+//  Dequantizzazione Q6_K
+//
+//  Q6_K usa 6 bit per elemento organizzati in
+//  super-block da 256 elementi.
+//
+//  Struttura di ogni super-block (210 byte):
+//    [128 byte: bit bassi (4 bit × 256)]
+//    [64 byte:  bit alti  (2 bit × 256)]
+//    [16 byte:  scales per sub-block (int8 × 16)]
+//    [2 byte:   super scale float16]
+//
+//  Per ogni elemento:
+//    q6 = (4bit_low) | (2bit_high << 4)  → range [0,63]
+//    val = (q6 - 32) * scale * super_scale
+// ─────────────────────────────────────────────
+void dequantize_q6_k(const uint8_t* src, float* dst, uint64_t n_elem);
+
+// ─────────────────────────────────────────────
 //  Conversione float16 → float32
 //
 //  GPT-2 usa float16 (half precision) per alcuni
@@ -130,3 +168,41 @@ void softmax(float* x, int n);
 //  Modifica il vettore in-place.
 // ─────────────────────────────────────────────
 void gelu(float* x, int n);
+
+// ─────────────────────────────────────────────
+//  RMSNorm
+//
+//  Normalizza x usando solo la root mean square,
+//  senza sottrarre la media (più semplice e veloce
+//  di LayerNorm). Solo gamma (w), nessun beta.
+//
+//  RMS(x)   = √( (1/n) Σ xᵢ² )
+//  out[i]   = w[i] * x[i] / RMS(x)
+// ─────────────────────────────────────────────
+void rms_norm(const float* x, const float* w, float* out, int n, float eps);
+
+// ─────────────────────────────────────────────
+//  RoPE — Rotary Position Embedding
+//
+//  Applica la rotazione in-place al vettore x
+//  (Q oppure K) alla posizione pos.
+//  Ogni coppia (x[2i], x[2i+1]) viene ruotata
+//  di θᵢ = pos / (freq_base ^ (2i / rope_dim))
+//
+//  x        : vettore da ruotare [n_elem]
+//  pos      : posizione del token
+//  n_heads  : numero di head
+//  d_head   : dimensione per head
+//  rope_dim : dimensioni su cui applicare RoPE
+//  freq_base: base della frequenza (default 10000)
+// ─────────────────────────────────────────────
+void rope(float* x, int pos, int n_heads, int d_head, int rope_dim, float freq_base);
+
+// ─────────────────────────────────────────────
+//  SiLU activation
+//
+//  SiLU(x) = x * σ(x) = x / (1 + e^(-x))
+//  Usata nel gate di SwiGLU.
+//  Modifica il vettore in-place.
+// ─────────────────────────────────────────────
+void silu(float* x, int n);

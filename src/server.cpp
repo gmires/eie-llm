@@ -173,7 +173,7 @@ static std::string generate_text(Model& model,
             : sample_topk_topp(logits, params.top_k, params.top_p, params.temperature);
 
     for (int i = 0; i < max_tokens; i++) {
-        if (next_token == 50256) break;
+        if (next_token == tok.eos_id) break;
 
         output += tokenizer_decode(tok, {next_token});
         context_ids.push_back(next_token);

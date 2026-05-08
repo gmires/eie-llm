@@ -6,6 +6,15 @@
 #include "bench.hpp"
 
 // ─────────────────────────────────────────────
+//  Tipo di architettura
+//  Determina quali blocchi usare nel forward pass
+// ─────────────────────────────────────────────
+enum class ArchType {
+    GPT2,   // LayerNorm, pos embedding assoluto, QKV unito, GELU
+    LLAMA,  // RMSNorm, RoPE, Q/K/V separati, GQA, SwiGLU
+};
+
+// ─────────────────────────────────────────────
 //  Iperparametri del modello
 //
 //  Tutti i valori vengono letti dai metadata
@@ -15,13 +24,18 @@
 //  codice cambiando solo il file .gguf
 // ─────────────────────────────────────────────
 struct ModelConfig {
+    ArchType arch; // tipo di architettura
     int n_vocab;   // dimensione vocabolario (50257)
     int n_ctx;     // context length massimo  (1024)
     int n_embd;    // dimensione embedding    (768)
     int n_head;    // numero attention heads  (12)
+    int n_head_kv        = 0;
     int n_layer;   // numero di layer         (12)
     int n_ff;      // dimensione feed-forward (3072 = 4 × n_embd)
     int d_head;    // dimensione per head     (64  = n_embd / n_head)
+    int rope_dim         = 0;   // dimensioni RoPE (LLaMA)
+    float norm_eps       = 1e-5f;  // epsilon per RMSNorm/LayerNorm
+    float rope_freq_base = 10000.0f;    
 };
 
 // ─────────────────────────────────────────────
@@ -38,29 +52,39 @@ struct ModelConfig {
 //  pronti per il calcolo.
 // ─────────────────────────────────────────────
 struct LayerWeights {
-    // LayerNorm 1 — prima della self-attention
-    std::vector<float> ln1_w;   // gamma [n_embd]
-    std::vector<float> ln1_b;   // beta  [n_embd]
+    // ── Norm prima dell'attention ─────────────
+    std::vector<float> ln1_w;   // GPT2: LayerNorm gamma | LLaMA: RMSNorm
+    std::vector<float> ln1_b;   // GPT2: LayerNorm beta  | LLaMA: non usato
 
-    // Self-attention — proiezioni Q, K, V combinate
-    // In GPT-2 le proiezioni Q/K/V sono una sola
-    // matrice [3*n_embd × n_embd] poi splittata
-    std::vector<float> attn_qkv_w;  // [3*n_embd × n_embd]
-    std::vector<float> attn_qkv_b;  // [3*n_embd]
+    // ── Self-attention ────────────────────────
+    // GPT2: unica matrice QKV combinata
+    std::vector<float> attn_qkv_w;
+    std::vector<float> attn_qkv_b;
 
-    // Self-attention — proiezione output
-    std::vector<float> attn_out_w;  // [n_embd × n_embd]
-    std::vector<float> attn_out_b;  // [n_embd]
+    // LLaMA: Q, K, V separati (K e V più piccoli con GQA)
+    std::vector<float> attn_q_w;
+    std::vector<float> attn_k_w;
+    std::vector<float> attn_v_w;
 
-    // LayerNorm 2 — prima del FFN
-    std::vector<float> ln2_w;   // gamma [n_embd]
-    std::vector<float> ln2_b;   // beta  [n_embd]
+    // Output projection (comune a entrambi)
+    std::vector<float> attn_out_w;
+    std::vector<float> attn_out_b;  // GPT2 ha il bias, LLaMA no
 
-    // Feed-Forward Network
-    std::vector<float> ffn_fc1_w;  // [n_ff × n_embd]
-    std::vector<float> ffn_fc1_b;  // [n_ff]
-    std::vector<float> ffn_fc2_w;  // [n_embd × n_ff]
-    std::vector<float> ffn_fc2_b;  // [n_embd]
+    // ── Norm prima del FFN ────────────────────
+    std::vector<float> ln2_w;
+    std::vector<float> ln2_b;   // LLaMA: non usato
+
+    // ── FFN ───────────────────────────────────
+    // GPT2: fc1 (up) + fc2 (down) con GELU
+    std::vector<float> ffn_fc1_w;
+    std::vector<float> ffn_fc1_b;
+    std::vector<float> ffn_fc2_w;
+    std::vector<float> ffn_fc2_b;
+
+    // LLaMA: gate + up + down con SwiGLU (no bias)
+    std::vector<float> ffn_gate_w;  // W1 — passa per SiLU
+    std::vector<float> ffn_up_w;    // W3 — moltiplicato col gate
+    std::vector<float> ffn_down_w;  // W2 — proiezione finale
 };
 
 // ─────────────────────────────────────────────
@@ -70,19 +94,19 @@ struct LayerWeights {
 //  una sola volta (non per ogni layer)
 // ─────────────────────────────────────────────
 struct ModelWeights {
-    // Token embedding: ogni token ID → vettore float
-    // Matrice [n_vocab × n_embd]
+    // Token embedding (comune)
     std::vector<float> token_embd;
 
-    // Positional embedding: ogni posizione → vettore float
-    // Matrice [n_ctx × n_embd]
+    // GPT2: positional embedding assoluto
     std::vector<float> pos_embd;
 
-    // LayerNorm finale (dopo tutti i layer)
-    std::vector<float> ln_f_w;  // [n_embd]
-    std::vector<float> ln_f_b;  // [n_embd]
+    // LayerNorm/RMSNorm finale
+    std::vector<float> ln_f_w;
+    std::vector<float> ln_f_b;   // LLaMA: non usato
 
-    // Pesi dei layer (uno per ogni transformer block)
+    // LLaMA: lm_head separato (non usa weight tying)
+    std::vector<float> output_w;
+
     std::vector<LayerWeights> layers;
 };
 
@@ -182,6 +206,18 @@ void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache&
 // lw  : pesi del layer corrente
 // cfg : configurazione del modello
 void feed_forward(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg);
+
+// Self-attention LLaMA
+// Differenze rispetto a GPT-2:
+//   - Q/K/V proiettati separatamente
+//   - RoPE applicato a Q e K
+//   - GQA: n_head_kv < n_head, K/V condivisi tra gruppi
+//   - nessun bias
+void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos);
+
+// Feed-forward LLaMA con SwiGLU
+// out = (W2) * ( SiLU(W1·x) ⊙ (W3·x) )
+void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg);
 
 // Forward pass completo per un singolo token
 //

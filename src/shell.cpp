@@ -3,6 +3,7 @@
 #include "tokenizer.hpp"
 #include "ops.hpp"
 #include <iostream>
+#include <iomanip>
 #include <string>
 #include <cstdlib>
 #include <ctime>
@@ -195,7 +196,7 @@ static void generate(Model& model,
                                           params.top_p,
                                           params.temperature);
 
-        if (next_token == 50256) break;
+        if (next_token == tok.eos_id) break;
 
         // Sanitizza prima di stampare
         std::string raw = tokenizer_decode(tok, {next_token});
@@ -230,12 +231,15 @@ void shell_run(Model& model, const Tokenizer& tok) {
     linenoise::SetHistoryMaxLen(100);
     linenoise::LoadHistory(HISTORY_FILE);  // carica history precedente
 
-    std::cout << "\n";
+std::string model_name = model.config.arch == ArchType::LLAMA
+        ? "TinyLlama 1.1B" : "GPT-2 small";
+
     std::cout << "╔═══════════════════════════════════════╗\n";
     std::cout << "║   EIE-LLM — Educational Infer Engine  ║\n";
-    std::cout << "║   GPT-2 small  •  CPU only  •  C++17  ║\n";
-    std::cout << "╚═══════════════════════════════════════╝\n";
-    print_help();
+    std::cout << "║   " << std::left << std::setw(35)
+              << (model_name + "  •  CPU only  •  C++17")
+              << "║\n";
+    std::cout << "╚═══════════════════════════════════════╝\n";    print_help();
 
     while (true) {
         std::string line;

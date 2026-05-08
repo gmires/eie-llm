@@ -49,19 +49,57 @@ static std::vector<float> load_tensor(const GGUFContext& ctx,
 //                      la calcoliamo noi)
 // ─────────────────────────────────────────────
 bool model_load_config(ModelConfig& cfg, const GGUFContext& ctx) {
-    cfg.n_vocab = get_u32(ctx, "tokenizer.ggml.vocab_size", 50257);
-    cfg.n_ctx   = get_u32(ctx, "gpt2.context_length",       1024);
-    cfg.n_embd  = get_u32(ctx, "gpt2.embedding_length",     768);
-    cfg.n_head  = get_u32(ctx, "gpt2.attention.head_count", 12);
-    cfg.n_layer = get_u32(ctx, "gpt2.block_count",          12);
+    // ── Rileva architettura ───────────────────
+    // Il campo "general.architecture" dice tutto
+    std::string arch_str;
+    for (const auto& kv : ctx.metadata)
+        if (kv.key == "general.architecture")
+            if (auto* s = kv.value.get_if<std::string>())
+                arch_str = *s;
 
-    // n_ff non è sempre nei metadata — usiamo il valore
-    // standard GPT-2: 4 × n_embd
-    cfg.n_ff    = get_u32(ctx, "gpt2.feed_forward_length",
-                          cfg.n_embd * 4);
+    if (arch_str == "llama") {
+        cfg.arch = ArchType::LLAMA;
 
-    // d_head si calcola sempre da n_embd / n_head
-    cfg.d_head  = cfg.n_embd / cfg.n_head;
+        cfg.n_vocab  = get_u32(ctx, "tokenizer.ggml.vocab_size", 32000);
+        cfg.n_ctx    = get_u32(ctx, "llama.context_length",      2048);
+        cfg.n_embd   = get_u32(ctx, "llama.embedding_length",    2048);
+        cfg.n_head   = get_u32(ctx, "llama.attention.head_count", 32);
+        cfg.n_head_kv= get_u32(ctx, "llama.attention.head_count_kv", cfg.n_head);
+        cfg.n_layer  = get_u32(ctx, "llama.block_count",         22);
+        cfg.n_ff     = get_u32(ctx, "llama.feed_forward_length", 5632);
+        cfg.rope_dim = get_u32(ctx, "llama.rope.dimension_count", 0);
+
+        // RMSNorm epsilon
+        for (const auto& kv : ctx.metadata)
+            if (kv.key == "llama.attention.layer_norm_rms_epsilon")
+                if (auto* v = kv.value.get_if<float>())
+                    cfg.norm_eps = *v;
+
+        // RoPE freq base
+        for (const auto& kv : ctx.metadata)
+            if (kv.key == "llama.rope.freq_base")
+                if (auto* v = kv.value.get_if<float>())
+                    cfg.rope_freq_base = *v;
+
+    } else {
+        // Default: GPT-2
+        cfg.arch = ArchType::GPT2;
+
+        cfg.n_vocab   = get_u32(ctx, "tokenizer.ggml.vocab_size", 50257);
+        cfg.n_ctx     = get_u32(ctx, "gpt2.context_length",       1024);
+        cfg.n_embd    = get_u32(ctx, "gpt2.embedding_length",     768);
+        cfg.n_head    = get_u32(ctx, "gpt2.attention.head_count", 12);
+        cfg.n_head_kv = cfg.n_head;  // GPT2 non ha GQA
+        cfg.n_layer   = get_u32(ctx, "gpt2.block_count",          12);
+        cfg.n_ff      = get_u32(ctx, "gpt2.feed_forward_length",  cfg.n_embd * 4);
+        cfg.norm_eps  = 1e-5f;
+    }
+
+    cfg.d_head = cfg.n_embd / cfg.n_head;
+
+    // rope_dim fallback: se non specificato nei metadata usa d_head
+    if (cfg.arch == ArchType::LLAMA && cfg.rope_dim == 0)
+        cfg.rope_dim = cfg.d_head;
 
     if (cfg.n_embd == 0 || cfg.n_head == 0 || cfg.n_layer == 0) {
         std::cerr << "[ERRORE] Configurazione non valida\n";
@@ -93,18 +131,31 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
     const ModelConfig& cfg = model.config;
     ModelWeights& w = model.weights;
 
+    std::cout << "  Architettura : "
+              << (cfg.arch == ArchType::LLAMA ? "LLaMA" : "GPT-2") << "\n";
     std::cout << "  Caricamento pesi globali...\n";
 
-    // ── Pesi globali ──────────────────────────
+    // ── Pesi globali comuni ───────────────────
     w.token_embd = load_tensor(ctx, "token_embd.weight");
     if (w.token_embd.empty()) return false;
 
-    w.pos_embd = load_tensor(ctx, "position_embd.weight");
-    if (w.pos_embd.empty()) return false;
-
     w.ln_f_w = load_tensor(ctx, "output_norm.weight");
-    w.ln_f_b = load_tensor(ctx, "output_norm.bias");
-    if (w.ln_f_w.empty() || w.ln_f_b.empty()) return false;
+    if (w.ln_f_w.empty()) return false;
+
+    if (cfg.arch == ArchType::GPT2) {
+        // GPT2: positional embedding + lm_head = token_embd (weight tying)
+        w.pos_embd = load_tensor(ctx, "position_embd.weight");
+        if (w.pos_embd.empty()) return false;
+
+        w.ln_f_b = load_tensor(ctx, "output_norm.bias");
+        if (w.ln_f_b.empty()) return false;
+
+    } else {
+        // LLaMA: lm_head separato, no positional embedding
+        w.output_w = load_tensor(ctx, "output.weight");
+        if (w.output_w.empty()) return false;
+        // ln_f_b non esiste in LLaMA — lascia vuoto
+    }
 
     // ── Pesi per layer ────────────────────────
     std::cout << "  Caricamento " << cfg.n_layer << " layer...\n";
@@ -114,36 +165,43 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
         std::string p = "blk." + std::to_string(i) + ".";
         LayerWeights& lw = w.layers[i];
 
-        // Layer norm 1
-        lw.ln1_w = load_tensor(ctx, p + "attn_norm.weight");
-        lw.ln1_b = load_tensor(ctx, p + "attn_norm.bias");
+        if (cfg.arch == ArchType::GPT2) {
+            lw.ln1_w      = load_tensor(ctx, p + "attn_norm.weight");
+            lw.ln1_b      = load_tensor(ctx, p + "attn_norm.bias");
+            lw.attn_qkv_w = load_tensor(ctx, p + "attn_qkv.weight");
+            lw.attn_qkv_b = load_tensor(ctx, p + "attn_qkv.bias");
+            lw.attn_out_w = load_tensor(ctx, p + "attn_output.weight");
+            lw.attn_out_b = load_tensor(ctx, p + "attn_output.bias");
+            lw.ln2_w      = load_tensor(ctx, p + "ffn_norm.weight");
+            lw.ln2_b      = load_tensor(ctx, p + "ffn_norm.bias");
+            lw.ffn_fc1_w  = load_tensor(ctx, p + "ffn_up.weight");
+            lw.ffn_fc1_b  = load_tensor(ctx, p + "ffn_up.bias");
+            lw.ffn_fc2_w  = load_tensor(ctx, p + "ffn_down.weight");
+            lw.ffn_fc2_b  = load_tensor(ctx, p + "ffn_down.bias");
 
-        // Attention Q/K/V
-        lw.attn_qkv_w = load_tensor(ctx, p + "attn_qkv.weight");
-        lw.attn_qkv_b = load_tensor(ctx, p + "attn_qkv.bias");
+            if (lw.attn_qkv_w.empty() || lw.ffn_fc1_w.empty()) {
+                std::cerr << "[ERRORE] GPT2 layer " << i << " incompleto\n";
+                return false;
+            }
 
-        // Attention output
-        lw.attn_out_w = load_tensor(ctx, p + "attn_output.weight");
-        lw.attn_out_b = load_tensor(ctx, p + "attn_output.bias");
+        } else {
+            // LLaMA: no bias, Q/K/V separati
+            lw.ln1_w      = load_tensor(ctx, p + "attn_norm.weight");
+            lw.attn_q_w   = load_tensor(ctx, p + "attn_q.weight");
+            lw.attn_k_w   = load_tensor(ctx, p + "attn_k.weight");
+            lw.attn_v_w   = load_tensor(ctx, p + "attn_v.weight");
+            lw.attn_out_w = load_tensor(ctx, p + "attn_output.weight");
+            lw.ln2_w      = load_tensor(ctx, p + "ffn_norm.weight");
+            lw.ffn_gate_w = load_tensor(ctx, p + "ffn_gate.weight");
+            lw.ffn_up_w   = load_tensor(ctx, p + "ffn_up.weight");
+            lw.ffn_down_w = load_tensor(ctx, p + "ffn_down.weight");
 
-        // Layer norm 2
-        lw.ln2_w = load_tensor(ctx, p + "ffn_norm.weight");
-        lw.ln2_b = load_tensor(ctx, p + "ffn_norm.bias");
-
-        // FFN
-        lw.ffn_fc1_w = load_tensor(ctx, p + "ffn_up.weight");
-        lw.ffn_fc1_b = load_tensor(ctx, p + "ffn_up.bias");
-        lw.ffn_fc2_w = load_tensor(ctx, p + "ffn_down.weight");
-        lw.ffn_fc2_b = load_tensor(ctx, p + "ffn_down.bias");
-
-        // Verifica che i tensori critici siano stati caricati
-        if (lw.attn_qkv_w.empty() || lw.ffn_fc1_w.empty()) {
-            std::cerr << "[ERRORE] Layer " << i
-                      << ": tensori mancanti\n";
-            return false;
+            if (lw.attn_q_w.empty() || lw.ffn_gate_w.empty()) {
+                std::cerr << "[ERRORE] LLaMA layer " << i << " incompleto\n";
+                return false;
+            }
         }
     }
-
     return true;
 }
 
@@ -157,13 +215,16 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
 // ─────────────────────────────────────────────
 void model_init_kvcache(Model& model) {
     const ModelConfig& cfg = model.config;
-    int cache_size = cfg.n_ctx * cfg.n_embd;
+
+    // LLaMA GQA: la cache KV usa n_head_kv, non n_head
+    // GPT-2: n_head_kv == n_head quindi formula uguale
+    int kv_dim    = cfg.n_head_kv * cfg.d_head;
+    int cache_size = cfg.n_ctx * kv_dim;
 
     model.kv_cache.k.assign(cfg.n_layer, std::vector<float>(cache_size, 0.0f));
     model.kv_cache.v.assign(cfg.n_layer, std::vector<float>(cache_size, 0.0f));
     model.kv_cache.n_cached = 0;
 }
-
 // ─────────────────────────────────────────────
 //  Stampa configurazione
 // ─────────────────────────────────────────────
@@ -171,13 +232,21 @@ void model_print_config(const ModelConfig& cfg) {
     std::cout << "\n═══════════════════════════════════════\n";
     std::cout << "  EIE-LLM — Model Config\n";
     std::cout << "═══════════════════════════════════════\n";
-    std::cout << "  n_vocab  : " << cfg.n_vocab  << "\n";
-    std::cout << "  n_ctx    : " << cfg.n_ctx    << "\n";
-    std::cout << "  n_embd   : " << cfg.n_embd   << "\n";
-    std::cout << "  n_head   : " << cfg.n_head   << "\n";
-    std::cout << "  n_layer  : " << cfg.n_layer  << "\n";
-    std::cout << "  n_ff     : " << cfg.n_ff     << "\n";
-    std::cout << "  d_head   : " << cfg.d_head   << "\n";
+    std::cout << "  arch     : "
+              << (cfg.arch == ArchType::LLAMA ? "LLaMA" : "GPT-2") << "\n";
+    std::cout << "  n_vocab  : " << cfg.n_vocab       << "\n";
+    std::cout << "  n_ctx    : " << cfg.n_ctx          << "\n";
+    std::cout << "  n_embd   : " << cfg.n_embd         << "\n";
+    std::cout << "  n_head   : " << cfg.n_head         << "\n";
+    std::cout << "  n_head_kv: " << cfg.n_head_kv      << "\n";
+    std::cout << "  n_layer  : " << cfg.n_layer        << "\n";
+    std::cout << "  n_ff     : " << cfg.n_ff           << "\n";
+    std::cout << "  d_head   : " << cfg.d_head         << "\n";
+    if (cfg.arch == ArchType::LLAMA) {
+        std::cout << "  rope_dim : " << cfg.rope_dim       << "\n";
+        std::cout << "  rope_base: " << cfg.rope_freq_base << "\n";
+        std::cout << "  norm_eps : " << cfg.norm_eps       << "\n";
+    }
     std::cout << "═══════════════════════════════════════\n\n";
 }
 
@@ -404,6 +473,147 @@ void feed_forward(const float* x, float* out,
 }
 
 // ─────────────────────────────────────────────
+//  Self-Attention LLaMA con GQA e RoPE
+//
+//  Differenze rispetto a GPT-2:
+//
+//  1) Q, K, V sono proiettati separatamente
+//     Q: [n_embd × n_embd]      → n_head    vettori d_head
+//     K: [n_embd × n_head_kv*d] → n_head_kv vettori d_head
+//     V: [n_embd × n_head_kv*d] → n_head_kv vettori d_head
+//
+//  2) RoPE applicato a Q e K prima della cache
+//     Ruota le coppie di dimensioni in base alla posizione
+//
+//  3) GQA: ogni gruppo di (n_head/n_head_kv) head Q
+//     condivide lo stesso head K e V
+//     kv_head = q_head / (n_head / n_head_kv)
+// ─────────────────────────────────────────────
+void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos) {
+
+    const int n_embd    = cfg.n_embd;
+    const int n_head    = cfg.n_head;
+    const int n_head_kv = cfg.n_head_kv;
+    const int d_head    = cfg.d_head;
+    const int rope_dim  = cfg.rope_dim;
+
+    // Dimensione totale K e V (n_head_kv × d_head)
+    const int kv_dim = n_head_kv * d_head;
+
+    // ── Step 1: proiezione Q, K, V separata ──
+    std::vector<float> Q(n_embd);          // n_head × d_head
+    std::vector<float> K(kv_dim);          // n_head_kv × d_head
+    std::vector<float> V(kv_dim);          // n_head_kv × d_head
+
+    matvec(lw.attn_q_w.data(), x, Q.data(), n_embd,  n_embd);
+    matvec(lw.attn_k_w.data(), x, K.data(), kv_dim,  n_embd);
+    matvec(lw.attn_v_w.data(), x, V.data(), kv_dim,  n_embd);
+    // LLaMA non ha bias nelle proiezioni attention
+
+    // ── Step 2: applica RoPE a Q e K ─────────
+    //
+    // RoPE ruota ogni coppia di dimensioni in base
+    // alla posizione. Applicato prima di salvare
+    // in cache in modo che la cache contenga già
+    // i vettori ruotati — non bisogna ricalcolare
+    // la rotazione per i token già in cache.
+    rope(Q.data(), pos, n_head,    d_head, rope_dim, cfg.rope_freq_base);
+    rope(K.data(), pos, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+
+    // ── Step 3: salva K e V nella cache ──────
+    float* k_pos = cache.k[layer].data() + pos * kv_dim;
+    float* v_pos = cache.v[layer].data() + pos * kv_dim;
+    vec_copy(K.data(), k_pos, kv_dim);
+    vec_copy(V.data(), v_pos, kv_dim);
+
+    // ── Step 4: attention con GQA ─────────────
+    //
+    // GQA: n_head Q head sono divisi in n_head_kv gruppi.
+    // Ogni gruppo condivide un head K e V.
+    // Gruppo di head Q h → kv_head = h / (n_head / n_head_kv)
+    int gqa_ratio = n_head / n_head_kv;
+
+    std::vector<float> attn_out(n_embd, 0.0f);
+    std::vector<float> scores(pos + 1);
+    float scale = 1.0f / sqrtf((float)d_head);
+
+    for (int h = 0; h < n_head; h++) {
+        // Head K/V corrispondente per GQA
+        int kv_h   = h / gqa_ratio;
+        int h_off  = h    * d_head;
+        int kv_off = kv_h * d_head;
+
+        const float* Qh = Q.data() + h_off;
+
+        // Calcola scores = Q·K / √d_head
+        for (int t = 0; t <= pos; t++) {
+            const float* Kh_t = cache.k[layer].data()
+                                + t * kv_dim + kv_off;
+            float dot = 0.0f;
+            for (int d = 0; d < d_head; d++)
+                dot += Qh[d] * Kh_t[d];
+            scores[t] = dot * scale;
+        }
+
+        // Softmax
+        softmax(scores.data(), pos + 1);
+
+        // Weighted sum dei V
+        float* out_h = attn_out.data() + h_off;
+        for (int t = 0; t <= pos; t++) {
+            const float* Vh_t = cache.v[layer].data()
+                                + t * kv_dim + kv_off;
+            for (int d = 0; d < d_head; d++)
+                out_h[d] += scores[t] * Vh_t[d];
+        }
+    }
+
+    // ── Step 5: proiezione output ─────────────
+    // LLaMA non ha bias nella proiezione output
+    matvec(lw.attn_out_w.data(), attn_out.data(),
+           out, n_embd, n_embd);
+}
+
+// ─────────────────────────────────────────────
+//  Feed-Forward LLaMA con SwiGLU
+//
+//  SwiGLU usa 3 matrici invece di 2:
+//
+//    gate = SiLU( x · ffn_gate_w^T )   [n_embd → n_ff]
+//    up   =       x · ffn_up_w^T        [n_embd → n_ff]
+//    h    = gate ⊙ up                   [n_ff] (Hadamard)
+//    out  = h · ffn_down_w^T            [n_ff → n_embd]
+//
+//  Il gate moltiplicativo rende la rete più
+//  espressiva — ogni dimensione di up viene
+//  scalata da un gate che dipende dall'input.
+//  SiLU è più smooth di ReLU e migliora il
+//  flusso del gradiente durante il training.
+// ─────────────────────────────────────────────
+void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, const ModelConfig& cfg) {
+    const int n_embd = cfg.n_embd;
+    const int n_ff   = cfg.n_ff;
+
+    std::vector<float> gate(n_ff);
+    std::vector<float> up(n_ff);
+
+    // Proiezione gate e up parallele
+    matvec(lw.ffn_gate_w.data(), x, gate.data(), n_ff, n_embd);
+    matvec(lw.ffn_up_w.data(),   x, up.data(),   n_ff, n_embd);
+
+    // Applica SiLU al gate
+    silu(gate.data(), n_ff);
+
+    // Hadamard product: gate ⊙ up
+    for (int i = 0; i < n_ff; i++)
+        gate[i] *= up[i];
+
+    // Proiezione down: n_ff → n_embd
+    matvec(lw.ffn_down_w.data(), gate.data(), out, n_embd, n_ff);
+    // LLaMA non ha bias nel FFN
+}
+
+// ─────────────────────────────────────────────
 //  Forward pass completo
 //
 //  Per ogni layer il flusso è:
@@ -435,75 +645,124 @@ void feed_forward(const float* x, float* out,
 //  lm_head è la STESSA di token_embd trasposta.
 //  Questo riduce i parametri e migliora la qualità.
 // ─────────────────────────────────────────────
-void forward(Model& model,
-             int token_id, int pos,
-             std::vector<float>& logits,
-             bool bench_mode) {
+void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bool bench_mode) {
 
     const ModelConfig& cfg = model.config;
     const ModelWeights& w  = model.weights;
     const int n_embd        = cfg.n_embd;
+    const bool is_llama     = (cfg.arch == ArchType::LLAMA);
 
+    // Buffer principale — stato del token
     std::vector<float> x(n_embd);
+
+    // Buffer temporanei
     std::vector<float> residual(n_embd);
     std::vector<float> ln_out(n_embd);
     std::vector<float> attn_out(n_embd);
     std::vector<float> ffn_out(n_embd);
 
-    // ── Embedding ─────────────────────────────
+    // ── Step 1: embedding lookup ──────────────
     auto t0 = now();
-    embedding_lookup(w.token_embd.data(),
-                     w.pos_embd.data(),
-                     token_id, pos,
-                     x.data(), n_embd);
+
+    if (is_llama) {
+        // LLaMA: solo token embedding, niente positional
+        const float* te = w.token_embd.data() + token_id * n_embd;
+        vec_copy(te, x.data(), n_embd);
+    } else {
+        // GPT-2: token embedding + positional embedding
+        embedding_lookup(w.token_embd.data(),
+                         w.pos_embd.data(),
+                         token_id, pos,
+                         x.data(), n_embd);
+    }
+
     auto t1 = now();
 
-    // ── Loop layer ────────────────────────────
+    // ── Step 2: loop sui layer ─────────────────
     double attn_ms_step = 0.0;
     double ffn_ms_step  = 0.0;
 
     for (int l = 0; l < cfg.n_layer; l++) {
         const LayerWeights& lw = w.layers[l];
 
+        // ── Salva residual ────────────────────
         vec_copy(x.data(), residual.data(), n_embd);
 
-        // Attention
+        // ── Norm 1 ────────────────────────────
         auto ta0 = now();
-        layer_norm(x.data(), lw.ln1_w.data(),
-                   lw.ln1_b.data(), ln_out.data(), n_embd);
-        self_attention(ln_out.data(), attn_out.data(),
-                       lw, model.kv_cache, cfg, l, pos);
-        vec_add(attn_out.data(), residual.data(),
-                x.data(), n_embd);
+        if (is_llama)
+            rms_norm(x.data(), lw.ln1_w.data(),
+                     ln_out.data(), n_embd, cfg.norm_eps);
+        else
+            layer_norm(x.data(), lw.ln1_w.data(),
+                       lw.ln1_b.data(), ln_out.data(), n_embd);
+
+        // ── Self-Attention ────────────────────
+        if (is_llama)
+            self_attention_llama(ln_out.data(), attn_out.data(),
+                                 lw, model.kv_cache, cfg, l, pos);
+        else
+            self_attention(ln_out.data(), attn_out.data(),
+                           lw, model.kv_cache, cfg, l, pos);
+
         auto ta1 = now();
 
+        // ── Residual connection 1 ─────────────
+        vec_add(attn_out.data(), residual.data(),
+                x.data(), n_embd);
+
+        // ── Salva residual ────────────────────
         vec_copy(x.data(), residual.data(), n_embd);
 
-        // FFN
+        // ── Norm 2 ────────────────────────────
         auto tf0 = now();
-        layer_norm(x.data(), lw.ln2_w.data(),
-                   lw.ln2_b.data(), ln_out.data(), n_embd);
-        feed_forward(ln_out.data(), ffn_out.data(), lw, cfg);
+        if (is_llama)
+            rms_norm(x.data(), lw.ln2_w.data(),
+                     ln_out.data(), n_embd, cfg.norm_eps);
+        else
+            layer_norm(x.data(), lw.ln2_w.data(),
+                       lw.ln2_b.data(), ln_out.data(), n_embd);
+
+        // ── FFN ───────────────────────────────
+        if (is_llama)
+            feed_forward_llama(ln_out.data(), ffn_out.data(),
+                               lw, cfg);
+        else
+            feed_forward(ln_out.data(), ffn_out.data(),
+                         lw, cfg);
+
+        auto tf1 = now();
+
+        // ── Residual connection 2 ─────────────
         vec_add(ffn_out.data(), residual.data(),
                 x.data(), n_embd);
-        auto tf1 = now();
 
         attn_ms_step += ms_between(ta0, ta1);
         ffn_ms_step  += ms_between(tf0, tf1);
     }
 
-    // ── LayerNorm finale + lm_head ────────────
+    // ── Step 3: norm finale ───────────────────
     std::vector<float> ln_final(n_embd);
-    layer_norm(x.data(), w.ln_f_w.data(),
-               w.ln_f_b.data(), ln_final.data(), n_embd);
+    if (is_llama)
+        rms_norm(x.data(), w.ln_f_w.data(),
+                 ln_final.data(), n_embd, cfg.norm_eps);
+    else
+        layer_norm(x.data(), w.ln_f_w.data(),
+                   w.ln_f_b.data(), ln_final.data(), n_embd);
 
+    // ── Step 4: lm_head → logits ──────────────
+    //
+    // GPT-2: weight tying — usa token_embd trasposta
+    // LLaMA: output.weight separato
     logits.resize(cfg.n_vocab);
-    matvec(w.token_embd.data(), ln_final.data(),
+    const float* lm_head = is_llama
+        ? w.output_w.data()
+        : w.token_embd.data();
+
+    matvec(lm_head, ln_final.data(),
            logits.data(), cfg.n_vocab, n_embd);
 
-    auto t2 = now();
-
-    // ── Accumula tempi se in modalità bench ───
+    // ── Accumula tempi benchmark ───────────────
     if (bench_mode) {
         model.bench.embed_ms  += ms_between(t0, t1);
         model.bench.attn_ms   += attn_ms_step;
@@ -511,6 +770,7 @@ void forward(Model& model,
         model.bench.n_steps++;
     }
 }
+
 // ─────────────────────────────────────────────
 //  Sampling greedy (argmax)
 //

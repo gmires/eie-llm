@@ -6,15 +6,33 @@ compatibile con l'API OpenAI. Zero dipendenze pesanti, solo stdlib + httplib.
 
 ---
 
+## Stato del progetto
+
+| Architettura | Stato |
+|---|---|
+| **GPT-2** (Q8\_0) | Funzionante |
+| **LLaMA / TinyLLaMA** (Q4\_K\_M) | **Work in progress — output non corretto** |
+
+> **Nota LLaMA**: il codice per l'architettura LLaMA è presente (RoPE, RMSNorm,
+> SwiGLU, GQA, dequantizzazione Q4\_K e Q6\_K) ma il modello non produce ancora
+> testo coerente. Le dequantizzazioni sono state corrette e verificate contro
+> ggml-quants.c, ma rimane almeno un bug nel forward pass o nel tokenizer
+> SentencePiece da individuare.
+
+---
+
 ## Roadmap
 
 - [x] Fase 1 — Parser GGUF: header + metadata KV
 - [x] Fase 2 — Lettura info tensori
-- [x] Fase 3 — Tokenizer BPE
-- [x] Fase 4 — Forward pass GPT-2
-- [x] Fase 5 — Shell interattiva
+- [x] Fase 3 — Tokenizer BPE (GPT-2 byte-level)
+- [x] Fase 4 — Forward pass GPT-2 (LayerNorm, GELU, MHA)
+- [x] Fase 5 — Shell interattiva con linenoise
 - [x] Fase 6 — Server HTTP minimale
 - [x] Fase 7 — Sampling avanzato (top-k, top-p, repetition penalty)
+- [x] Fase 8 — Dequantizzazione Q4\_K e Q6\_K
+- [x] Fase 9 — Architettura LLaMA (RoPE, RMSNorm, SwiGLU, GQA)
+- [ ] Fase 10 — **Debug forward pass LLaMA** *(in corso)*
 
 ---
 
@@ -22,10 +40,10 @@ compatibile con l'API OpenAI. Zero dipendenze pesanti, solo stdlib + httplib.
 
 | Modulo | File | Cosa fa |
 |--------|------|---------|
-| Parser GGUF | `gguf.hpp/cpp` | Legge header, metadata KV, info tensori dal file binario |
-| Tensor ops | `ops.hpp/cpp` | Dequantizzazione Q8\_0/F16, matmul, matvec, softmax, GELU |
-| Tokenizer | `tokenizer.hpp/cpp` | BPE encode/decode con vocabolario e merge rules da GGUF |
-| Modello | `model.hpp/cpp` | Config, pesi, KV cache, LayerNorm, Self-Attention, FFN |
+| Parser GGUF | `gguf.hpp/cpp` | Legge header, metadata KV, info tensori, dati raw dal file binario |
+| Tensor ops | `ops.hpp/cpp` | Dequantizzazione F16/Q8\_0/Q4\_K/Q6\_K, fp16→fp32, matmul, matvec, softmax, RMSNorm, RoPE, GELU, SiLU |
+| Tokenizer | `tokenizer.hpp/cpp` | BPE encode/decode per GPT-2 (byte-level) e LLaMA (SentencePiece) |
+| Modello | `model.hpp/cpp` | Config, pesi, KV cache, LayerNorm/RMSNorm, Self-Attention (MHA e GQA), FFN (GELU e SwiGLU), forward pass |
 | Shell | `shell.hpp/cpp` | REPL interattiva con comandi e streaming token per token |
 | Server | `server.hpp/cpp` | HTTP server con endpoint `/v1/completions` |
 
@@ -42,11 +60,18 @@ compatibile con l'API OpenAI. Zero dipendenze pesanti, solo stdlib + httplib.
 
 ## Setup
 
-Lo script scarica il modello GPT-2 (~176MB) e la libreria httplib:
+Lo script scarica il modello GPT-2 (~176 MB) e la libreria httplib:
 
 ```bash
 chmod +x scripts/setup.sh
 ./scripts/setup.sh
+```
+
+Per TinyLLaMA (~638 MB), scaricare manualmente:
+
+```bash
+wget -P models/ https://huggingface.co/second-state/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+     -O models/tinyllama.Q4_K_M.gguf
 ```
 
 ---
@@ -63,6 +88,10 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
+> **Nota build**: se si modificano file sorgente e i cambiamenti non vengono
+> rilevati, usare `cmake --build build --clean-first` per forzare la
+> ricompilazione completa.
+
 ---
 
 ## Uso
@@ -70,7 +99,11 @@ cmake --build build
 ### Shell interattiva
 
 ```bash
+# GPT-2 (funzionante)
 ./build/eie-llm models/gpt2.Q8_0.gguf
+
+# TinyLLaMA (WIP — output non corretto)
+./build/eie-llm models/tinyllama.Q4_K_M.gguf
 ```
 
 Comandi disponibili nella shell:
@@ -236,7 +269,7 @@ token ID
 │  │                         │            │
 │  └─────────── + ◄──────────┘            │  residual connection
 │               │                         │
-│  x ──► LayerNorm2 ──► FFN               │
+│  x ──► LayerNorm2 ──► FFN (GELU)        │
 │  │                     │                │
 │  └─────────── + ◄──────┘                │  residual connection
 │                                         │
@@ -252,7 +285,41 @@ token ID
 sampling → token successivo
 ```
 
-### Self-Attention con KV Cache
+### Forward pass LLaMA (implementato, WIP)
+
+```
+token ID
+    │
+    ▼
+[embedding lookup]          solo token embedding (no positional)
+    │
+    ▼  × 22 layer (TinyLLaMA)
+┌─────────────────────────────────────────┐
+│                                         │
+│  x ──► RMSNorm1 ──► Self-Attention      │
+│  │         RoPE su Q e K                │
+│  │         GQA: 32 head Q / 4 head KV   │
+│  │                         │            │
+│  └─────────── + ◄──────────┘            │  residual connection
+│               │                         │
+│  x ──► RMSNorm2 ──► FFN (SwiGLU)        │
+│  │         gate = SiLU(W1·x)            │
+│  │         out  = (gate ⊙ W3·x) · W2    │
+│  └─────────── + ◄──────────┘            │  residual connection
+│                                         │
+└─────────────────────────────────────────┘
+    │
+    ▼
+[RMSNorm finale]
+    │
+    ▼
+[output.weight]             lm_head separato (no weight tying)
+    │
+    ▼
+logits [32000] → sampling → token successivo
+```
+
+### Self-Attention con KV Cache (GPT-2)
 
 ```
 x [n_embd=768]
@@ -273,21 +340,34 @@ QKV projection [3×768]
 concatena heads → output projection [768]
 ```
 
-### Quantizzazione Q8\_0
+### Quantizzazione — formati supportati
 
+**Q8\_0** (usato da GPT-2):
 ```
-Blocco originale (32 float32):
-    [f0, f1, f2, ..., f31]
+Blocco: 2 byte scale (float16) + 32 byte int8
+Dequantizzazione: val = int8 * scale
+```
 
-Quantizzazione:
-    scale = max(|fi|) / 127.0   → float16 (2 byte)
-    qi    = round(fi / scale)   → int8    (1 byte × 32)
+**Q4\_K** (usato da TinyLLaMA):
+```
+Super-block: 256 elementi, 144 byte
+  2 byte d (scale globale scales), 2 byte dmin (scale globale minimi)
+  12 byte: 8 scale + 8 minimi compressi a 6 bit ciascuno
+  128 byte qs: nibble 4 bit, due sub-block per ogni 32 byte
+    low nibble  → sub-block pari,  elemento l
+    high nibble → sub-block dispari, elemento l
+Dequantizzazione: val = nibble * (sv * d) - (mv * dmin)
+```
 
-Blocco Q8_0 (34 byte totali):
-    [scale_f16 | q0 q1 q2 ... q31]
-
-Dequantizzazione:
-    fi = qi * scale
+**Q6\_K** (usato da TinyLLaMA per output.weight e attn_v):
+```
+Super-block: 256 elementi, 210 byte
+  128 byte ql: 4 bit bassi di ogni elemento
+   64 byte qh: 2 bit alti per 4 elementi/byte (stride 32)
+   16 byte scales: int8 × 16 scale
+    2 byte d: super-scale float16
+Dequantizzazione: q6 = (low4 | high2<<4) - 32
+                  val = d * scale[k] * q6
 ```
 
 ---
@@ -301,30 +381,36 @@ eie-llm/
 ├── include/
 │   ├── gguf.hpp          # Strutture e funzioni GGUF
 │   ├── ops.hpp           # Operazioni primitive sui tensori
-│   ├── tokenizer.hpp     # Tokenizer BPE
+│   ├── tokenizer.hpp     # Tokenizer BPE (GPT-2 e SentencePiece)
 │   ├── model.hpp         # Strutture modello e forward pass
 │   ├── shell.hpp         # Shell interattiva
 │   └── server.hpp        # Server HTTP
 ├── src/
 │   ├── main.cpp          # Entry point
-│   ├── gguf.cpp
-│   ├── ops.cpp
-│   ├── tokenizer.cpp
-│   ├── model.cpp
-│   ├── shell.cpp
-│   └── server.cpp
+│   ├── gguf.cpp          # Parser GGUF
+│   ├── ops.cpp           # Dequantizzazione e operazioni vettoriali
+│   ├── tokenizer.cpp     # BPE encode/decode
+│   ├── model.cpp         # Forward pass GPT-2 e LLaMA
+│   ├── shell.cpp         # Shell interattiva
+│   └── server.cpp        # Server HTTP
 ├── models/               # Modelli GGUF (non inclusi nel repo)
 │   └── .gitkeep
 ├── scripts/
 │   └── setup.sh          # Download modello + dipendenze
+├── tools/
+│   ├── inspect_gguf.py   # Ispezione file GGUF
+│   ├── debug_q4k.py      # Debug dequantizzazione Q4_K
+│   └── verify_q4k.py     # Verifica Q4_K contro riferimento ggml
 └── third_party/          # httplib.h (non incluso nel repo)
 ```
 
 ---
 
-## Modello
+## Modelli
 
-GPT-2 small — 124M parametri, architettura transformer decoder-only.
+### GPT-2 small (funzionante)
+
+124M parametri, architettura transformer decoder-only.
 
 | Parametro | Valore |
 |-----------|--------|
@@ -335,20 +421,38 @@ GPT-2 small — 124M parametri, architettura transformer decoder-only.
 | `n_layer` | 12 |
 | `n_ff` | 3072 |
 | `d_head` | 64 |
-| Formato file | GGUF Q8\_0 |
-| Dimensione | ~176 MB |
+| Quantizzazione | Q8\_0 |
+| Dimensione file | ~176 MB |
+
+### TinyLLaMA 1.1B Chat (WIP)
+
+1.1B parametri, architettura LLaMA con GQA.
+
+| Parametro | Valore |
+|-----------|--------|
+| `n_vocab` | 32000 |
+| `n_ctx` | 2048 |
+| `n_embd` | 2048 |
+| `n_head` | 32 |
+| `n_head_kv` | 4 (GQA) |
+| `n_layer` | 22 |
+| `n_ff` | 5632 |
+| `d_head` | 64 |
+| `rope_dim` | 64 |
+| Quantizzazione | Q4\_K\_M |
+| Dimensione file | ~638 MB |
 
 ---
 
-## Prossimi passi possibili
+## Prossimi passi
 
-| Obiettivo | Cosa aggiungere |
-|-----------|----------------|
-| **Performance** | AVX2/NEON per matmul, thread pool per i layer |
-| **Modelli più grandi** | Supporto LLaMA (RoPE, SwiGLU, RMSNorm) |
-| **Memoria** | Quantizzazione KV cache, sliding window attention |
-| **Streaming HTTP** | Server-Sent Events per output token per token |
-| **Benchmark** | Misura tokens/sec, latenza prefill vs generazione |
+| Obiettivo | Priorità |
+|-----------|----------|
+| **Debug LLaMA** — individuare il bug nel forward pass | Alta |
+| **Tokenizer SentencePiece** — verificare encoding LLaMA | Alta |
+| **Performance** — AVX2/NEON per matmul, thread pool | Media |
+| **Streaming HTTP** — Server-Sent Events per output token per token | Bassa |
+| **Memoria** — Quantizzazione KV cache, sliding window attention | Bassa |
 
 ---
 
