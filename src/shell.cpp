@@ -115,7 +115,7 @@ static std::string sanitize_output(const std::string& s) {
 // ─────────────────────────────────────────────
 //  Stampa i comandi disponibili
 // ─────────────────────────────────────────────
-static void print_help() {
+static void print_help(bool chat_mode) {
     std::cout
         << "\n  Comandi disponibili:\n"
         << "  :help                mostra questo messaggio\n"
@@ -126,10 +126,13 @@ static void print_help() {
         << "  :penalty <f>         repetition penalty    (default 1.1)\n"
         << "  :greedy              attiva sampling greedy (argmax)\n"
         << "  :sample              attiva top-k + top-p sampling\n"
+        << "  :chat                modalità chat (applica template)\n"
+        << "  :raw                 modalità raw  (prompt diretto)\n"
         << "  :params              mostra parametri correnti\n"
         << "  :reset               azzera la KV cache\n"
         << "  :quit                esci\n"
         << "  qualsiasi testo      genera completamento\n"
+        << "\n  Modalità corrente: " << (chat_mode ? "chat" : "raw") << "\n"
         << "\n  Scorciatoie tastiera:\n"
         << "  ↑ ↓                  naviga la history\n"
         << "  Ctrl+R               cerca nella history\n"
@@ -153,12 +156,18 @@ static void print_params(const SamplingParams& p, int max_tokens) {
 
 // ─────────────────────────────────────────────
 //  Generazione con streaming e sanitizzazione
+//
+//  print_prompt controlla se stampare il testo del prompt
+//  prima della generazione. In modalità chat viene disabilitato
+//  perché il prompt include i tag del template (<|user|> ecc.)
+//  che non devono apparire sullo schermo.
 // ─────────────────────────────────────────────
 static void generate(Model& model,
                      const Tokenizer& tok,
                      const std::string& prompt,
                      const SamplingParams& params,
-                     int max_tokens) {
+                     int max_tokens,
+                     bool print_prompt = true) {
     model_init_kvcache(model);
 
     auto input_ids = tokenizer_encode(tok, prompt);
@@ -170,8 +179,10 @@ static void generate(Model& model,
     std::vector<int> context_ids = input_ids;
     std::vector<float> logits;
 
-    std::cout << "\n" << prompt;
-    std::cout.flush();
+    if (print_prompt) {
+        std::cout << "\n" << prompt;
+        std::cout.flush();
+    }
 
     // Prefill
     int pos = 0;
@@ -226,6 +237,12 @@ void shell_run(Model& model, const Tokenizer& tok) {
     int max_tokens = 200;
     srand(static_cast<unsigned>(time(nullptr)));
 
+    // Modalità chat attiva automaticamente se il modello ha un template.
+    // In chat mode ogni input viene avvolto nel template prima della
+    // tokenizzazione; l'output viene preceduto da "Assistente: ".
+    bool chat_mode = (model.config.arch == ArchType::LLAMA &&
+                      tok.has_chat_template);
+
     // Configura linenoise
     linenoise::SetMultiLine(false);
     linenoise::SetHistoryMaxLen(100);
@@ -239,7 +256,8 @@ void shell_run(Model& model, const Tokenizer& tok) {
     std::cout << "║   " << std::left << std::setw(35)
               << (model_name + "  •  CPU only  •  C++17")
               << "║\n";
-    std::cout << "╚═══════════════════════════════════════╝\n";    print_help();
+    std::cout << "╚═══════════════════════════════════════╝\n";
+    print_help(chat_mode);
 
     while (true) {
         std::string line;
@@ -263,7 +281,7 @@ void shell_run(Model& model, const Tokenizer& tok) {
                 break;
             }
             else if (line == ":help" || line == ":h") {
-                print_help();
+                print_help(chat_mode);
             }
             else if (line == ":reset") {
                 model_init_kvcache(model);
@@ -271,11 +289,27 @@ void shell_run(Model& model, const Tokenizer& tok) {
             }
             else if (line == ":greedy") {
                 params.greedy = true;
-                std::cout << "  Modalità: greedy\n\n";
+                std::cout << "  Sampling: greedy\n\n";
             }
             else if (line == ":sample") {
                 params.greedy = false;
-                std::cout << "  Modalità: top-k + top-p sampling\n\n";
+                std::cout << "  Sampling: top-k + top-p\n\n";
+            }
+            else if (line == ":chat") {
+                // Abilita modalità chat: il prompt viene avvolto nel
+                // template prima della tokenizzazione.
+                if (tok.has_chat_template) {
+                    chat_mode = true;
+                    std::cout << "  Modalità: chat (template attivo)\n\n";
+                } else {
+                    std::cout << "  Il modello non ha un chat template.\n\n";
+                }
+            }
+            else if (line == ":raw") {
+                // Disabilita modalità chat: il prompt viene passato
+                // al modello invariato (utile per completamento libero).
+                chat_mode = false;
+                std::cout << "  Modalità: raw (prompt diretto)\n\n";
             }
             else if (line == ":params") {
                 print_params(params, max_tokens);
@@ -330,7 +364,19 @@ void shell_run(Model& model, const Tokenizer& tok) {
                           << "Usa :help per la lista.\n\n";
             }
         } else {
-            generate(model, tok, line, params, max_tokens);
+            if (chat_mode) {
+                // Modalità chat: avvolge l'input nel template e
+                // mostra solo la risposta del modello (non il prompt formattato).
+                std::string formatted = apply_chat_template(tok, line);
+                std::cout << "\nAssistente: ";
+                std::cout.flush();
+                generate(model, tok, formatted, params, max_tokens,
+                         /*print_prompt=*/false);
+            } else {
+                // Modalità raw: passa il prompt invariato al modello.
+                generate(model, tok, line, params, max_tokens,
+                         /*print_prompt=*/true);
+            }
         }
     }
 

@@ -184,23 +184,41 @@ void dequantize_q4_k(const uint8_t* src, float* dst, uint64_t n_elem) {
 //  Formato super-block (256 elementi, 210 byte):
 //
 //  Offset  Size  Contenuto
-//  0       128   ql: 4 bit bassi di ogni elemento (nibble packed)
-//  128     64    qh: 2 bit alti di ogni elemento  (2 bit × 4 elem/byte)
-//  192     16    scales: int8 × 8 gruppi × 2 scale/gruppo = 16 valori
-//  208     2     d: super-scale float16
+//  0       128   ql: 4 bit bassi di ogni elemento (nibble packed, 2 elem/byte)
+//  128      64   qh: 2 bit alti di ogni elemento  (4 elem/byte, 2 bit ciascuno)
+//  192      16   scales: 16 scale int8, una per gruppo di 16 elementi
+//  208       2   d: super-scale float16 (fattore globale)
 //
-//  Il super-block è diviso in 2 metà da 128 elementi ciascuna (n=0,1).
-//  Ogni metà usa 64 byte di ql, 32 byte di qh e 4 scale.
+//  Il super-block è diviso in 2 metà da 128 elementi ciascuna (n = 0, 1).
+//  Ogni metà usa:
+//    - 64 byte di ql  (4 bit bassi per 128 elementi)
+//    - 32 byte di qh  (2 bit alti per 128 elementi)
+//    - 8 scale int8   (sc_n = scales + n*8)
 //
-//  Per ogni l in [0,31] dentro una metà, i 4 valori ricostruiti sono:
-//    q1 = (ql[l]    & 0xF) | ((qh[l] >> 0) & 3) << 4  → elem  l+ 0
-//    q2 = (ql[l+32] & 0xF) | ((qh[l] >> 2) & 3) << 4  → elem  l+32
-//    q3 = (ql[l]    >> 4)  | ((qh[l] >> 4) & 3) << 4  → elem  l+64
-//    q4 = (ql[l+32] >> 4)  | ((qh[l] >> 6) & 3) << 4  → elem  l+96
-//  Valore finale: d * scale[k] * (q - 32)
+//  I 6 bit di ogni elemento si ricostruiscono combinando ql e qh:
+//    q1 = (ql[l]    & 0xF) | ((qh[l] >> 0) & 3) << 4  → elemento l+ 0
+//    q2 = (ql[l+32] & 0xF) | ((qh[l] >> 2) & 3) << 4  → elemento l+32
+//    q3 = (ql[l]    >> 4)  | ((qh[l] >> 4) & 3) << 4  → elemento l+64
+//    q4 = (ql[l+32] >> 4)  | ((qh[l] >> 6) & 3) << 4  → elemento l+96
+//  Centro: ogni q viene spostato di -32 (valori da 0..63 → -32..31).
 //
-//  Ogni byte di ql porta 4 bit bassi di due elementi a distanza 32.
-//  Ogni byte di qh porta i 2 bit alti di quattro elementi a distanza 32.
+//  Le 8 scale per metà coprono 8 gruppi di 16 elementi. L'indice is = l/16
+//  seleziona la coppia di scale corretta per l in [0,15] e [16,31]:
+//    y[l+ 0] = d * sc_n[is+0] * q1
+//    y[l+32] = d * sc_n[is+2] * q2
+//    y[l+64] = d * sc_n[is+4] * q3
+//    y[l+96] = d * sc_n[is+6] * q4
+//  Gli offset +0/+2/+4/+6 separano le scale dei 4 "slot" (q1..q4)
+//  all'interno della metà, mentre is (0 o 1) scorre le 2 sotto-fasce.
+//
+//  BUG FIX (rispetto alla versione precedente):
+//    - sc_n puntava a sc + n*4 (4 scale per metà): ERRATO.
+//      Il formato prevede 8 scale per metà (16 totali / 2 metà).
+//    - Gli indici delle scale erano fissi sc_n[0..3] per tutte le
+//      32 iterazioni: ERRATO. Devono variare con is = l/16,
+//      esattamente come in ggml-quants.c (ggml_dequantize_row_q6_K).
+//    Effetto: tutti i tensori Q6_K (output.weight, ffn_down, attn_v)
+//    producevano valori completamente errati → output non-sense.
 // ─────────────────────────────────────────────
 void dequantize_q6_k(const uint8_t* src, float* dst, uint64_t n_elem) {
     static constexpr int SUPER_BLOCK = 256;
@@ -220,37 +238,46 @@ void dequantize_q6_k(const uint8_t* src, float* dst, uint64_t n_elem) {
 
         float* out = dst + s * SUPER_BLOCK;
 
-        // Due metà da 128 elementi ciascuna. Ogni metà:
-        //   ql_n: 64 byte → nibble bassi (4 bit) per 128 elementi
-        //   qh_n: 32 byte → bit alti   (2 bit) per 128 elementi
-        //   sc_n: 4 scale int8 (una per ciascuno dei 4 gruppi da 32)
-        // La stride è 32: ql[l] e ql[l+32] coprono elementi a distanza 32.
+        // Due metà da 128 elementi ciascuna. Ogni metà ha 8 scale (una per
+        // gruppo di 16 elementi). L'indice is = l/16 seleziona la coppia
+        // di scale corretta ogni 16 iterazioni, replicando la logica di
+        // ggml-quants.c: sc[is+0], sc[is+2], sc[is+4], sc[is+6].
         for (int n = 0; n < 2; n++) {
             const uint8_t* ql_n = ql + n * 64;
             const uint8_t* qh_n = qh + n * 32;
-            const int8_t*  sc_n = sc  + n * 4;
+            const int8_t*  sc_n = sc  + n * 8;
             float*          y   = out + n * 128;
 
             for (int l = 0; l < 32; l++) {
+                int is = l / 16;
                 int8_t q1 = (int8_t)((ql_n[l]    & 0xF) | (((qh_n[l] >> 0) & 3) << 4)) - 32;
                 int8_t q2 = (int8_t)((ql_n[l+32] & 0xF) | (((qh_n[l] >> 2) & 3) << 4)) - 32;
                 int8_t q3 = (int8_t)((ql_n[l]    >>  4) | (((qh_n[l] >> 4) & 3) << 4)) - 32;
                 int8_t q4 = (int8_t)((ql_n[l+32] >>  4) | (((qh_n[l] >> 6) & 3) << 4)) - 32;
-                y[l +  0] = d * sc_n[0] * q1;
-                y[l + 32] = d * sc_n[1] * q2;
-                y[l + 64] = d * sc_n[2] * q3;
-                y[l + 96] = d * sc_n[3] * q4;
+                y[l +  0] = d * sc_n[is + 0] * q1;
+                y[l + 32] = d * sc_n[is + 2] * q2;
+                y[l + 64] = d * sc_n[is + 4] * q3;
+                y[l + 96] = d * sc_n[is + 6] * q4;
             }
         }
     }
 }
 
 // ─────────────────────────────────────────────
-//  Ottieni tensore come vettore float32
+//  Converti un tensore GGUF in vettore float32
 //
-//  Gestisce i diversi tipi di quantizzazione.
-//  F32: copia diretta (reinterpret cast)
-//  Q8_0: dequantizza blocco per blocco
+//  Dispatcha sul tipo di quantizzazione del tensore e
+//  restituisce tutti gli elementi come float32 non compressi.
+//
+//  Tipi supportati:
+//    F32   → copia diretta
+//    F16   → conversione elemento per elemento via fp16_to_fp32
+//    Q8_0  → dequantize_q8_0  (1 scale fp16 ogni 32 int8)
+//    Q4_K  → dequantize_q4_k  (super-block 256 elem, nibble 4 bit)
+//    Q6_K  → dequantize_q6_k  (super-block 256 elem, 6 bit/elem)
+//
+//  Tipi non supportati: stampa un errore su stderr e restituisce
+//  un vettore di zeri della dimensione corretta.
 // ─────────────────────────────────────────────
 std::vector<float> tensor_to_float(const GGUFTensor& t) {
     uint64_t n_elem = gguf_tensor_n_elements(t.info);
@@ -404,7 +431,24 @@ void gelu(float* x, int n) {
 }
 
 // ─────────────────────────────────────────────
-//  RMSNorm
+//  RMSNorm  (Root Mean Square Layer Normalization)
+//
+//  Alternativa a LayerNorm usata in LLaMA/GPT-NeoX.
+//  Non calcola la media (mean-centering), solo l'RMS:
+//
+//    RMS(x) = sqrt( (1/n) * Σ xᵢ² + ε )
+//    out[i]  = w[i] * x[i] / RMS(x)
+//
+//  Il parametro eps evita divisione per zero quando x ≈ 0.
+//  Il vettore w (weight) è il parametro appreso della norma
+//  (chiamato "gamma" in alcune implementazioni).
+//
+//  Parametri:
+//    x   — vettore di input  [n]
+//    w   — weight appresi    [n]
+//    out — vettore di output [n]  (può coincidere con x)
+//    n   — dimensione
+//    eps — epsilon per stabilità numerica (tipicamente 1e-5)
 // ─────────────────────────────────────────────
 void rms_norm(const float* x, const float* w,
               float* out, int n, float eps) {
@@ -414,7 +458,7 @@ void rms_norm(const float* x, const float* w,
         ms += x[i] * x[i];
     ms /= n;
 
-    // Normalizza e scala
+    // Normalizza e scala con il weight appreso
     float inv_rms = 1.0f / sqrtf(ms + eps);
     for (int i = 0; i < n; i++)
         out[i] = w[i] * x[i] * inv_rms;
@@ -461,7 +505,17 @@ void rope(float* x, int pos,
 }
 
 // ─────────────────────────────────────────────
-//  SiLU activation
+//  SiLU activation  (Sigmoid Linear Unit)
+//
+//  Usata nel gate della FFN di LLaMA (SwiGLU):
+//    SiLU(x) = x * σ(x) = x / (1 + e^(-x))
+//
+//  È equivalente a x * sigmoid(x). A differenza di ReLU,
+//  SiLU è smooth e non azzera i valori negativi di colpo,
+//  ma li attenua in modo continuo.
+//
+//  In LLaMA la FFN calcola: SiLU(gate) ⊙ up, dove ⊙ è il
+//  prodotto elemento per elemento (SwiGLU gate mechanism).
 // ─────────────────────────────────────────────
 void silu(float* x, int n) {
     for (int i = 0; i < n; i++)

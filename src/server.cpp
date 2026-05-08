@@ -110,6 +110,71 @@ static int json_get_int(const std::string& json,
     );
 }
 
+// Estrae un valore booleano da una chiave JSON.
+// Riconosce "true" e "false" (senza virgolette), es: {"chat":true}
+static bool json_get_bool(const std::string& json,
+                          const std::string& key,
+                          bool default_val) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return default_val;
+
+    pos = json.find(':', pos);
+    if (pos == std::string::npos) return default_val;
+    pos++;
+
+    while (pos < json.size() && json[pos] == ' ') pos++;
+
+    if (json.compare(pos, 4, "true")  == 0) return true;
+    if (json.compare(pos, 5, "false") == 0) return false;
+    return default_val;
+}
+
+// Estrae il contenuto dell'ultimo messaggio con role "user"
+// dall'array "messages" in formato OpenAI chat.
+//
+// Formato atteso (minimo):
+//   {"messages":[{"role":"user","content":"Ciao"}]}
+//
+// Cerca l'ultima occorrenza di "role":"user" e legge il "content"
+// successivo. Robusto abbastanza per i casi tipici; non è un parser
+// JSON completo — usare una libreria reale in produzione.
+static std::string json_get_last_user_message(const std::string& json) {
+    std::string result;
+
+    size_t search_from = 0;
+    while (true) {
+        // Cerca la prossima occorrenza di "role"
+        size_t role_pos = json.find("\"role\"", search_from);
+        if (role_pos == std::string::npos) break;
+
+        // Verifica che il valore sia "user"
+        size_t colon = json.find(':', role_pos);
+        if (colon == std::string::npos) break;
+        size_t val_start = json.find('"', colon + 1);
+        if (val_start == std::string::npos) break;
+        val_start++;
+        size_t val_end = json.find('"', val_start);
+        if (val_end == std::string::npos) break;
+
+        std::string role = json.substr(val_start, val_end - val_start);
+
+        if (role == "user") {
+            // Leggi il "content" successivo (nella stessa entry)
+            size_t content_pos = json.find("\"content\"", val_end);
+            // Ma non oltre il prossimo "role" o la fine dell'oggetto
+            size_t next_role = json.find("\"role\"", val_end + 1);
+            if (content_pos != std::string::npos &&
+                (next_role == std::string::npos || content_pos < next_role)) {
+                result = json_get_string(json.substr(content_pos - 1), "content");
+            }
+        }
+
+        search_from = val_end + 1;
+    }
+    return result;
+}
+
 // ─────────────────────────────────────────────
 //  Escape caratteri speciali per JSON
 //
@@ -216,38 +281,21 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         );
     });
 
-    // ── POST /v1/completions ──────────────────
-svr.Post("/v1/completions",
-        [&model, &tok](const httplib::Request& req,
-                       httplib::Response& res) {
+    // ── Logica comune per gestire una richiesta ──
+    // Estratta in lambda per riutilizzarla in entrambi gli endpoint.
+    // Riceve il prompt già formattato (con o senza chat template)
+    // e restituisce il JSON di risposta.
+    auto handle_request = [&model, &tok](
+            const std::string& prompt,
+            int max_tokens,
+            const SamplingParams& params,
+            const std::string& endpoint_label) -> std::string {
 
-        std::string prompt     = json_get_string(req.body, "prompt");
-        int         max_tokens = json_get_int   (req.body, "max_tokens",  50);
-        max_tokens = std::min(max_tokens, 500);
-
-        SamplingParams params;
-        params.temperature = json_get_float(req.body, "temperature",        1.0f);
-        params.top_p       = json_get_float(req.body, "top_p",              0.9f);
-        params.top_k       = json_get_int  (req.body, "top_k",              40);        
-        params.rep_penalty = json_get_float(req.body, "repetition_penalty", 1.1f);
-        params.greedy      = (params.temperature <= 0.0f);
-
-        if (prompt.empty()) {
-            res.status = 400;
-            res.set_content(
-                "{\"error\":\"prompt mancante o vuoto\"}",
-                "application/json");
-            return;
-        }
-
-        std::cout << "[REQ] prompt=\""
+        std::cout << "[REQ:" << endpoint_label << "] prompt=\""
                   << prompt.substr(0, 40)
                   << (prompt.size() > 40 ? "..." : "")
                   << "\" max_tokens=" << max_tokens
-                  << " temp=" << params.temperature
-                  << " top_p=" << params.top_p
-                  << " top_k=" << params.top_k
-                  << " penalty=" << params.rep_penalty << "\n";
+                  << " temp=" << params.temperature << "\n";
 
         int prompt_tokens = static_cast<int>(
             tokenizer_encode(tok, prompt).size());
@@ -258,27 +306,117 @@ svr.Post("/v1/completions",
         int completion_tokens = static_cast<int>(
             tokenizer_encode(tok, generated).size());
 
-        std::cout << "[RES] generati "
-                  << completion_tokens << " token\n";
+        std::cout << "[RES] generati " << completion_tokens << " token\n";
 
-        std::ostringstream json;
-        json << "{"
-             << "\"object\":\"text_completion\","
-             << "\"model\":\"gpt2\","
-             << "\"choices\":[{"
-             <<   "\"text\":\"" << json_escape(generated) << "\","
-             <<   "\"index\":0,"
-             <<   "\"finish_reason\":\"stop\""
-             << "}],"
-             << "\"usage\":{"
-             <<   "\"prompt_tokens\":"     << prompt_tokens     << ","
-             <<   "\"completion_tokens\":" << completion_tokens << ","
-             <<   "\"total_tokens\":"
-             <<   (prompt_tokens + completion_tokens)
-             << "}"
-             << "}";
+        std::ostringstream j;
+        j << "{"
+          << "\"object\":\"text_completion\","
+          << "\"choices\":[{"
+          <<   "\"text\":\"" << json_escape(generated) << "\","
+          <<   "\"index\":0,"
+          <<   "\"finish_reason\":\"stop\""
+          << "}],"
+          << "\"usage\":{"
+          <<   "\"prompt_tokens\":"     << prompt_tokens     << ","
+          <<   "\"completion_tokens\":" << completion_tokens << ","
+          <<   "\"total_tokens\":"      << (prompt_tokens + completion_tokens)
+          << "}"
+          << "}";
+        return j.str();
+    };
 
-        res.set_content(json.str(), "application/json");
+    // ── POST /v1/completions ──────────────────
+    //
+    //  Endpoint per il completamento di testo grezzo.
+    //  Campo opzionale "chat": true — se presente e il modello
+    //  ha un chat template, avvolge il prompt nel template
+    //  prima della generazione.
+    //
+    //  Esempio con chat template:
+    //    {"prompt":"Qual è la capitale della Francia?","chat":true}
+    //  Esempio grezzo (default):
+    //    {"prompt":"The capital of France is"}
+    svr.Post("/v1/completions",
+        [&model, &tok, &handle_request](const httplib::Request& req,
+                                        httplib::Response& res) {
+
+        std::string prompt     = json_get_string(req.body, "prompt");
+        int         max_tokens = json_get_int   (req.body, "max_tokens", 50);
+        max_tokens = std::min(max_tokens, 500);
+
+        SamplingParams params;
+        params.temperature = json_get_float(req.body, "temperature",        1.0f);
+        params.top_p       = json_get_float(req.body, "top_p",              0.9f);
+        params.top_k       = json_get_int  (req.body, "top_k",              40);
+        params.rep_penalty = json_get_float(req.body, "repetition_penalty", 1.1f);
+        params.greedy      = (params.temperature <= 0.0f);
+
+        if (prompt.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"prompt mancante o vuoto\"}",
+                            "application/json");
+            return;
+        }
+
+        // Se "chat":true e il modello ha un template, applica la formattazione.
+        bool use_chat = json_get_bool(req.body, "chat", false);
+        if (use_chat && tok.has_chat_template)
+            prompt = apply_chat_template(tok, prompt);
+
+        res.set_content(
+            handle_request(prompt, max_tokens, params, "completions"),
+            "application/json");
+    });
+
+    // ── POST /v1/chat/completions ─────────────
+    //
+    //  Endpoint compatibile con l'API OpenAI chat.
+    //  Accetta un array "messages" con messaggi role/content.
+    //  Estrae l'ultimo messaggio con role "user" e lo avvolge
+    //  nel chat template del modello.
+    //
+    //  Esempio di richiesta:
+    //    {
+    //      "messages": [
+    //        {"role": "system", "content": "Sei un assistente utile."},
+    //        {"role": "user",   "content": "Qual è la capitale dell'Italia?"}
+    //      ],
+    //      "max_tokens": 100
+    //    }
+    //
+    //  Nota: il parser JSON è minimalista — gestisce l'uso tipico
+    //  ma non è un parser completo. Usare una libreria in produzione.
+    svr.Post("/v1/chat/completions",
+        [&model, &tok, &handle_request](const httplib::Request& req,
+                                        httplib::Response& res) {
+
+        std::string user_msg = json_get_last_user_message(req.body);
+        int max_tokens = json_get_int(req.body, "max_tokens", 100);
+        max_tokens = std::min(max_tokens, 500);
+
+        SamplingParams params;
+        params.temperature = json_get_float(req.body, "temperature",        1.0f);
+        params.top_p       = json_get_float(req.body, "top_p",              0.9f);
+        params.top_k       = json_get_int  (req.body, "top_k",              40);
+        params.rep_penalty = json_get_float(req.body, "repetition_penalty", 1.1f);
+        params.greedy      = (params.temperature <= 0.0f);
+
+        if (user_msg.empty()) {
+            res.status = 400;
+            res.set_content(
+                "{\"error\":\"nessun messaggio utente trovato in messages\"}",
+                "application/json");
+            return;
+        }
+
+        // Applica il chat template se disponibile, altrimenti usa il testo grezzo.
+        std::string prompt = tok.has_chat_template
+            ? apply_chat_template(tok, user_msg)
+            : user_msg;
+
+        res.set_content(
+            handle_request(prompt, max_tokens, params, "chat/completions"),
+            "application/json");
     });
     
     // ── Avvio ─────────────────────────────────
@@ -289,6 +427,12 @@ svr.Post("/v1/completions",
     std::cout << "╠═══════════════════════════════════════╣\n";
     std::cout << "║   GET  /health                        ║\n";
     std::cout << "║   POST /v1/completions                ║\n";
+    std::cout << "║   POST /v1/chat/completions           ║\n";
+    std::cout << "╠═══════════════════════════════════════╣\n";
+    std::cout << "║   Chat template: "
+              << std::left << std::setw(21)
+              << (tok.has_chat_template ? "attivo" : "non disponibile")
+              << "║\n";
     std::cout << "╚═══════════════════════════════════════╝\n\n";
     std::cout << "Premi Ctrl+C per fermare il server\n\n";
 

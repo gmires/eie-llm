@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <climits>
 #include <iomanip>
+#include <array>
+#include <cstdio>
 
 // ─────────────────────────────────────────────
 //  Helper: cerca array nei metadata
@@ -89,7 +91,7 @@ bool tokenizer_init(Tokenizer& tok, const GGUFContext& ctx) {
                 tok.token_type.push_back(*i);
     }
 
-    // ── Merge rules ───────────────────────────
+    // ── Merge rules (usate solo per GPT-2 BPE) ───
     const GGUFArray* merges_arr = find_array(ctx, "tokenizer.ggml.merges");
     if (merges_arr) {
         tok.merges.reserve(merges_arr->values.size());
@@ -106,6 +108,26 @@ bool tokenizer_init(Tokenizer& tok, const GGUFContext& ctx) {
             tok.merges.push_back(std::move(merge));
         }
     }
+
+    // ── Lunghezza massima token ───────────────
+    // Calcolata una volta sola per limitare la finestra di ricerca
+    // nell'algoritmo Viterbi, evitando substr inutilmente lunghe.
+    tok.max_token_len = 1;
+    for (const auto& s : tok.id_to_token)
+        if ((int)s.size() > tok.max_token_len)
+            tok.max_token_len = (int)s.size();
+
+    // ── Chat template ─────────────────────────
+    for (const auto& kv : ctx.metadata)
+        if (kv.key == "tokenizer.chat_template")
+            if (auto* s = kv.value.get_if<std::string>())
+                tok.chat_template = *s;
+
+    tok.has_chat_template = !tok.chat_template.empty();
+
+    // Stringa EOS usata nel template (es. "</s>" per LLaMA)
+    if (tok.eos_id >= 0 && tok.eos_id < tok.vocab_size)
+        tok.eos_token_str = tok.id_to_token[tok.eos_id];
 
     return true;
 }
@@ -188,68 +210,126 @@ static std::vector<int> encode_gpt2(const Tokenizer& tok,
 }
 
 // ─────────────────────────────────────────────
-//  Encode SentencePiece
+//  Encode SentencePiece — algoritmo Viterbi unigram
 //
-//  SentencePiece usa ▁ (U+2581, UTF-8: 0xE2 0x96 0x81)
-//  per rappresentare lo spazio che precede una parola.
+//  SentencePiece LLaMA non usa BPE tradizionale:
+//  usa un modello unigram dove ogni token ha un
+//  punteggio (log-probabilità). La tokenizzazione
+//  ottimale è quella che massimizza la somma dei
+//  punteggi — trovata con programmazione dinamica.
 //
-//  Pre-tokenizzazione:
-//    "Hello world" → ["▁Hello", "▁world"]
-//    La prima parola NON ha ▁ se il testo inizia senza spazio.
+//  Normalizzazione del testo:
+//    "Hello world" → "▁Hello▁world"
+//    (▁ = U+2581, UTF-8: 0xE2 0x96 0x81)
+//    Ogni spazio diventa ▁; ▁ viene preposto all'inizio.
 //
-//  BPE identico a GPT-2 ma sul vocabolario SentencePiece.
+//  Algoritmo Viterbi (forward pass):
+//    best_score[i] = massima somma log-prob per coprire
+//                    i byte normalizzati da 0 a i.
+//    Per ogni posizione i, si provano tutti i token del
+//    vocabolario che iniziano in i e durano al più
+//    max_token_len byte. Si aggiorna best_score[i+len]
+//    se il nuovo punteggio è migliore.
+//
+//  Fallback su byte-token <0xXX>:
+//    Se nessun token del vocabolario copre un byte,
+//    si usa il token speciale "<0xXX>" (sempre presente
+//    nel vocabolario SentencePiece). Questo garantisce
+//    che l'algoritmo raggiunga sempre la fine del testo.
+//
+//  Backtrace (backward pass):
+//    Partendo dalla fine, si risale la catena di best_tok
+//    e best_prev per ricostruire la sequenza di token.
 // ─────────────────────────────────────────────
 static std::vector<int> encode_sentencepiece(const Tokenizer& tok,
                                               const std::string& text) {
-    // ▁ in UTF-8
-    static const std::string SP = "\xe2\x96\x81";
+    static const std::string SP = "\xe2\x96\x81";  // ▁ in UTF-8
 
     if (text.empty()) return {};
 
-    // Dividi in parole aggiungendo ▁ dove c'è uno spazio
-    std::vector<std::string> words;
-    std::string current;
-    bool first = true;
+    // ── 1. Normalizzazione ────────────────────
+    // Prepone ▁ e sostituisce ogni spazio con ▁.
+    // Nota: ▁ è parte del carattere, non un separatore —
+    // il Viterbi lavora poi sull'intera stringa normalizzata.
+    std::string norm;
+    norm.reserve(text.size() + SP.size());
+    norm = SP;
+    for (char c : text) {
+        if (c == ' ') norm += SP;
+        else          norm += c;
+    }
 
-    for (size_t i = 0; i < text.size(); ) {
-        unsigned char c = text[i];
+    // ── 2. Precalcola mappa byte → token di fallback ──
+    // SentencePiece include "<0x00>".."<0xFF>" nel vocabolario
+    // per gestire byte altrimenti non rappresentabili.
+    std::array<int, 256> byte_tok;
+    byte_tok.fill(tok.unk_id);
+    for (int b = 0; b < 256; b++) {
+        char hex[8];
+        std::snprintf(hex, sizeof(hex), "<0x%02X>", (unsigned char)b);
+        auto it = tok.token_to_id.find(std::string(hex));
+        if (it != tok.token_to_id.end())
+            byte_tok[b] = it->second;
+    }
 
-        if (c == ' ') {
-            if (!current.empty()) {
-                words.push_back(current);
-                current.clear();
+    // ── 3. Viterbi forward ────────────────────
+    int n = (int)norm.size();
+
+    // best_score[i]: massima somma log-prob per coprire norm[0..i)
+    // best_tok[i]:   token che termina in posizione i nella soluzione ottima
+    // best_prev[i]:  posizione di partenza di quel token
+    std::vector<float> best_score(n + 1, -1e30f);
+    std::vector<int>   best_tok  (n + 1, -1);
+    std::vector<int>   best_prev (n + 1, -1);
+
+    best_score[0] = 0.0f;
+
+    for (int i = 0; i < n; i++) {
+        if (best_score[i] < -1e29f) continue;
+
+        // Prova tutti i token del vocabolario che iniziano in i.
+        // max_token_len limita la lunghezza massima del substr da cercare.
+        int end = std::min(n, i + tok.max_token_len);
+        for (int j = i + 1; j <= end; j++) {
+            auto it = tok.token_to_id.find(norm.substr(i, j - i));
+            if (it == tok.token_to_id.end()) continue;
+
+            int   tid   = it->second;
+            // Punteggio del token: log-prob dal campo scores del GGUF.
+            // Se scores non è disponibile (GPT-2 puro) usa 0 come default.
+            float score = (!tok.scores.empty() && tid < (int)tok.scores.size())
+                          ? tok.scores[tid] : 0.0f;
+            float ns    = best_score[i] + score;
+
+            if (ns > best_score[j]) {
+                best_score[j] = ns;
+                best_tok  [j] = tid;
+                best_prev [j] = i;
             }
-            // Il prossimo token avrà ▁ come prefisso
-            current = SP;
-            i++;
-        } else {
-            // Prima parola senza spazio iniziale
-            if (first && current.empty())
-                current = SP;  // SentencePiece aggiunge sempre ▁
-            first = false;
+        }
 
-            // Copia il carattere UTF-8
-            int len = 1;
-            if      (c >= 0xF0) len = 4;
-            else if (c >= 0xE0) len = 3;
-            else if (c >= 0xC0) len = 2;
-            current += text.substr(i, len);
-            i += len;
+        // Fallback: se la posizione i+1 è ancora irraggiungibile,
+        // emetti il byte-token per norm[i]. Questo garantisce che
+        // il Viterbi raggiunga sempre la fine del testo.
+        if (i + 1 <= n && best_score[i + 1] < -1e29f) {
+            unsigned char b = (unsigned char)norm[i];
+            int tid  = byte_tok[b];
+            float ns = best_score[i] - 10.0f;  // penalità byte sconosciuto
+            best_score[i + 1] = ns;
+            best_tok  [i + 1] = tid;
+            best_prev [i + 1] = i;
         }
     }
-    if (!current.empty()) words.push_back(current);
 
-    // BPE su ogni parola
+    // ── 4. Backtrace ──────────────────────────
+    // Ricostruisce la sequenza ottima partendo dalla fine.
     std::vector<int> result;
-    for (const auto& word : words) {
-        auto tokens = split_utf8(word);
-        apply_bpe(tokens, tok);
-        for (const auto& t : tokens) {
-            auto it = tok.token_to_id.find(t);
-            result.push_back(it != tok.token_to_id.end()
-                             ? it->second : tok.unk_id);
-        }
+    int pos = n;
+    while (pos > 0 && best_tok[pos] != -1) {
+        result.push_back(best_tok[pos]);
+        pos = best_prev[pos];
     }
+    std::reverse(result.begin(), result.end());
     return result;
 }
 
@@ -339,6 +419,65 @@ std::string tokenizer_decode(const Tokenizer& tok,
 }
 
 // ─────────────────────────────────────────────
+//  apply_chat_template
+//
+//  Formatta un messaggio utente secondo il chat template
+//  letto dai metadata GGUF, senza interpretare Jinja2.
+//
+//  Strategia: rileva il "sapore" del template cercando
+//  tag caratteristici, poi applica la formattazione fissa
+//  corrispondente. Supporta due formati comuni:
+//
+//  ● TinyLlama / LLaMA-chat  (tag <|user|>):
+//      [<|system|>\n{system}</s>\n]
+//      <|user|>\n{user}</s>
+//      <|assistant|>\n
+//
+//  ● ChatML  (tag <|im_start|>, usato da Mistral/Qwen):
+//      [<|im_start|>system\n{system}<|im_end|>\n]
+//      <|im_start|>user\n{user}<|im_end|>
+//      <|im_start|>assistant\n
+//
+//  Il tag <|assistant|> (o equivalente) finale segnala al
+//  modello che deve iniziare a generare la risposta.
+//  L'EOS token viene letto da tok.eos_token_str (es. "</s>").
+//
+//  Se il template non è riconosciuto, il testo viene restituito
+//  invariato — meglio un prompt grezzo che un formato sbagliato.
+// ─────────────────────────────────────────────
+std::string apply_chat_template(const Tokenizer& tok,
+                                const std::string& user_msg,
+                                const std::string& system_msg) {
+    const std::string& eos = tok.eos_token_str;
+
+    // Rilevamento del formato dal template grezzo
+    bool is_llama_chat = tok.chat_template.find("<|user|>")     != std::string::npos;
+    bool is_chatml     = tok.chat_template.find("<|im_start|>") != std::string::npos;
+
+    std::string result;
+
+    if (is_llama_chat) {
+        // ── Formato TinyLlama / LLaMA-chat ───────
+        if (!system_msg.empty())
+            result += "<|system|>\n" + system_msg + eos + "\n";
+        result += "<|user|>\n" + user_msg + eos + "\n<|assistant|>\n";
+
+    } else if (is_chatml) {
+        // ── Formato ChatML ────────────────────────
+        if (!system_msg.empty())
+            result += "<|im_start|>system\n" + system_msg + "<|im_end|>\n";
+        result += "<|im_start|>user\n" + user_msg + "<|im_end|>\n"
+               +  "<|im_start|>assistant\n";
+
+    } else {
+        // ── Fallback: nessun formato riconosciuto ─
+        result = user_msg;
+    }
+
+    return result;
+}
+
+// ─────────────────────────────────────────────
 //  Print info
 // ─────────────────────────────────────────────
 void tokenizer_print_info(const Tokenizer& tok) {
@@ -347,11 +486,16 @@ void tokenizer_print_info(const Tokenizer& tok) {
     std::cout << "═══════════════════════════════════════\n";
     std::cout << "  Tipo        : "
               << (tok.type == TokenizerType::SENTENCEPIECE
-                  ? "SentencePiece" : "GPT-2 BPE") << "\n";
-    std::cout << "  Vocab size  : " << tok.vocab_size    << "\n";
-    std::cout << "  Merge rules : " << tok.merges.size() << "\n";
-    std::cout << "  BOS id      : " << tok.bos_id        << "\n";
-    std::cout << "  EOS id      : " << tok.eos_id        << "\n";
+                  ? "SentencePiece (Viterbi unigram)" : "GPT-2 BPE") << "\n";
+    std::cout << "  Vocab size  : " << tok.vocab_size      << "\n";
+    std::cout << "  Merge rules : " << tok.merges.size()   << "\n";
+    std::cout << "  Scores      : " << tok.scores.size()   << "\n";
+    std::cout << "  Max tok len : " << tok.max_token_len   << " byte\n";
+    std::cout << "  BOS id      : " << tok.bos_id          << "\n";
+    std::cout << "  EOS id      : " << tok.eos_id
+              << " (\"" << tok.eos_token_str << "\")\n";
+    std::cout << "  Chat template: "
+              << (tok.has_chat_template ? "sì" : "no") << "\n";
     std::cout << "  Primi 10 token:\n";
     for (int i = 0; i < std::min(10, tok.vocab_size); i++) {
         std::cout << "    [" << std::setw(5) << i << "] = \"";
