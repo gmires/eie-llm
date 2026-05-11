@@ -265,6 +265,22 @@ void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, cons
 // logits   : output [n_vocab] — probabilità grezze
 void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bool bench_mode = false);
 
+// Forward pass BATCH per il prefill.
+//
+// Processa tutti i token del prompt in un UNICO
+// passaggio attraverso i layer, sfruttando il
+// riutilizzo dei pesi in cache (matvec_quant_batch).
+//
+// Dopo il prefill:
+//   - kv_cache.n_cached = token_ids.size()
+//   - bufs.x contiene l'output dell'ULTIMO token
+//   - logits contiene i logits dell'ULTIMO token
+//     (quelli necessari per il primo sampling)
+//
+// La generazione autoregressiva continua con
+// forward() token per token come al solito.
+void forward_prefill(Model& model, const std::vector<int>& token_ids, std::vector<float>& logits);
+
 // ─────────────────────────────────────────────
 //  Parametri di sampling raggruppati
 //

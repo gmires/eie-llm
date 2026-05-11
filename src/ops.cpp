@@ -346,6 +346,7 @@ void matvec_q4k(const uint8_t* A, const float* x, float* y, int out_dim, int in_
     int n_super_per_row = in_dim / SUPER_BLOCK;
     int row_bytes       = n_super_per_row * SUPER_BYTES;
 
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const uint8_t* row = A + i * row_bytes;
         float sum = 0.0f;
@@ -412,6 +413,7 @@ void matvec_q6k(const uint8_t* A, const float* x, float* y, int out_dim, int in_
     int n_super_per_row = in_dim / SUPER_BLOCK;
     int row_bytes       = n_super_per_row * SUPER_BYTES;
 
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const uint8_t* row = A + i * row_bytes;
         float sum = 0.0f;
@@ -470,6 +472,7 @@ void matvec_q8_0(const uint8_t* A, const float* x, float* y, int out_dim, int in
     int n_blocks_per_row = in_dim / BLOCK_SIZE;
     int row_bytes        = n_blocks_per_row * BLOCK_BYTES;
 
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const uint8_t* row = A + i * row_bytes;
         float sum = 0.0f;
@@ -503,6 +506,7 @@ void matvec_f16(const uint16_t* A, const float* x, float* y, int out_dim, int in
         matvec_f16_avx2(A, x, y, out_dim, in_dim);
         return;
     }
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const uint16_t* row = A + i * in_dim;
         float sum = 0.0f;
@@ -539,6 +543,70 @@ void matvec_quant(const QuantTensor& A, const float* x, float* y) {
             std::cerr << "[ERRORE] matvec_quant: tipo non supportato: "
                       << ggml_type_name(A.type) << "\n";
             std::fill(y, y + out_dim, 0.0f);
+    }
+}
+
+// ─────────────────────────────────────────────
+//  matvec_quant_batch — prodotto matrice-vettore BATCH
+//
+//  Calcola y = A @ x^T dove x è una matrice
+//  di N token invece di un singolo vettore.
+//
+//  Loop order ottimale per la cache:
+//    per ogni riga i di A:
+//      dequantizza la riga i
+//      per ogni colonna j della riga:
+//        per ogni token t del batch:
+//          y[t][i] += w[i][j] * x[t][j]
+//
+//  Il peso w[i][j] viene caricato una sola volta
+//  e riutilizzato per tutti i N token — questo
+//  è il cuore del guadagno rispetto a N matvec
+//  sequenziali, dove ogni peso veniva caricato N
+//  volte (una per token).
+// ─────────────────────────────────────────────
+void matvec_quant_batch(const QuantTensor& A, const float* x_batch, float* y_batch, int N) {
+    int out_dim = static_cast<int>(A.n_rows);
+    int in_dim  = static_cast<int>(A.n_cols);
+    std::fill(y_batch, y_batch + N * out_dim, 0.0f);
+
+    switch (A.type) {
+        case GGMLType::F32: {
+            const float* W = reinterpret_cast<const float*>(A.data.data());
+            #pragma omp parallel for if(out_dim > 512)
+            for (int i = 0; i < out_dim; i++) {
+                for (int j = 0; j < in_dim; j++) {
+                    float w = W[i * in_dim + j];
+                    for (int t = 0; t < N; t++) {
+                        y_batch[t * out_dim + i] += w * x_batch[t * in_dim + j];
+                    }
+                }
+            }
+            break;
+        }
+        case GGMLType::F16:
+        case GGMLType::Q8_0:
+        case GGMLType::Q4_K:
+        case GGMLType::Q6_K: {
+            // Dequantizza una riga alla volta, accumula per tutti i token.
+            // Il loop order j, t è cache-friendly: w è riutilizzato per tutti i token.
+            std::vector<float> row(in_dim);
+            #pragma omp parallel for if(out_dim > 512)
+            for (int i = 0; i < out_dim; i++) {
+                dequant_row(A, i, row.data());
+                for (int j = 0; j < in_dim; j++) {
+                    float w = row[j];
+                    for (int t = 0; t < N; t++) {
+                        y_batch[t * out_dim + i] += w * x_batch[t * in_dim + j];
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            std::cerr << "[ERRORE] matvec_quant_batch: tipo non supportato: "
+                      << ggml_type_name(A.type) << "\n";
+            break;
     }
 }
 
@@ -609,6 +677,8 @@ void matmul(const float* A, const float* B, float* C,
     // Inizializza output a zero
     memset(C, 0, m * n * sizeof(float));
 
+    // Parallelizza sulle righe di output — ogni riga è indipendente
+    #pragma omp parallel for if(m > 64)
     for (int i = 0; i < m; i++) {
         for (int kk = 0; kk < k; kk++) {
             float a = A[i * k + kk];
@@ -639,6 +709,8 @@ void matvec(const float* A, const float* x, float* y,
         matvec_avx2(A, x, y, out_dim, in_dim);
         return;
     }
+    // Versione scalare con OpenMP sulle righe (solo per matrici grandi)
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         float sum = 0.0f;
         const float* row = A + i * in_dim;
@@ -652,6 +724,7 @@ void matvec(const float* A, const float* x, float* y,
 //  Addizione elemento per elemento
 // ─────────────────────────────────────────────
 void vec_add(const float* a, const float* b, float* out, int n) {
+    #pragma omp parallel for if(n > 1024)
     for (int i = 0; i < n; i++)
         out[i] = a[i] + b[i];
 }
@@ -703,6 +776,7 @@ void gelu(float* x, int n) {
     static constexpr float SQRT_2_OVER_PI = 0.7978845608f;
     static constexpr float COEFF          = 0.044715f;
 
+    #pragma omp parallel for if(n > 1024)
     for (int i = 0; i < n; i++) {
         float v = x[i];
         // Argomento della tanh
@@ -800,6 +874,7 @@ void rope(float* x, int pos,
 //  prodotto elemento per elemento (SwiGLU gate mechanism).
 // ─────────────────────────────────────────────
 void silu(float* x, int n) {
+    #pragma omp parallel for if(n > 1024)
     for (int i = 0; i < n; i++)
         x[i] = x[i] / (1.0f + expf(-x[i]));
 }

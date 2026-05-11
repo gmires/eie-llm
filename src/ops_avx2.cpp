@@ -78,6 +78,7 @@ static inline float hsum256_ps_avx(__m256 v) {
 // ─────────────────────────────────────────────
 __attribute__((target("avx2,fma")))
 void matvec_avx2(const float* A, const float* x, float* y, int out_dim, int in_dim) {
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const float* row = A + i * in_dim;
         __m256 sum_vec = _mm256_setzero_ps();
@@ -108,6 +109,7 @@ void matvec_avx2(const float* A, const float* x, float* y, int out_dim, int in_d
 // ─────────────────────────────────────────────
 __attribute__((target("avx2,fma,f16c")))
 void matvec_f16_avx2(const uint16_t* A, const float* x, float* y, int out_dim, int in_dim) {
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const uint16_t* row = A + i * in_dim;
         __m256 sum_vec = _mm256_setzero_ps();
@@ -155,6 +157,7 @@ void matvec_q8_0_avx2(const uint8_t* A, const float* x, float* y, int out_dim, i
     int n_blocks_per_row = in_dim / BLOCK_SIZE;
     int row_bytes        = n_blocks_per_row * BLOCK_BYTES;
 
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const uint8_t* row = A + i * row_bytes;
         __m256 sum_vec = _mm256_setzero_ps();
@@ -223,6 +226,7 @@ void matvec_q4k_avx2(const uint8_t* A, const float* x, float* y, int out_dim, in
     int n_super_per_row = in_dim / SUPER_BLOCK;
     int row_bytes       = n_super_per_row * SUPER_BYTES;
 
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const uint8_t* row = A + i * row_bytes;
         __m256 sum_vec = _mm256_setzero_ps();
@@ -312,6 +316,7 @@ void matvec_q6k_avx2(const uint8_t* A, const float* x, float* y, int out_dim, in
     int n_super_per_row = in_dim / SUPER_BLOCK;
     int row_bytes       = n_super_per_row * SUPER_BYTES;
 
+    #pragma omp parallel for if(out_dim > 512)
     for (int i = 0; i < out_dim; i++) {
         const uint8_t* row = A + i * row_bytes;
         __m256 sum_vec = _mm256_setzero_ps();

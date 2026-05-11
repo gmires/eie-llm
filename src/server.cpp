@@ -221,12 +221,13 @@ static std::string generate_text(Model& model,
     std::vector<int> context_ids = input_ids;
     std::vector<float> logits;
 
-    int pos = 0;
-    for (int id : input_ids) {
-        forward(model, id, pos, logits);
-        pos++;
+    // Prefill batch — processa tutto il prompt in un passaggio
+    if (!input_ids.empty()) {
+        forward_prefill(model, input_ids, logits);
+    } else {
+        logits.resize(model.config.n_vocab);
     }
-    model.kv_cache.n_cached = pos;
+    int pos = static_cast<int>(input_ids.size());
 
     std::string output;
 

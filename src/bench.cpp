@@ -23,16 +23,15 @@ BenchResult bench_run(Model& model, const Tokenizer& tok, const std::string& pro
     model_init_kvcache(model);
 
     auto tp0 = now();
-    int pos = 0;
-    for (int id : input_ids) {
-        // prefill senza bench_mode — non ci interessa
-        // il breakdown del prefill, solo il tempo totale
-        forward(model, id, pos, logits, false);
-        pos++;
+    // Prefill batch — processa tutto il prompt in un passaggio
+    if (!input_ids.empty()) {
+        forward_prefill(model, input_ids, logits);
+    } else {
+        logits.resize(model.config.n_vocab);
     }
     auto tp1 = now();
     r.prefill_ms = ms_between(tp0, tp1);
-    model.kv_cache.n_cached = pos;
+    int pos = static_cast<int>(input_ids.size());
 
     // ── Benchmark generazione ─────────────────
     // Ora attiviamo bench_mode per raccogliere

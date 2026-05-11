@@ -370,6 +370,42 @@ Questo accade perché i pesi Q6_K sono usati per `attn_v` (i valori dell'attenti
 - La variabile `EIE_NO_AVX2` per fallback immediato
 - Commenti dettagliati che spiegano ogni passaggio SIMD
 
+### Prefill batch — processare il prompt tutto insieme
+
+Durante la generazione autoregressiva, ogni nuovo token dipende da tutti i precedenti: **deve essere sequenziale**. Ma durante il **prefill** (processamento del prompt iniziale), tutti i token sono già noti.
+
+Prima, il prefill faceva un loop sequenziale:
+```cpp
+for (int id : prompt_tokens) {
+    forward(model, id, pos, logits);  // UN token alla volta
+    pos++;
+}
+```
+
+Questo ha due problemi:
+1. **Overhead**: N chiamate a `forward`, ognuna con setup/teardown di layer.
+2. **Cache dei pesi**: ogni matvec ricarica la stessa riga di pesi dequantizzata dalla memoria.
+
+La soluzione è `forward_prefill()`: un singolo passaggio batch che processa tutti i token del prompt insieme. La chiave è `matvec_quant_batch()`:
+
+```cpp
+// Dequantizza la riga i una sola volta,
+// accumula il dot product per TUTTI i token
+for (int i = 0; i < out_dim; i++) {
+    dequant_row(A, i, row.data());
+    for (int j = 0; j < in_dim; j++) {
+        float w = row[j];
+        for (int t = 0; t < N; t++) {
+            y_batch[t * out_dim + i] += w * x_batch[t * in_dim + j];
+        }
+    }
+}
+```
+
+Il peso `w` viene caricato **una sola volta** e riutilizzato per tutti i N token — un enorme risparmio di banda memoria quando N è grande.
+
+**Perché non sempre?** Per prompt corti (≤ 32 token), il loop sequenziale con AVX2 è ancora più veloce del batch scalare. `forward_prefill` sceglie automaticamente la strategia migliore in base alla lunghezza del prompt.
+
 ---
 
 ## Prestazioni e limiti
@@ -410,7 +446,40 @@ Con il kernel AVX2 attivo, il throughput sale significativamente grazie all'elab
 |---|---|---|
 | Build Release (`-O3`) | ✅ Attivo | 2-4× (inlining, SIMD automatico) |
 | AVX2/FMA esplicito | ✅ Attivo (tutti i formati) | 4-8× sul matvec |
-| OpenMP su `matvec_quant` | 🚧 Non implementato | N× (N = core fisici) |
+| Prefill batch | ✅ Attivo (N > 32) | riduce overhead per prompt lunghi |
+| OpenMP su matvec e ops | ✅ Attivo (soglia automatica) | ~3× su multicore |
+
+### OpenMP — parallelizzazione multicore
+
+Le CPU moderne hanno **più core fisici** (tipicamente 4-16). OpenMP permette di distribuire il lavoro su tutti i core con un semplice pragma:
+
+```cpp
+#pragma omp parallel for
+for (int i = 0; i < out_dim; i++) {
+    // calcolo della riga i — indipendente dalle altre
+}
+```
+
+**Attenzione all'overhead**: creare e sincronizzare thread ha un costo fisso (~10-50 µs). Se il loop è troppo piccolo, l'overhead supera il guadagno. Per questo usiamo una **soglia dinamica**:
+
+```cpp
+#pragma omp parallel for if(out_dim > 512)
+```
+
+OpenMP si attiva solo quando il lavoro è sufficiente da distribuire. Questo è particolarmente importante per la generazione autoregressiva, dove ogni token fa molti matvec di dimensioni medie (768-3072 righe).
+
+**Risultati misurati** (CPU 8-core, TinyLlama Q4_K):
+
+| Fase | Senza OpenMP | Con OpenMP | Speedup |
+|---|---|---|---|
+| Prefill (13 token) | 2.0 tok/s | 5.7 tok/s | **2.8×** |
+| Generazione (per token) | 426 ms | 161 ms | **2.6×** |
+
+### Perché non parallelizzare il loop `n_head`?
+
+La self-attention ha un loop esterno su `n_head` (32 iterazioni in TinyLlama). Sembra perfetto per OpenMP, ma c'è un problema: dentro ogni head ci sono chiamate a `matvec_quant`, che è GIÀ parallelizzata con OpenMP. Parallelizzare entrambi creerebbe **nested parallelism** — 32 head × 8 thread = 256 thread, con overhead e contesa della cache che degraderebbero le prestazioni.
+
+Per questo parallelizziamo solo il loop interno più costoso (il matvec) e lasciamo le head sequenziali.
 
 ---
 
@@ -431,8 +500,9 @@ Con il kernel AVX2 attivo, il throughput sale significativamente grazie all'elab
 - [x] Fase 13 — Buffer di inferenza pre-allocati (eliminazione malloc nel hot path)
 - [x] Fase 14 — Dequantizzazione lazy: `QuantTensor` + kernel `matvec_quant` (−3.5 GB RAM, F32/F16/Q8_0/Q4_K/Q6_K)
 - [x] Fase 15 — Ottimizzazioni matvec AVX2+FMA con dispatcher runtime (tutti i formati quantizzati)
-- [ ] Fase 16 — OpenMP sul loop esterno dei matvec
-- [ ] Fase 17 — Streaming HTTP (Server-Sent Events, token per token)
+- [x] Fase 16 — Prefill batch per prompt lunghi (matvec_quant_batch + forward_prefill)
+- [x] Fase 17 — OpenMP su matvec e ops vettoriali con soglia automatica
+- [ ] Fase 18 — Streaming HTTP (Server-Sent Events, token per token)
 
 ---
 

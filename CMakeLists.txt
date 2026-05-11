@@ -36,6 +36,13 @@ target_include_directories(eie-llm PRIVATE
 
 find_package(Threads REQUIRED)
 
+# OpenMP — parallelizzazione multicore per matvec e ops vettoriali
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  target_compile_options(eie-llm PRIVATE ${OpenMP_CXX_FLAGS})
+  target_link_libraries(eie-llm PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 target_compile_options(eie-llm PRIVATE
   -Wall -Wextra
   $<$<CONFIG:Debug>:-g -O0>

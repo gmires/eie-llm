@@ -256,6 +256,21 @@ void matvec_f16 (const uint16_t*  A, const float* x, float* y, int out_dim, int 
 // — usa A.n_rows come out_dim, A.n_cols come in_dim
 void matvec_quant(const QuantTensor& A, const float* x, float* y);
 
+// Prodotto matrice-vettore BATCH per pesi quantizzati.
+//
+//  y_batch[N × out_dim] = A @ x_batch^T
+//
+//  x_batch è una matrice [N × in_dim] in row-major:
+//    token t occupa gli elementi [t*in_dim .. (t+1)*in_dim-1]
+//
+//  y_batch è una matrice [N × out_dim] in row-major.
+//
+//  La dequantizzazione avviene riga per riga di A
+//  (come matvec_quant) ma ogni riga dequantizzata
+//  viene riutilizzata per tutti i N token — questo
+//  è il cuore dell'ottimizzazione del prefill batch.
+void matvec_quant_batch(const QuantTensor& A, const float* x_batch, float* y_batch, int N);
+
 // Dequantizza la riga row_idx di A in out[0..n_cols-1]
 // Usata per l'embedding lookup (accesso singola riga)
 void dequant_row(const QuantTensor& A, int row_idx, float* out);

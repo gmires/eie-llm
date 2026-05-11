@@ -744,6 +744,358 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
     }
 }
 
+// ═════════════════════════════════════════════
+//  PREFILL BATCH — ottimizzazione del prompt
+// ═════════════════════════════════════════════
+
+// ─────────────────────────────────────────────
+//  Self-Attention GPT-2 — versione batch
+//
+//  Differenze rispetto alla versione sequenziale:
+//  - QKV è calcolato per tutti i N token con
+//    una singola matvec_quant_batch
+//  - K e V sono salvati nella cache per tutte
+//    le posizioni 0..N-1 in un solo passaggio
+//  - L'attention causale calcola gli score per
+//    ogni posizione contro tutti i token precedenti
+//    usando la cache appena popolata
+// ─────────────────────────────────────────────
+static void self_attention_prefill(const float* x_batch, float* out_batch,
+                                    const LayerWeights& lw, KVCache& cache,
+                                    const ModelConfig& cfg, int layer, int N) {
+    const int n_embd = cfg.n_embd;
+    const int n_head = cfg.n_head;
+    const int d_head = cfg.d_head;
+
+    // QKV batch: [N × 3*n_embd]
+    std::vector<float> qkv_batch(N * 3 * n_embd);
+    matvec_quant_batch(lw.attn_qkv_w, x_batch, qkv_batch.data(), N);
+
+    // Aggiungi bias
+    for (int t = 0; t < N; t++) {
+        float* qkv_t = qkv_batch.data() + t * 3 * n_embd;
+        vec_add(qkv_t, lw.attn_qkv_b.data(), qkv_t, 3 * n_embd);
+    }
+
+    // Salva K e V nella cache per tutte le posizioni
+    for (int t = 0; t < N; t++) {
+        float* k_pos = cache.k[layer].data() + t * n_embd;
+        float* v_pos = cache.v[layer].data() + t * n_embd;
+        vec_copy(qkv_batch.data() + t * 3 * n_embd + n_embd, k_pos, n_embd);
+        vec_copy(qkv_batch.data() + t * 3 * n_embd + 2 * n_embd, v_pos, n_embd);
+    }
+
+    // Attention causale batch
+    std::vector<float> scores(N);
+    std::vector<float> attn_acc(N * n_embd);
+    std::fill(attn_acc.begin(), attn_acc.end(), 0.0f);
+    float scale = 1.0f / sqrtf((float)d_head);
+
+    for (int h = 0; h < n_head; h++) {
+        int h_off = h * d_head;
+        for (int pos = 0; pos < N; pos++) {
+            const float* Qh = qkv_batch.data() + pos * 3 * n_embd + h_off;
+
+            // Score contro tutti i token 0..pos
+            for (int t = 0; t <= pos; t++) {
+                const float* Kh = cache.k[layer].data() + t * n_embd + h_off;
+                float dot = 0.0f;
+                for (int d = 0; d < d_head; d++)
+                    dot += Qh[d] * Kh[d];
+                scores[t] = dot * scale;
+            }
+            // Causal mask: posizioni future → -inf
+            for (int t = pos + 1; t < N; t++)
+                scores[t] = -1e9f;
+
+            softmax(scores.data(), N);
+
+            // Weighted sum di V
+            float* acc_h = attn_acc.data() + pos * n_embd + h_off;
+            for (int t = 0; t < N; t++) {
+                const float* Vh = cache.v[layer].data() + t * n_embd + h_off;
+                for (int d = 0; d < d_head; d++)
+                    acc_h[d] += scores[t] * Vh[d];
+            }
+        }
+    }
+
+    // Proiezione output
+    matvec_quant_batch(lw.attn_out_w, attn_acc.data(), out_batch, N);
+
+    // Aggiungi bias
+    for (int t = 0; t < N; t++) {
+        float* out_t = out_batch + t * n_embd;
+        vec_add(out_t, lw.attn_out_b.data(), out_t, n_embd);
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Feed-Forward GPT-2 — versione batch
+// ─────────────────────────────────────────────
+static void feed_forward_prefill(const float* x_batch, float* out_batch,
+                                  const LayerWeights& lw, const ModelConfig& cfg, int N) {
+    const int n_embd = cfg.n_embd;
+    const int n_ff   = cfg.n_ff;
+
+    std::vector<float> h_batch(N * n_ff);
+    matvec_quant_batch(lw.ffn_fc1_w, x_batch, h_batch.data(), N);
+
+    for (int t = 0; t < N; t++) {
+        float* h_t = h_batch.data() + t * n_ff;
+        vec_add(h_t, lw.ffn_fc1_b.data(), h_t, n_ff);
+    }
+
+    gelu(h_batch.data(), N * n_ff);
+
+    matvec_quant_batch(lw.ffn_fc2_w, h_batch.data(), out_batch, N);
+
+    for (int t = 0; t < N; t++) {
+        float* out_t = out_batch + t * n_embd;
+        vec_add(out_t, lw.ffn_fc2_b.data(), out_t, n_embd);
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Self-Attention LLaMA — versione batch
+//
+//  Stessa logica di GPT-2 ma con:
+//  - Q/K/V separati (3 matrici)
+//  - RoPE applicato a tutte le posizioni
+//  - GQA (raggruppamento K/V)
+//  - No bias
+// ─────────────────────────────────────────────
+static void self_attention_llama_prefill(const float* x_batch, float* out_batch,
+                                          const LayerWeights& lw, KVCache& cache,
+                                          const ModelConfig& cfg, int layer, int N) {
+    const int n_head    = cfg.n_head;
+    const int n_head_kv = cfg.n_head_kv;
+    const int d_head    = cfg.d_head;
+    const int rope_dim  = cfg.rope_dim;
+    const int n_embd    = cfg.n_embd;
+    const int kv_dim    = n_head_kv * d_head;
+    const int gqa_ratio = n_head / n_head_kv;
+
+    // Q, K, V batch
+    std::vector<float> Q_batch(N * n_embd);
+    std::vector<float> K_batch(N * kv_dim);
+    std::vector<float> V_batch(N * kv_dim);
+
+    matvec_quant_batch(lw.attn_q_w, x_batch, Q_batch.data(), N);
+    matvec_quant_batch(lw.attn_k_w, x_batch, K_batch.data(), N);
+    matvec_quant_batch(lw.attn_v_w, x_batch, V_batch.data(), N);
+
+    // RoPE per tutte le posizioni
+    for (int t = 0; t < N; t++) {
+        rope(Q_batch.data() + t * n_embd, t, n_head,    d_head, rope_dim, cfg.rope_freq_base);
+        rope(K_batch.data() + t * kv_dim, t, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+    }
+
+    // Salva K e V nella cache
+    for (int t = 0; t < N; t++) {
+        float* k_pos = cache.k[layer].data() + t * kv_dim;
+        float* v_pos = cache.v[layer].data() + t * kv_dim;
+        vec_copy(K_batch.data() + t * kv_dim, k_pos, kv_dim);
+        vec_copy(V_batch.data() + t * kv_dim, v_pos, kv_dim);
+    }
+
+    // Attention causale batch
+    std::vector<float> scores(N);
+    std::vector<float> attn_acc(N * n_embd);
+    std::fill(attn_acc.begin(), attn_acc.end(), 0.0f);
+    float scale = 1.0f / sqrtf((float)d_head);
+
+    for (int h = 0; h < n_head; h++) {
+        int kv_h   = h / gqa_ratio;
+        int h_off  = h    * d_head;
+        int kv_off = kv_h * d_head;
+
+        for (int pos = 0; pos < N; pos++) {
+            const float* Qh = Q_batch.data() + pos * n_embd + h_off;
+
+            for (int t = 0; t <= pos; t++) {
+                const float* Kh = cache.k[layer].data() + t * kv_dim + kv_off;
+                float dot = 0.0f;
+                for (int d = 0; d < d_head; d++)
+                    dot += Qh[d] * Kh[d];
+                scores[t] = dot * scale;
+            }
+            for (int t = pos + 1; t < N; t++)
+                scores[t] = -1e9f;
+
+            softmax(scores.data(), N);
+
+            float* acc_h = attn_acc.data() + pos * n_embd + h_off;
+            for (int t = 0; t < N; t++) {
+                const float* Vh = cache.v[layer].data() + t * kv_dim + kv_off;
+                for (int d = 0; d < d_head; d++)
+                    acc_h[d] += scores[t] * Vh[d];
+            }
+        }
+    }
+
+    // Proiezione output (senza bias in LLaMA)
+    matvec_quant_batch(lw.attn_out_w, attn_acc.data(), out_batch, N);
+}
+
+// ─────────────────────────────────────────────
+//  Feed-Forward LLaMA — versione batch
+// ─────────────────────────────────────────────
+static void feed_forward_llama_prefill(const float* x_batch, float* out_batch,
+                                        const LayerWeights& lw, const ModelConfig& cfg, int N) {
+    const int n_ff = cfg.n_ff;
+
+    std::vector<float> gate_batch(N * n_ff);
+    std::vector<float> up_batch(N * n_ff);
+
+    matvec_quant_batch(lw.ffn_gate_w, x_batch, gate_batch.data(), N);
+    matvec_quant_batch(lw.ffn_up_w,   x_batch, up_batch.data(), N);
+
+    for (int t = 0; t < N; t++) {
+        float* gate_t = gate_batch.data() + t * n_ff;
+        float* up_t   = up_batch.data()   + t * n_ff;
+        silu(gate_t, n_ff);
+        for (int i = 0; i < n_ff; i++)
+            gate_t[i] *= up_t[i];
+    }
+
+    matvec_quant_batch(lw.ffn_down_w, gate_batch.data(), out_batch, N);
+}
+
+// ─────────────────────────────────────────────
+//  Forward pass BATCH per il prefill
+//
+//  Processa tutti i token del prompt in un
+//  singolo passaggio attraverso i layer.
+//
+//  Algoritmo per ogni layer:
+//    1. Norm batch (per ogni token)
+//    2. Attention batch (matvec_quant_batch + causal mask)
+//    3. Residual connection
+//    4. Norm batch
+//    5. FFN batch (matvec_quant_batch)
+//    6. Residual connection
+//
+//  Alla fine estrae l'output dell'ULTIMO token
+//  per il primo sampling e salva lo stato in
+//  bufs.x per la generazione sequenziale.
+// ─────────────────────────────────────────────
+void forward_prefill(Model& model, const std::vector<int>& token_ids, std::vector<float>& logits) {
+    const int N = static_cast<int>(token_ids.size());
+
+    // Per prompt corti (≤ 32 token) il loop sequenziale con AVX2
+    // è più veloce del batch puramente scalare. Il batch diventa
+    // vantaggioso solo con prompt lunghi dove il parallelismo sui
+    // pesi (riutilizzo in cache) supera l'overhead.
+    if (N <= 32) {
+        int pos = 0;
+        for (int id : token_ids) {
+            forward(model, id, pos, logits, false);
+            pos++;
+        }
+        return;
+    }
+
+    const ModelConfig& cfg = model.config;
+    const ModelWeights& w = model.weights;
+    const int n_embd = cfg.n_embd;
+    const bool is_llama = (cfg.arch == ArchType::LLAMA);
+
+    // Buffer batch — allocati sullo stack/heap come vettori locali.
+    // Il prefill avviene una volta per conversazione, quindi
+    // l'overhead di allocazione è irrilevante rispetto al guadagno.
+    std::vector<float> x_batch(N * n_embd);
+    std::vector<float> residual_batch(N * n_embd);
+    std::vector<float> ln_out_batch(N * n_embd);
+    std::vector<float> attn_out_batch(N * n_embd);
+    std::vector<float> ffn_out_batch(N * n_embd);
+
+    // ── Embedding lookup batch ─────────────────
+    for (int t = 0; t < N; t++) {
+        dequant_row(w.token_embd, token_ids[t], x_batch.data() + t * n_embd);
+        if (!is_llama) {
+            // GPT-2: somma il positional embedding per la posizione t
+            const float* pe = w.pos_embd.data() + t * n_embd;
+            vec_add(x_batch.data() + t * n_embd, pe, x_batch.data() + t * n_embd, n_embd);
+        }
+    }
+
+    // ── Loop sui layer ─────────────────────────
+    for (int l = 0; l < cfg.n_layer; l++) {
+        const LayerWeights& lw = w.layers[l];
+
+        // Residual
+        residual_batch = x_batch;
+
+        // Norm 1 (per ogni token — non batchabile perché
+        // opera su singoli vettori, non su matrici)
+        for (int t = 0; t < N; t++) {
+            if (is_llama)
+                rms_norm(x_batch.data() + t * n_embd, lw.ln1_w.data(),
+                         ln_out_batch.data() + t * n_embd, n_embd, cfg.norm_eps);
+            else
+                layer_norm(x_batch.data() + t * n_embd, lw.ln1_w.data(),
+                           lw.ln1_b.data(), ln_out_batch.data() + t * n_embd, n_embd);
+        }
+
+        // Attention batch
+        if (is_llama)
+            self_attention_llama_prefill(ln_out_batch.data(), attn_out_batch.data(),
+                                         lw, model.kv_cache, cfg, l, N);
+        else
+            self_attention_prefill(ln_out_batch.data(), attn_out_batch.data(),
+                                   lw, model.kv_cache, cfg, l, N);
+
+        // Residual connection 1
+        for (int t = 0; t < N; t++)
+            vec_add(attn_out_batch.data() + t * n_embd, residual_batch.data() + t * n_embd,
+                    x_batch.data() + t * n_embd, n_embd);
+
+        // Residual
+        residual_batch = x_batch;
+
+        // Norm 2
+        for (int t = 0; t < N; t++) {
+            if (is_llama)
+                rms_norm(x_batch.data() + t * n_embd, lw.ln2_w.data(),
+                         ln_out_batch.data() + t * n_embd, n_embd, cfg.norm_eps);
+            else
+                layer_norm(x_batch.data() + t * n_embd, lw.ln2_w.data(),
+                           lw.ln2_b.data(), ln_out_batch.data() + t * n_embd, n_embd);
+        }
+
+        // FFN batch
+        if (is_llama)
+            feed_forward_llama_prefill(ln_out_batch.data(), ffn_out_batch.data(), lw, cfg, N);
+        else
+            feed_forward_prefill(ln_out_batch.data(), ffn_out_batch.data(), lw, cfg, N);
+
+        // Residual connection 2
+        for (int t = 0; t < N; t++)
+            vec_add(ffn_out_batch.data() + t * n_embd, residual_batch.data() + t * n_embd,
+                    x_batch.data() + t * n_embd, n_embd);
+    }
+
+    // ── Norm finale ────────────────────────────
+    for (int t = 0; t < N; t++) {
+        if (is_llama)
+            rms_norm(x_batch.data() + t * n_embd, w.ln_f_w.data(),
+                     ln_out_batch.data() + t * n_embd, n_embd, cfg.norm_eps);
+        else
+            layer_norm(x_batch.data() + t * n_embd, w.ln_f_w.data(),
+                       w.ln_f_b.data(), ln_out_batch.data() + t * n_embd, n_embd);
+    }
+
+    // ── lm_head: solo l'ULTIMO token serve ──────
+    logits.resize(cfg.n_vocab);
+    const QuantTensor& lm_head = is_llama ? w.output_w : w.token_embd;
+    matvec_quant(lm_head, ln_out_batch.data() + (N - 1) * n_embd, logits.data());
+
+    // Salva lo stato dell'ultimo token per la generazione sequenziale
+    vec_copy(ln_out_batch.data() + (N - 1) * n_embd, model.bufs.x.data(), n_embd);
+    model.kv_cache.n_cached = N;
+}
+
 // ─────────────────────────────────────────────
 //  Sampling greedy (argmax)
 //
