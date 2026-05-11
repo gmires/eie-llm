@@ -330,23 +330,23 @@ static std::string json_escape(const std::string& s) {
 
 static std::string sse_text_chunk(const std::string& text) {
     return "data: {\"choices\":[{\"text\":\"" + json_escape(text) +
-           "\",\"index\":0,\"finish_reason\":null}]\n\n";
+           "\",\"index\":0,\"finish_reason\":null}]}\n\n";
 }
 
 static std::string sse_chat_chunk(const std::string& text) {
     return "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
-           json_escape(text) + "\"},\"finish_reason\":null}]\n\n";
+           json_escape(text) + "\"},\"finish_reason\":null}]}\n\n";
 }
 
 static std::string sse_text_done() {
     return "data: {\"choices\":[{\"text\":\"\",\"index\":0,"
-           "\"finish_reason\":\"stop\"}]\n\n"
+           "\"finish_reason\":\"stop\"}]}\n\n"
            "data: [DONE]\n\n";
 }
 
 static std::string sse_chat_done() {
     return "data: {\"choices\":[{\"index\":0,\"delta\":{},"
-           "\"finish_reason\":\"stop\"}]\n\n"
+           "\"finish_reason\":\"stop\"}]}\n\n"
            "data: [DONE]\n\n";
 }
 
@@ -378,6 +378,10 @@ static std::string sse_chat_done() {
 static void generate_for_request(Model& model,
                                  const Tokenizer& tok,
                                  ServerRequest& req) {
+    std::cout << "[GEN] inizio generazione per endpoint=" << req.endpoint_label
+              << " prompt=\"" << req.prompt.substr(0, 40)
+              << (req.prompt.size() > 40 ? "..." : "") << "\"\n";
+
     // ── Fase 1: Tokenizzazione del prompt ─────
     req.input_ids = tokenizer_encode(tok, req.prompt);
     req.context_ids = req.input_ids;
@@ -452,6 +456,9 @@ static void generate_for_request(Model& model,
     req.completion_tokens = static_cast<int>(
         tokenizer_encode(tok, req.output_text).size());
 
+    std::cout << "[GEN] completamento finito, " << req.completion_tokens
+              << " token generati\n";
+
     // ── Fase 5: Segnala completamento ─────────
     // Il thread HTTP è in attesa su req.cv: lo svegliamo.
     {
@@ -495,10 +502,16 @@ static bool generate_streaming_for_request(
                            bool is_first,
                            bool is_last)> callback) {
 
+    std::cout << "[GEN_STREAM] prompt=\"" << prompt.substr(0, 40)
+              << (prompt.size() > 40 ? "..." : "")
+              << "\" max_tokens=" << max_tokens << "\n";
+
     auto input_ids = tokenizer_encode(tok, prompt);
     std::vector<int> context_ids = input_ids;
     std::vector<float> logits;
     int pos = 0;
+
+    std::cout << "[GEN_STREAM] prompt tokenizzato, n=" << input_ids.size() << "\n";
 
     // Prefill con prefix cache
     if (!input_ids.empty()) {
@@ -529,17 +542,23 @@ static bool generate_streaming_for_request(
 
     // Loop di generazione con callback
     bool client_ok = true;
+    int generated = 0;
     for (int i = 0; i < max_tokens && client_ok; i++) {
         if (next_token == tok.eos_id) {
+            std::cout << "[GEN_STREAM] EOS raggiunto dopo " << generated << " token\n";
             client_ok = callback("", false, true);
             break;
         }
 
         std::string token_str = tokenizer_decode(tok, {next_token});
         context_ids.push_back(next_token);
+        generated++;
 
         client_ok = callback(token_str, i == 0, false);
-        if (!client_ok) break;
+        if (!client_ok) {
+            std::cout << "[GEN_STREAM] client_ok=false al token " << generated << "\n";
+            break;
+        }
 
         forward(model, next_token, pos, logits);
         pos++;
@@ -552,8 +571,10 @@ static bool generate_streaming_for_request(
 
     // Se usciti per max_tokens (non EOS), segnala fine
     if (client_ok && next_token != tok.eos_id) {
+        std::cout << "[GEN_STREAM] max_tokens raggiunto, generated=" << generated << "\n";
         callback("", false, true);
     }
+    std::cout << "[GEN_STREAM] terminato, generated=" << generated << "\n";
     return client_ok;
 }
 
@@ -663,13 +684,35 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                              std::ref(tok),
                              std::ref(queue));
 
+    // ── CORS globale ──────────────────────────
+    // Permette alla Web UI (o a qualsiasi client)
+    // di chiamare le API anche se servita da un
+    // dominio diverso (es. file:// o altro host).
+    svr.set_post_routing_handler(
+        [](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods",
+                           "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers",
+                           "Content-Type");
+        });
+
+    // ── Preflight OPTIONS ─────────────────────
+    // I browser inviano OPTIONS prima di POST cross-origin.
+    svr.Options(".*",
+        [](const httplib::Request&, httplib::Response& res) {
+            res.status = 204;
+        });
+
     // ── GET /health ───────────────────────────
     // Endpoint di health check — risponde subito
     // senza toccare il modello.
-    svr.Get("/health", [](const httplib::Request&,
-                           httplib::Response& res) {
+    svr.Get("/health", [&model](const httplib::Request&,
+                                 httplib::Response& res) {
+        std::string arch = (model.config.arch == ArchType::GPT2)
+                               ? "gpt2" : "llama";
         res.set_content(
-            "{\"status\":\"ok\",\"model\":\"gpt2\"}",
+            "{\"status\":\"ok\",\"model\":\"" + arch + "\"}",
             "application/json"
         );
     });
@@ -686,6 +729,9 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
     svr.Post("/v1/completions",
         [&model, &tok, &queue](const httplib::Request& req,
                                httplib::Response& res) {
+
+        std::cout << "[SERVER] POST /v1/completions arrivata"
+                  << " (body=" << req.body.size() << " bytes)\n";
 
         std::string prompt     = json_get_string(req.body, "prompt");
         int         max_tokens = json_get_int   (req.body, "max_tokens", 50);
@@ -711,6 +757,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
             prompt = apply_chat_template(tok, prompt);
 
         bool stream = json_get_bool(req.body, "stream", false);
+        std::cout << "[SERVER] /v1/completions stream=" << (stream ? "true" : "false") << "\n";
 
         if (!stream) {
             // ═════════════════════════════════════
@@ -761,19 +808,29 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         res.set_chunked_content_provider("text/event-stream",
             [prompt, max_tokens, params, &model, &tok]
             (size_t offset, httplib::DataSink &sink) -> bool {
-                if (offset > 0) return false; // già inviato tutto
+                if (offset > 0) {
+                    sink.done();  // chiudi il chunked stream
+                    return true;
+                }
 
+                std::cout << "[STREAM] /v1/completions content_provider iniziato\n";
                 generate_streaming_for_request(
                     model, tok, prompt, max_tokens, params,
                     [&sink](const std::string& token,
                             bool /*is_first*/, bool is_last) -> bool {
                         std::string event = is_last
                             ? sse_text_done()
-                            : sse_text_chunk(token);
-                        return sink.write(event.data(), event.size());
+                            : sse_chat_chunk(token);
+                        bool ok = sink.write(event.data(), event.size());
+                        if (!ok) {
+                            std::cout << "[STREAM] client disconnesso (sink.write=false)\n";
+                        }
+                        return ok;
                     });
 
-                return false; // fine stream
+                std::cout << "[STREAM] /v1/completions content_provider terminato\n";
+                sink.done();  // invia il chunk finale 0\r\n\r\n
+                return true;
             });
     });
 
@@ -786,6 +843,9 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
     svr.Post("/v1/chat/completions",
         [&model, &tok, &queue](const httplib::Request& req,
                                httplib::Response& res) {
+
+        std::cout << "[SERVER] POST /v1/chat/completions arrivata"
+                  << " (body=" << req.body.size() << " bytes)\n";
 
         std::string user_msg = json_get_last_user_message(req.body);
         int max_tokens = json_get_int(req.body, "max_tokens", 100);
@@ -811,6 +871,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
             : user_msg;
 
         bool stream = json_get_bool(req.body, "stream", false);
+        std::cout << "[SERVER] /v1/chat/completions stream=" << (stream ? "true" : "false") << "\n";
 
         if (!stream) {
             // ═════════════════════════════════════
@@ -853,8 +914,12 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         res.set_chunked_content_provider("text/event-stream",
             [prompt, max_tokens, params, &model, &tok]
             (size_t offset, httplib::DataSink &sink) -> bool {
-                if (offset > 0) return false;
+                if (offset > 0) {
+                    sink.done();
+                    return true;
+                }
 
+                std::cout << "[STREAM] /v1/chat/completions content_provider iniziato\n";
                 generate_streaming_for_request(
                     model, tok, prompt, max_tokens, params,
                     [&sink](const std::string& token,
@@ -862,10 +927,16 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                         std::string event = is_last
                             ? sse_chat_done()
                             : sse_chat_chunk(token);
-                        return sink.write(event.data(), event.size());
+                        bool ok = sink.write(event.data(), event.size());
+                        if (!ok) {
+                            std::cout << "[STREAM] client disconnesso (sink.write=false)\n";
+                        }
+                        return ok;
                     });
 
-                return false;
+                std::cout << "[STREAM] /v1/chat/completions content_provider terminato\n";
+                sink.done();
+                return true;
             });
     });
 

@@ -270,24 +270,85 @@ Oltre al client Python, EIE-LLM include un'interfaccia web grafica completa in `
 # Apri http://localhost:8080 nel browser
 ```
 
-### Funzionalità
+### Chat
 
-| Feature | Descrizione |
-|---------|-------------|
-| **Chat streaming** | Token in tempo reale via SSE, con pulsante di stop |
-| **Cronologia chat** | Salvata in `localStorage`, con nuova/importa/esporta/elimina |
-| **Markdown + highlight** | Messaggi formattati con marked.js e highlight.js |
-| **Impostazioni** | Temperatura, max tokens, top-k, top-p, repetition penalty, greedy, streaming toggle |
-| **Attention heatmap** | Visualizzazione interattiva su canvas dei pesi attention per layer/head |
-| **Tema chiaro/scuro** | Toggle con persistenza |
-| **Responsive** | Layout adattivo per desktop e mobile |
+L'interfaccia principale è divisa in tre aree:
 
-### Architettura
+- **Sidebar sinistra** — cronologia delle conversazioni. Ogni chat ha un titolo tratto dal primo messaggio utente. Puoi crearne di nuove (+), eliminarle (×), importare ed esportare l'intero archivio in JSON.
+- **Area centrale** — i messaggi vengono renderizzati in Markdown con syntax highlighting per i blocchi di codice. I token dell'assistente arrivano in streaming via SSE e vengono aggiunti alla bubble in tempo reale.
+- **Barra in basso** — textarea per l'input (supporta invio per mandare, Shift+Invio per newline). Il pulsante verde invia, il pulsante rosso ferma la generazione.
 
-- **Zero build step** — HTML/CSS/JS vanilla, nessun bundler
-- **Zero dipendenze locali** — marked.js e highlight.js da CDN
-- **SPA** — logica tutta in `app.js`
-- **File statici** — serviti da `httplib::Server::set_mount_point("/", "./webui")`
+### Impostazioni (⚙️)
+
+Cliccando l'ingranaggio si apre un pannello laterale con tutti i parametri di sampling:
+
+| Parametro | Default | Descrizione |
+|-----------|---------|-------------|
+| **Temperatura** | 1.0 | Quanto "creativa" è la risposta. 0 = deterministico (greedy). |
+| **Max tokens** | 100 | Numero massimo di token da generare (limite server: 500). |
+| **Top-k** | 40 | Campiona solo tra i k token più probabili. 0 = disabilitato. |
+| **Top-p** | 0.9 | Nucleus sampling: taglia la coda della distribuzione. |
+| **Repetition penalty** | 1.1 | Scoraggia le ripetizioni (>1.0 attivo). |
+| **Streaming** | ON | Se disattivato, la risposta arriva tutta insieme (bloccante). |
+| **Greedy** | OFF | Sempre il token più probabile, nessuna casualità. |
+| **Modalità chat** | ON | Usa `/v1/chat/completions` con il chat template del modello. |
+
+Le impostazioni vengono salvate automaticamente in `localStorage`.
+
+### Attention Heatmap (🔥)
+
+Il pannello attention permette di "guardare dentro" il modello e vedere come i token si "guardano" tra loro. È uno strumento didattico potente per capire il meccanismo della self-attention.
+
+#### Come funziona
+
+1. Inserisci un testo breve (max 100 token) nella textarea e premi **Analizza**.
+2. Il server esegue il forward pass e salva i pesi attention per ogni layer e head.
+3. La heatmap viene disegnata su un canvas HTML5.
+
+#### Come leggere la matrice
+
+La heatmap è una matrice quadrata dove ogni cella `(q, k)` rappresenta il peso attention del token query `q` sul token key `k`:
+
+- **Righe (Y, Query)** — il token che sta "chiedendo" attenzione (quello corrente).
+- **Colonne (X, Key)** — i token precedenti a cui può rivolgersi.
+- **Colore** — gradiente da **blu** (peso ~0.0) a **rosso** (peso ~1.0).
+- **Valori numerici** — se le celle sono abbastanza grandi, il numero viene disegnato al centro (es. `0.35`).
+- **Tooltip** — passando il mouse su una cella compare un popup con: token query, token key, e peso esatto a 4 decimali.
+
+#### Proprietà fondamentali
+
+1. **Ogni riga somma a 1.0** — dopo la softmax, l'attenzione è una distribuzione di probabilità.
+2. **Triangolare inferiore** — la causal mask impedisce a un token di guardare al futuro. La parte sopra la diagonale è sempre 0.
+3. **La diagonale ha spesso pesi alti** — ogni token si guarda almeno a se stesso.
+
+#### Layer e Head
+
+Un transformer ha molteplici layer (strati) e ogni layer ha molteplici head (teste d'attenzione). Ogni head specializza su pattern diversi:
+
+- **Head locali** — attenzione concentrata sui token vicini (pattern sintattici come aggettivo-sostantivo).
+- **Head globali** — attenzione a token lontani (relazioni semantiche come pronome-sostantivo).
+- **Head di posizione** — attenzione basata sulla distanza, indipendentemente dal contenuto.
+
+Puoi visualizzare:
+- Un **layer e head specifici** — per studiare il comportamento di una singola testa.
+- La **media su tutti i layer/head** — per una visione d'insieme stabile e meno rumorosa.
+
+#### Esempio didattico
+
+Con il testo "The cat sat on the mat":
+- Il token "sat" (riga) avrà probabilmente un peso alto sulla colonna "cat" (il soggetto del verbo).
+- Il token "mat" potrebbe guardare a "the" immediatamente precedente (pattern sintattico).
+- Il token "The" (primo) ha unico peso 1.0 su se stesso.
+
+Questo rende concreto il concetto astratto di "self-attention": il modello impara autonomamente quali relazioni tra token sono utili per predire il prossimo.
+
+### Architettura tecnica
+
+- **Zero build step** — HTML/CSS/JS vanilla, nessun bundler.
+- **Zero dipendenze locali** — marked.js e highlight.js da CDN.
+- **SPA** — logica tutta in `app.js` (~750 righe).
+- **File statici** — serviti da `httplib::Server::set_mount_point("/", "./webui")`.
+- **Streaming SSE** — `fetch()` con `ReadableStream` e parsing manuale degli eventi `data: ...`.
 
 Vedi `webui/README.md` per i dettagli.
 

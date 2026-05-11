@@ -333,11 +333,16 @@ async function sendMessage() {
 
   try {
     if (s.stream) {
+      console.log('[CLIENT] inizio streamResponse');
       await streamResponse(chat, assistantMsg, abortCtrl);
+      console.log('[CLIENT] streamResponse terminata');
     } else {
+      console.log('[CLIENT] inizio blockingResponse');
       await blockingResponse(chat, assistantMsg, abortCtrl);
+      console.log('[CLIENT] blockingResponse terminata');
     }
   } catch (e) {
+    console.error('[CLIENT] ERRORE:', e.name, e.message);
     if (e.name !== 'AbortError') {
       assistantMsg.content += '\n\n*[Errore: ' + e.message + ']*';
       updateLastBubble(assistantMsg.content);
@@ -373,14 +378,17 @@ async function blockingResponse(chat, assistantMsg, abortCtrl) {
         chat: s.chatMode,
       });
 
+  console.log('[CLIENT] fetch POST (blocking)', endpoint);
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body,
     signal: abortCtrl.signal,
   });
+  console.log('[CLIENT] blocking risposta:', res.status);
   if (!res.ok) throw new Error('HTTP ' + res.status);
   const data = await res.json();
+  console.log('[CLIENT] blocking JSON:', data);
   const text = data.choices?.[0]?.text ?? data.choices?.[0]?.message?.content ?? '';
   assistantMsg.content = text;
   updateLastBubble(text);
@@ -410,24 +418,32 @@ async function streamResponse(chat, assistantMsg, abortCtrl) {
         chat: s.chatMode,
       });
 
+  console.log('[CLIENT] fetch POST', endpoint);
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body,
     signal: abortCtrl.signal,
   });
+  console.log('[CLIENT] fetch risposta:', res.status, res.statusText);
+  console.log('[CLIENT] headers:', [...res.headers.entries()]);
   if (!res.ok) throw new Error('HTTP ' + res.status);
 
   const reader = res.body.getReader();
+  console.log('[CLIENT] reader ottenuto');
   const decoder = new TextDecoder();
   let buffer = '';
+  let chunkCount = 0;
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
-    if (abortCtrl.signal.aborted) break;
+    if (done) { console.log('[CLIENT] reader done'); break; }
+    if (abortCtrl.signal.aborted) { console.log('[CLIENT] abort'); break; }
 
-    buffer += decoder.decode(value, {stream: true});
+    chunkCount++;
+    const text = decoder.decode(value, {stream: true});
+    console.log('[CLIENT] chunk #' + chunkCount, 'bytes=', value?.length, 'text=', text.substring(0, 80));
+    buffer += text;
     const parts = buffer.split('\n\n');
     buffer = parts.pop();
 
@@ -436,7 +452,7 @@ async function streamResponse(chat, assistantMsg, abortCtrl) {
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const data = line.slice(6).trim();
-        if (data === '[DONE]') continue;
+        if (data === '[DONE]') { console.log('[CLIENT] [DONE]'); continue; }
         try {
           const json = JSON.parse(data);
           const delta = json.choices?.[0]?.delta?.content ?? json.choices?.[0]?.text ?? '';
@@ -444,10 +460,11 @@ async function streamResponse(chat, assistantMsg, abortCtrl) {
             assistantMsg.content += delta;
             updateLastBubble(assistantMsg.content);
           }
-        } catch (e) { /* ignore malformed json */ }
+        } catch (e) { console.warn('[CLIENT] JSON parse error:', e.message, 'data=', data); }
       }
     }
   }
+  console.log('[CLIENT] stream finito, chunk totali:', chunkCount);
 }
 
 function buildPromptFromMessages(messages) {
@@ -537,7 +554,6 @@ function drawAttention() {
   // Calcola matrice da visualizzare
   let matrix = [];
   if (el.attAvg.checked) {
-    // Media su tutti i layer e head
     const nL = d.layers.length;
     const nH = d.layers[0]?.heads.length || 1;
     for (let q = 0; q < seqLen; q++) {
@@ -560,17 +576,32 @@ function drawAttention() {
     matrix = layer.heads[hi].weights;
   }
 
+  // Salva per il tooltip
+  canvas._matrix = matrix;
+  canvas._tokens = tokens;
+  canvas._cellSize = cellSize;
+  canvas._margin = margin;
+
   // Sfondo
   ctx.fillStyle = document.body.classList.contains('dark-theme') ? '#0d0d0d' : '#ffffff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   // Celle
+  const showNumbers = cellSize > 16;
   for (let q = 0; q < seqLen; q++) {
     for (let k = 0; k < seqLen; k++) {
       const val = matrix[q][k];
-      const hue = 240 * (1 - val); // blu (240) -> rosso (0)
+      const hue = 240 * (1 - val);
       ctx.fillStyle = `hsl(${hue}, 80%, 50%)`;
       ctx.fillRect(margin.left + k * cellSize, margin.top + q * cellSize, cellSize, cellSize);
+
+      if (showNumbers) {
+        ctx.fillStyle = val > 0.5 ? '#000' : '#fff';
+        ctx.font = `${Math.max(8, cellSize - 6)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(val.toFixed(2), margin.left + k * cellSize + cellSize / 2, margin.top + q * cellSize + cellSize / 2);
+      }
     }
   }
 
@@ -608,6 +639,41 @@ function drawAttention() {
   ctx.restore();
 
   el.attInfo.textContent = `${tokens.length} token × ${tokens.length} token — Media: ${el.attAvg.checked ? 'tutti i layer/head' : 'Layer ' + el.attLayer.value + ' Head ' + el.attHead.value}`;
+}
+
+// Tooltip heatmap
+function setupAttentionTooltip() {
+  const tooltip = document.createElement('div');
+  tooltip.id = 'att-tooltip';
+  tooltip.style.cssText = 'position:absolute;display:none;padding:6px 10px;border-radius:6px;font-size:12px;pointer-events:none;z-index:200;background:var(--bg-3);color:var(--text-0);border:1px solid var(--border);box-shadow:0 2px 8px var(--shadow);';
+  document.body.appendChild(tooltip);
+
+  el.attCanvas.addEventListener('mousemove', (e) => {
+    const c = el.attCanvas;
+    if (!c._matrix) return;
+    const rect = c.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const cs = c._cellSize;
+    const m = c._margin;
+    const k = Math.floor((x - m.left) / cs);
+    const q = Math.floor((y - m.top) / cs);
+    const seqLen = c._tokens.length;
+
+    if (q >= 0 && q < seqLen && k >= 0 && k < seqLen) {
+      const val = c._matrix[q][k];
+      tooltip.innerHTML = `<strong>Q:</strong> "${escapeHtml(c._tokens[q])}"<br><strong>K:</strong> "${escapeHtml(c._tokens[k])}"<br><strong>Att:</strong> ${val.toFixed(4)}`;
+      tooltip.style.display = 'block';
+      tooltip.style.left = (e.pageX + 12) + 'px';
+      tooltip.style.top = (e.pageY + 12) + 'px';
+    } else {
+      tooltip.style.display = 'none';
+    }
+  });
+
+  el.attCanvas.addEventListener('mouseleave', () => {
+    tooltip.style.display = 'none';
+  });
 }
 
 /* ── Panels ─────────────────────────────────────────────────────────────────── */
@@ -706,6 +772,7 @@ function init() {
   if (!state.currentChatId) createNewChat();
   else selectChat(state.currentChatId);
   setupEventListeners();
+  setupAttentionTooltip();
   checkHealth();
   setInterval(checkHealth, 10000);
 }
