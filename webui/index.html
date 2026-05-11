@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EIE-LLM Web UI</title>
+  <link rel="stylesheet" href="/style.css">
+  <!-- Marked per Markdown -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- Highlight.js per code highlighting -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" id="hljs-theme">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body class="dark-theme">
+  <div id="app">
+    <!-- Sidebar sinistra: cronologia chat -->
+    <aside id="sidebar-left">
+      <div class="sidebar-header">
+        <h1>EIE-LLM</h1>
+        <button id="btn-new-chat" title="Nuova chat">+</button>
+      </div>
+      <div id="chat-list"></div>
+      <div class="sidebar-footer">
+        <button id="btn-import">Importa</button>
+        <button id="btn-export">Esporta</button>
+        <input type="file" id="file-import" accept=".json" style="display:none">
+      </div>
+    </aside>
+
+    <!-- Area principale -->
+    <main id="main">
+      <header id="main-header">
+        <button id="btn-toggle-sidebar" title="Toggle sidebar">☰</button>
+        <span id="model-status">⚫ Disconnesso</span>
+        <div class="header-actions">
+          <button id="btn-theme" title="Tema">🌙</button>
+          <button id="btn-settings" title="Impostazioni">⚙️</button>
+          <button id="btn-attention" title="Attention heatmap">🔥</button>
+        </div>
+      </header>
+
+      <div id="chat-messages"></div>
+
+      <div id="input-area">
+        <textarea id="msg-input" rows="1" placeholder="Scrivi un messaggio..."></textarea>
+        <button id="btn-send" title="Invia">➤</button>
+        <button id="btn-stop" title="Ferma generazione" style="display:none">⏹</button>
+      </div>
+    </main>
+
+    <!-- Pannello impostazioni (slide da destra) -->
+    <aside id="settings-panel" class="slide-panel">
+      <div class="panel-header">
+        <h2>Impostazioni</h2>
+        <button class="btn-close-panel">×</button>
+      </div>
+      <div class="panel-body">
+        <label>
+          Modello
+          <input type="text" id="setting-model" value="gpt2" readonly>
+        </label>
+        <label>
+          Temperatura
+          <input type="range" id="setting-temperature" min="0" max="2" step="0.1" value="1.0">
+          <span class="value-label" id="val-temperature">1.0</span>
+        </label>
+        <label>
+          Max tokens
+          <input type="range" id="setting-max-tokens" min="10" max="500" step="10" value="100">
+          <span class="value-label" id="val-max-tokens">100</span>
+        </label>
+        <label>
+          Top-k
+          <input type="range" id="setting-top-k" min="0" max="100" step="1" value="40">
+          <span class="value-label" id="val-top-k">40</span>
+        </label>
+        <label>
+          Top-p
+          <input type="range" id="setting-top-p" min="0" max="1" step="0.05" value="0.9">
+          <span class="value-label" id="val-top-p">0.9</span>
+        </label>
+        <label>
+          Repetition penalty
+          <input type="range" id="setting-rep-penalty" min="1" max="2" step="0.05" value="1.1">
+          <span class="value-label" id="val-rep-penalty">1.1</span>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="setting-stream" checked>
+          Streaming (SSE)
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="setting-greedy">
+          Greedy sampling
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="setting-chat-mode" checked>
+          Modalità chat
+        </label>
+      </div>
+    </aside>
+
+    <!-- Pannello attention (slide da destra) -->
+    <aside id="attention-panel" class="slide-panel">
+      <div class="panel-header">
+        <h2>Attention Heatmap</h2>
+        <button class="btn-close-panel">×</button>
+      </div>
+      <div class="panel-body">
+        <p class="hint">Inserisci un testo breve (max 100 token) per visualizzare i pesi attention.</p>
+        <textarea id="attention-input" rows="3" placeholder="The cat sat on the mat..."></textarea>
+        <div class="row-buttons">
+          <button id="btn-analyze">Analizza</button>
+          <button id="btn-attention-clear">Pulisci</button>
+        </div>
+        <div id="attention-controls" style="display:none">
+          <label>
+            Layer
+            <select id="attention-layer"></select>
+          </label>
+          <label>
+            Head
+            <select id="attention-head"></select>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" id="attention-average" checked>
+            Media su tutti i layer/head
+          </label>
+        </div>
+        <div id="attention-canvas-container">
+          <canvas id="attention-canvas"></canvas>
+        </div>
+        <div id="attention-info"></div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

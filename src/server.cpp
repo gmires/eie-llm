@@ -909,6 +909,9 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         res.set_content(json, "application/json");
     });
 
+    // ── Monta directory webui per la UI statica ──
+    svr.set_mount_point("/", "./webui");
+
     // ── Banner di avvio ───────────────────────
     std::cout << "\n╔═══════════════════════════════════════╗\n";
     std::cout << "║   EIE-LLM Server                      ║\n";
@@ -921,6 +924,9 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
     std::cout << "║   POST /v1/chat/completions           ║\n";
     std::cout << "║   POST /v1/chat/completions (stream)  ║\n";
     std::cout << "║   POST /v1/inspect/attention          ║\n";
+    std::cout << "╠═══════════════════════════════════════╣\n";
+    std::cout << "║   Web UI: http://localhost:" << port
+              << "/            ║\n";
     std::cout << "╠═══════════════════════════════════════╣\n";
     std::cout << "║   Chat template: "
               << std::left << std::setw(21)

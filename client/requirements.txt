@@ -1,0 +1,9 @@
+# Client Python per EIE-LLM
+# 
+# Dipendenze necessarie per interrogare l'API HTTP
+del server e visualizzare le heatmap di attention.
+
+requests>=2.28.0      # HTTP client
+matplotlib>=3.5.0     # Plotting heatmap
+seaborn>=0.11.0       # Heatmap migliorata
+numpy>=1.21.0         # Manipolazione matrici

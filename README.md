@@ -218,6 +218,81 @@ data: [DONE]
 
 ---
 
+## Client Python
+
+Oltre a `curl`, puoi usare il client Python ufficiale in `client/`.
+
+### Installazione
+
+```bash
+cd client
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Esempi
+
+```bash
+# Health check
+python client/client.py --mode health
+
+# Completamento
+python client/client.py --mode complete --prompt "The sky is"
+
+# Chat con streaming
+python client/client.py --mode chat --message "Ciao!" --stream
+
+# Attention heatmap (tutti i layer)
+python client/client.py --mode inspect --prompt "The cat sat" --plot
+
+# Attention singolo layer/head
+python client/client.py --mode inspect --prompt "Hello" --plot --layer 0 --head 0
+
+# Salva heatmap su file
+python client/client.py --mode inspect --prompt "Hello" --plot --output heatmap.png
+```
+
+Il client supporta tutti i parametri di sampling (`--temperature`, `--top-k`, `--top-p`, `--greedy`) e lo streaming SSE (`--stream`).
+
+Vedi `client/README.md` per la documentazione completa.
+
+---
+
+## Web UI (OpenWebUI-style)
+
+Oltre al client Python, EIE-LLM include un'interfaccia web grafica completa in `webui/`. Si avvia automaticamente insieme al server — basta aprire il browser all'indirizzo del server.
+
+### Avvio
+
+```bash
+./build/eie-llm models/tinyllama.Q4_K_M.gguf --server 8080
+# Apri http://localhost:8080 nel browser
+```
+
+### Funzionalità
+
+| Feature | Descrizione |
+|---------|-------------|
+| **Chat streaming** | Token in tempo reale via SSE, con pulsante di stop |
+| **Cronologia chat** | Salvata in `localStorage`, con nuova/importa/esporta/elimina |
+| **Markdown + highlight** | Messaggi formattati con marked.js e highlight.js |
+| **Impostazioni** | Temperatura, max tokens, top-k, top-p, repetition penalty, greedy, streaming toggle |
+| **Attention heatmap** | Visualizzazione interattiva su canvas dei pesi attention per layer/head |
+| **Tema chiaro/scuro** | Toggle con persistenza |
+| **Responsive** | Layout adattivo per desktop e mobile |
+
+### Architettura
+
+- **Zero build step** — HTML/CSS/JS vanilla, nessun bundler
+- **Zero dipendenze locali** — marked.js e highlight.js da CDN
+- **SPA** — logica tutta in `app.js`
+- **File statici** — serviti da `httplib::Server::set_mount_point("/", "./webui")`
+
+Vedi `webui/README.md` per i dettagli.
+
+---
+
 ## Struttura del codice
 
 ```
@@ -235,6 +310,8 @@ eie-llm/
 ├── include/            — header corrispondenti
 ├── models/             — file .gguf (non inclusi nel repo)
 ├── scripts/setup.sh    — download modelli e dipendenze
+├── client/             — client Python CLI
+├── webui/              — interfaccia web (HTML/CSS/JS)
 └── tools/              — script Python per debug e ispezione GGUF
 ```
 
