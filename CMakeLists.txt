@@ -4,9 +4,10 @@ project(eie-llm VERSION 0.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Build type default a Debug per ora (più facile fare debug)
+# Build type default a Release (prestazioni ottimali per l'inferenza)
+# Per il debug esplicito: cmake -B build -DCMAKE_BUILD_TYPE=Debug
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Debug)
+  set(CMAKE_BUILD_TYPE Release)
 endif()
 
 add_executable(eie-llm

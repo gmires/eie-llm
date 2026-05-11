@@ -2,13 +2,104 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug eie-llm",
+      "name": "Debug GPT-2 (shell)",
       "type": "cppdbg",
       "request": "launch",
       "program": "${workspaceFolder}/build/eie-llm",
       "args": ["models/gpt2.Q8_0.gguf"],
       "stopAtEntry": false,
       "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Abilita pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Debug TinyLlama (shell)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/tinyllama.Q4_K_M.gguf"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Abilita pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Debug GPT-2 Server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/gpt2.Q8_0.gguf", "--server", "8080"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Abilita pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Debug TinyLlama Server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/tinyllama.Q4_K_M.gguf", "--server", "8080"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Abilita pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Debug GPT-2 Bench",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/gpt2.Q8_0.gguf", "--bench", "50"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        {
+          "description": "Abilita pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "Debug TinyLlama Bench",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/tinyllama.Q4_K_M.gguf", "--bench", "50"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
       "MIMode": "gdb",
       "setupCommands": [
         {

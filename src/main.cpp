@@ -8,6 +8,7 @@
 #include "shell.hpp"
 #include "server.hpp"
 #include "bench.hpp"
+#include "cpuinfo.hpp"
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -49,6 +50,28 @@ int main(int argc, char* argv[]) {
     std::cerr << "✓ Pronto! (caricamento: "
               << std::fixed << std::setprecision(0)
               << load_ms << " ms)\n";
+
+    // ── Info build e ottimizzazioni ───────────
+    std::cerr << "  Build type: "
+#ifdef NDEBUG
+              << "Release (-O3)"
+#else
+              << "Debug (-O0)"
+#endif
+              << "\n";
+
+#ifdef _OPENMP
+    std::cerr << "  OpenMP:     attivo (multicore)\n";
+#else
+    std::cerr << "  OpenMP:     non disponibile\n";
+#endif
+
+    CPUFeatures feat = cpu_features();
+    std::cerr << "  AVX2:       " << (feat.avx2 ? "sì" : "no") << "\n";
+    std::cerr << "  FMA:        " << (feat.fma  ? "sì" : "no") << "\n";
+    if (feat.avx2 && !avx2_enabled()) {
+        std::cerr << "  AVX2 disabilitato via EIE_NO_AVX2=1\n";
+    }
 
     // ── Modalità ──────────────────────────────
     std::string mode = argc >= 3 ? argv[2] : "";

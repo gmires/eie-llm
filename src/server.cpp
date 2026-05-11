@@ -13,6 +13,7 @@
 #include <queue>
 #include <thread>
 #include <chrono>
+#include <iomanip>
 #include "httplib.h"
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -382,6 +383,8 @@ static void generate_for_request(Model& model,
               << " prompt=\"" << req.prompt.substr(0, 40)
               << (req.prompt.size() > 40 ? "..." : "") << "\"\n";
 
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     // ── Fase 1: Tokenizzazione del prompt ─────
     req.input_ids = tokenizer_encode(tok, req.prompt);
     req.context_ids = req.input_ids;
@@ -421,6 +424,9 @@ static void generate_for_request(Model& model,
         req.pos = 0;
     }
 
+    auto t_prefill = std::chrono::high_resolution_clock::now();
+    double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t0).count();
+
     // ── Fase 3: Sampling del primo token ──────
     int next_token;
     apply_repetition_penalty(req.logits, req.context_ids, req.params.rep_penalty);
@@ -456,8 +462,14 @@ static void generate_for_request(Model& model,
     req.completion_tokens = static_cast<int>(
         tokenizer_encode(tok, req.output_text).size());
 
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double gen_ms = std::chrono::duration<double, std::milli>(t_end - t_prefill).count();
+    double total_ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
+
     std::cout << "[GEN] completamento finito, " << req.completion_tokens
-              << " token generati\n";
+              << " token generati | prefill=" << std::fixed << std::setprecision(1)
+              << prefill_ms << "ms gen=" << gen_ms << "ms total=" << total_ms << "ms"
+              << " (" << (req.generated / (gen_ms / 1000.0)) << " tok/s)" << std::endl;
 
     // ── Fase 5: Segnala completamento ─────────
     // Il thread HTTP è in attesa su req.cv: lo svegliamo.
@@ -506,6 +518,8 @@ static bool generate_streaming_for_request(
               << (prompt.size() > 40 ? "..." : "")
               << "\" max_tokens=" << max_tokens << "\n";
 
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     auto input_ids = tokenizer_encode(tok, prompt);
     std::vector<int> context_ids = input_ids;
     std::vector<float> logits;
@@ -532,6 +546,9 @@ static bool generate_streaming_for_request(
         logits.resize(model.config.n_vocab);
         pos = 0;
     }
+
+    auto t_prefill = std::chrono::high_resolution_clock::now();
+    double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t0).count();
 
     // Primo token
     int next_token;
@@ -574,7 +591,14 @@ static bool generate_streaming_for_request(
         std::cout << "[GEN_STREAM] max_tokens raggiunto, generated=" << generated << "\n";
         callback("", false, true);
     }
-    std::cout << "[GEN_STREAM] terminato, generated=" << generated << "\n";
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double gen_ms = std::chrono::duration<double, std::milli>(t_end - t_prefill).count();
+    double total_ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
+
+    std::cout << "[GEN_STREAM] terminato, generated=" << generated
+              << " | prefill=" << std::fixed << std::setprecision(1)
+              << prefill_ms << "ms gen=" << gen_ms << "ms total=" << total_ms << "ms"
+              << " (" << (generated / (gen_ms / 1000.0)) << " tok/s)" << std::endl;
     return client_ok;
 }
 

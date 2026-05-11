@@ -4,10 +4,24 @@
     {
       "label": "cmake build debug",
       "type": "shell",
-      "command": "cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build",
+      "command": "cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j$(nproc)",
       "group": {
         "kind": "build",
         "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "cmake build release",
+      "type": "shell",
+      "command": "cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)",
+      "group": {
+        "kind": "build",
+        "isDefault": false
       },
       "presentation": {
         "reveal": "always",

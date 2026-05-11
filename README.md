@@ -51,7 +51,9 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-> **Nota:** compilare in **Release** invece di Debug dà un guadagno immediato di 2-4x grazie alle ottimizzazioni del compilatore (SIMD automatico, inlining, eliminazione dei controlli di debug).
+> **⚠️ Importante:** il default di CMake è ora **Release**. Se hai compilato in passato senza specificare `-DCMAKE_BUILD_TYPE=Release`, potresti avere una build **Debug** (-O0, nessuna ottimizzazione) che è **10-50x più lenta**. Controlla l'output di avvio: se vedi `Build type: Debug (-O0)`, ricompila in Release.
+>
+> Compilare in **Release** dà un guadagno immediato di 2-4x grazie alle ottimizzazioni del compilatore (SIMD automatico, inlining, eliminazione dei controlli di debug).
 
 ---
 
