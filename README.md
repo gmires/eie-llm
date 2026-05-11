@@ -147,6 +147,27 @@ curl -X POST http://localhost:8080/v1/completions \
 | `top_k` | intero | 40 | Top-k (0 = disabilitato) |
 | `top_p` | float | 0.9 | Nucleus sampling |
 | `repetition_penalty` | float | 1.1 | Penalità ripetizioni (1.0 = nessuna) |
+| `stream` | booleano | `false` | Se `true`, invia token via SSE in tempo reale |
+
+**Streaming (`stream: true`):**
+
+```bash
+curl -N -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"The capital of France is","max_tokens":20,"stream":true}'
+```
+
+L'opzione `-N` (no-buffer) di `curl` è essenziale per vedere i token man mano che arrivano. La risposta usa il formato SSE:
+
+```
+data: {"choices":[{"text":" the","index":0,"finish_reason":null}]}
+
+data: {"choices":[{"text":" city","index":0,"finish_reason":null}]}
+
+data: {"choices":[{"text":"","index":0,"finish_reason":"stop"}]}
+
+data: [DONE]
+```
 
 ### `POST /v1/chat/completions`
 
@@ -163,7 +184,29 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-**Risposta (entrambi gli endpoint):**
+**Streaming (`stream: true`):**
+
+```bash
+curl -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Ciao!"}],
+    "max_tokens": 50,
+    "stream": true
+  }'
+```
+
+```
+data: {"choices":[{"index":0,"delta":{"content":"Ciao"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+**Risposta non-streaming (entrambi gli endpoint):**
 
 ```json
 {
@@ -502,7 +545,108 @@ Per questo parallelizziamo solo il loop interno più costoso (il matvec) e lasci
 - [x] Fase 15 — Ottimizzazioni matvec AVX2+FMA con dispatcher runtime (tutti i formati quantizzati)
 - [x] Fase 16 — Prefill batch per prompt lunghi (matvec_quant_batch + forward_prefill)
 - [x] Fase 17 — OpenMP su matvec e ops vettoriali con soglia automatica
-- [ ] Fase 18 — Streaming HTTP (Server-Sent Events, token per token)
+- [x] Fase 18 — Streaming HTTP (Server-Sent Events, token per token)
+- [ ] Fase 19 — Speculative Decoding: draft & verify per accelerare la generazione
+- [ ] Fase 20 — KV Cache Prefix Sharing: riuso della cache per prefissi comuni
+- [ ] Fase 21 — Attention Heatmap Export: "guardare dentro" il modello
+- [ ] Fase 22 — Continuous Batching: throughput del server su richieste multiple
+
+---
+
+## Piano di sviluppo — Fasi 18-22
+
+### Fase 18 — Streaming SSE (Server-Sent Events)
+**Obiettivo**: il server invia i token man mano che vengono generati.
+
+**Perché**: l'utente percepisce la latenza come *Time-To-First-Token* (TTFT): il tempo dal click alla prima parola, non il tempo totale. Streaming = UX migliore.
+
+**Implementazione** (`src/server.cpp`):
+- Refactor della generazione in `generate_text_with_callback()`: accetta un `std::function` che viene chiamato per ogni token. Questo permette di riutilizzare la stessa logica sia per risposte bloccanti che streaming.
+- `generate_text()` è diventato un semplice wrapper che accumula i token in una stringa.
+- Per lo streaming, gli endpoint leggono `"stream": true` dal JSON e usano `res.set_chunked_content_provider("text/event-stream", ...)` di httplib.h.
+- Il *content provider* esegue la generazione interamente nel suo callback: per ogni token chiama `sink.write()` con il formato SSE OpenAI-compatibile:
+  ```
+  data: {"choices":[{"delta":{"content":"..."}}]}\n\n
+  ```
+- L'evento di fine stream invia `finish_reason: "stop"` seguito da `data: [DONE]\n\n`.
+- Se il client si disconnette, `sink.write()` ritorna `false` e il callback interrompe la generazione, rilasciando il lock sul modello.
+
+**Formato SSE per chat completions (OpenAI-compatibile)**:
+```bash
+curl -N -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Ciao!"}],"stream":true}'
+```
+
+**Cosa si impara**:
+- La generazione autoregressiva è intrinsecamente sequenziale: non possiamo "pre-calcolare" i token, ma possiamo renderli visibili immediatamente.
+- `httplib.h` supporta nativamente chunked transfer encoding: `set_chunked_content_provider()` gestisce automaticamente il framing dei chunk, basta scrivere i dati nel `DataSink`.
+- Il pattern "callback per token" è elegante: la stessa logica di generazione alimenta sia l'API classica che quella streaming, senza duplicazione di codice.
+- Attenzione ai *capture* nelle lambda: `model` e `tok` vivono nello scope di `server_run` (sicuro per reference), mentre `prompt` e `params` devono essere catturati per valore perché il content provider viene eseguito dopo che il handler HTTP è ritornato.
+
+---
+
+### Fase 19 — Speculative Decoding
+**Obiettivo**: accelerare la generazione con draft & verify.
+
+**Perché**: è una delle ottimizzazioni più eleganti degli engine moderni (llama.cpp, vLLM, TGI). La verifica batch di N token è molto più veloce della generazione sequenziale di N token.
+
+**Implementazione semplificata** (educational):
+- Usare il modello stesso come "draft": generare K token greedy in avanti (veloce perché non serve sampling)
+- Verificarli tutti insieme con un forward pass batch
+- Accettare i token finché il draft è corretto; al primo errore, rigenerare da lì
+- Il guadagno dipende dalla qualità del draft (tipicamente 2-3×)
+
+**Cosa si impara**: il trade-off qualità/velocità del draft, e perché la verifica in batch batte la generazione sequenziale.
+
+---
+
+### Fase 20 — KV Cache Prefix Sharing
+**Obiettivo**: condividere la KV cache del prefisso tra richieste multiple.
+
+**Perché**: nei server reali, il 50-80% dei token nei prompt è un system prompt identico per tutti. Ricalcolare la KV cache ogni volta è uno spreco enorme.
+
+**Implementazione**:
+- `PrefixCache` globale nel server: `hash(system_prompt) → KVCache`
+- Quando arriva una richiesta, controlla se il prefisso è già in cache
+- Se sì, copia la KV cache invece di ricalcolarla
+- Eviction LRU quando la cache è piena
+
+**Cosa si impara**: la KV cache è un bottleneck di memoria; la deduplication del prefisso è una delle ottimizzazioni più impattanti nel deployment.
+
+---
+
+### Fase 21 — Attention Heatmap Export
+**Obiettivo**: un endpoint che restituisce i pesi attention per ogni layer/head.
+
+**Perché**: vedere quali token si guardano tra loro (es. il pronome "essa" guarda "Francia" 10 token prima) rende concreto il meccanismo della self-attention.
+
+**Implementazione**:
+- Flag `save_attention` in `InferBuffers`; durante la self-attention, salvare `scores` dopo softmax
+- Endpoint `GET /v1/inspect/attention` → JSON con matrici attention
+- Endpoint `GET /v1/inspect/logits` → top-k logits per posizione
+- Tool Python opzionale per visualizzare la heatmap
+
+**Cosa si impara**: l'attention non è "magia", è una matrice di pesi che il modello apprende per puntare a token rilevanti.
+
+---
+
+### Fase 22 — Continuous Batching
+**Obiettivo**: processare un batch di token (uno per richiesta) ad ogni step.
+
+**Perché**: nei server reali, le richieste arrivano in momenti diversi. Se le processiamo una alla volta, la CPU è in idle. Il continuous batching massimizza l'utilizzo.
+
+**Implementazione semplificata**:
+- `RequestQueue` nel server: ogni richiesta ha uno stato (prefill_needed, generating, done)
+- Thread di inferenza in loop:
+  1. Prende tutte le richieste attive
+  2. Prefill per le nuove
+  3. UN forward pass batch con il token corrente di ogni richiesta
+  4. Distribuisce i logits per il sampling
+  5. Marca done le richieste terminate
+- Questo è un continuous batching "statico" ma sufficiente a spiegare il concetto
+
+**Cosa si impara**: la latenza di una singola richiesta aumenta leggermente, ma il **throughput totale** del server aumenta drasticamente. Questo è il trade-off fondamentale nei sistemi di produzione.
 
 ---
 
