@@ -20,6 +20,7 @@ add_executable(eie-llm
   src/shell.cpp
   src/server.cpp
   src/bench.cpp
+  src/prefix_cache.cpp
 )
 
 # Compila ops_avx2.cpp con -mavx2 -mfma per abilitare le intrinseche AVX2.

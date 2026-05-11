@@ -133,6 +133,48 @@ struct KVCache {
 };
 
 // ─────────────────────────────────────────────
+//  Attention Snapshot — salva i pesi attention
+//
+//  Struttura per esportare la matrice di attention
+//  dopo softmax per ogni layer, head, query e key.
+//  Usata dall'endpoint /v1/inspect/attention per
+//  "guardare dentro" il modello.
+//
+//  Dimensione: n_layer × n_head × seq_len × seq_len
+//  Per GPT-2 small con prompt di 10 token:
+//    12 × 12 × 10 × 10 = 14,400 float ≈ 57 KB
+//  Per TinyLlama con prompt di 20 token:
+//    22 × 32 × 20 × 20 = 281,600 float ≈ 1.1 MB
+//  La memoria cresce come O(seq_len²) quindi si
+//  limita ai prompt corti (≤ 100 token).
+// ─────────────────────────────────────────────
+struct AttentionSnapshot {
+    int n_layers = 0;   // numero di layer
+    int n_heads  = 0;   // numero di attention heads
+    int seq_len  = 0;   // lunghezza della sequenza
+
+    // Dati flat: index = ((layer * n_heads + head) * seq_len + q_pos) * seq_len + k_pos
+    std::vector<float> data;
+
+    // Inizializza le dimensioni e alloca la memoria
+    void init(int nl, int nh, int sl) {
+        n_layers = nl;
+        n_heads  = nh;
+        seq_len  = sl;
+        data.assign(static_cast<size_t>(nl) * nh * sl * sl, 0.0f);
+    }
+
+    // Accesso alla cella [layer][head][q][k]
+    float& at(int layer, int head, int q_pos, int k_pos) {
+        return data[static_cast<size_t>(((layer * n_heads + head) * seq_len + q_pos) * seq_len + k_pos)];
+    }
+
+    const float& at(int layer, int head, int q_pos, int k_pos) const {
+        return data[static_cast<size_t>(((layer * n_heads + head) * seq_len + q_pos) * seq_len + k_pos)];
+    }
+};
+
+// ─────────────────────────────────────────────
 //  Buffer temporanei per l'inferenza
 //
 //  Ogni forward step alloca e dealloca decine di
@@ -239,7 +281,9 @@ void embedding_lookup(const float* token_embd, const float* pos_embd, int token_
 // pos     : posizione del token corrente
 // Self-attention GPT-2.
 // Usa bufs.scores come buffer temporaneo per gli attention scores.
-void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs);
+// Se snap != nullptr, salva gli attention scores (post-softmax)
+// nello snapshot per visualizzazione.
+void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs, AttentionSnapshot* snap = nullptr);
 
 // Feed-Forward Network GPT-2.
 // Usa bufs.gate come buffer intermedio (proiezione up).
@@ -247,7 +291,9 @@ void feed_forward(const float* x, float* out, const LayerWeights& lw, const Mode
 
 // Self-attention LLaMA con GQA e RoPE.
 // Usa bufs.Q, bufs.K, bufs.V, bufs.scores come buffer temporanei.
-void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs);
+// Se snap != nullptr, salva gli attention scores (post-softmax)
+// nello snapshot per visualizzazione.
+void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs, AttentionSnapshot* snap = nullptr);
 
 // Feed-forward LLaMA con SwiGLU.
 // Usa bufs.gate e bufs.up come buffer temporanei.
@@ -263,7 +309,8 @@ void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, cons
 // token_id : ID del token corrente
 // pos      : posizione nella sequenza
 // logits   : output [n_vocab] — probabilità grezze
-void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bool bench_mode = false);
+// snap     : se non nullptr, salva gli attention scores
+void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bool bench_mode = false, AttentionSnapshot* snap = nullptr);
 
 // Forward pass BATCH per il prefill.
 //
@@ -280,6 +327,33 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
 // La generazione autoregressiva continua con
 // forward() token per token come al solito.
 void forward_prefill(Model& model, const std::vector<int>& token_ids, std::vector<float>& logits);
+
+// Forward pass BATCH per verifica (Speculative Decoding).
+//
+// Come forward_prefill ma partendo da base_pos e
+// restituendo i logits per OGNI token del batch.
+// Gli attention attendono a TUTTO il contesto precedente.
+//
+// Usato per verificare K token draft in un solo
+// passaggio: confronta argmax(logits_i) con draft_{i+1}.
+void forward_verify(Model& model, const std::vector<int>& token_ids,
+                    int base_pos, std::vector<std::vector<float>>& all_logits);
+
+// Esporta gli attention scores per un prompt.
+//
+// Esegue il forward pass sequenziale su tutti i token
+// del prompt e salva gli attention scores (post-softmax)
+// per ogni layer, head, query e key.
+//
+// Restituisce un JSON con:
+//   - tokens: array di stringhe (i token del prompt)
+//   - layers: array di layer, ognuno con array di head,
+//     ognuno con una matrice [q][k] di pesi attention.
+//
+// max_len: lunghezza massima del prompt (per limitare
+//          la memoria O(seq_len²)). Default 100.
+std::string inspect_attention(Model& model, const Tokenizer& tok,
+                               const std::string& prompt, int max_len = 100);
 
 // ─────────────────────────────────────────────
 //  Parametri di sampling raggruppati

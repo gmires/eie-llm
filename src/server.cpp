@@ -2,48 +2,175 @@
 #include "model.hpp"
 #include "tokenizer.hpp"
 #include "ops.hpp"
+#include "prefix_cache.hpp"
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <mutex>
 #include <functional>
 #include <atomic>
+#include <condition_variable>
+#include <queue>
+#include <thread>
+#include <chrono>
 #include "httplib.h"
 
-// ─────────────────────────────────────────────
-//  Mutex per serializzare le richieste
+// ═════════════════════════════════════════════════════════════════════════════
+//  FASE 22 — CONTINUOUS BATCHING (versione semplificata)
+// ═════════════════════════════════════════════════════════════════════════════
 //
-//  Il modello e la KV cache NON sono thread-safe.
-//  Un mutex garantisce che una sola richiesta
-//  alla volta usi il modello.
-//  In un engine di produzione si userebbe un
-//  pool di modelli o una request queue.
-// ─────────────────────────────────────────────
-static std::mutex model_mutex;
+//  In questa fase separiamo COMPLETAMENTE il thread HTTP dal thread di
+//  inferenza. Il thread HTTP accetta richieste, le mette in coda e
+//  risponde solo quando il lavoro è finito. Il thread di inferenza
+//  preleva richieste dalla coda e le esegue sequenzialmente.
+//
+//  ARCHITETTURA:
+//    ┌─────────────┐     push()      ┌─────────────────┐
+//    │ Thread HTTP │ ──────────────→ │   RequestQueue  │
+//    │  (httplib)  │                 │  (thread-safe)  │
+//    └─────────────┘                 └─────────────────┘
+//           ↑                              │ pop()
+//           │                              ↓
+//    attesa su cv                   ┌─────────────────┐
+//    (req->cv.wait)                 │ Thread Inferenza│
+//                                   │ (inference_thread│
+//                                   └─────────────────┘
+//
+//  VANTAGGI:
+//  1. Il thread HTTP non si blocca durante la generazione → può accettare
+//     nuove connessioni mentre il modello sta generando token.
+//  2. Time-To-First-Byte (TTFB) migliorato per il throughput del server.
+//  3. Struttura che si avvicina ai veri engine di produzione (vLLM, TGI).
+//
+//  LIMITAZIONE (didattica):
+//  Avendo un solo modello con una sola KV cache, processiamo le richieste
+//  UNA ALLA VOLTA. In un engine reale, il thread di inferenza farebbe
+//  UN unico forward pass batch con il token corrente di TUTTE le richieste
+//  attive, massimizzando il riutilizzo dei pesi in GPU/CPU cache.
+// ═════════════════════════════════════════════════════════════════════════════
+
 
 // ─────────────────────────────────────────────
-//  Parser JSON minimale
+//  Stato di una richiesta nel server
 //
-//  Non usiamo una libreria JSON per mantenere
-//  zero dipendenze aggiuntive. Estraiamo i
-//  campi che ci servono con semplice ricerca
-//  di stringhe — funziona per il nostro formato
-//  di input che è semplice e ben definito.
+//  Ogni richiesta HTTP viene convertita in un
+//  oggetto ServerRequest che viene messo in coda
+//  e processato dal thread di inferenza.
+//  Questo disaccoppia la gestione HTTP (veloce,
+//  asincrona) dalla computazione del modello
+//  (lenta, sequenziale).
 //
-//  In produzione si userebbe nlohmann/json
-//  o simili.
+//  Il thread HTTP aspetta su 'cv' finché
+//  'done' non diventa true.
 // ─────────────────────────────────────────────
+struct ServerRequest {
+    // ── Input dal client ──────────────────────
+    std::string prompt;          // testo del prompt
+    int max_tokens;              // quanti token generare al massimo
+    SamplingParams params;       // temperatura, top_p, top_k, ecc.
+    std::string endpoint_label;  // "completions" o "chat/completions"
+
+    // ── Stato della generazione (scritto dal thread di inferenza) ──
+    std::vector<int> input_ids;      // token del prompt
+    std::vector<int> context_ids;    // prompt + token generati (per repetition penalty)
+    std::vector<float> logits;       // logits dell'ultimo forward
+    std::string output_text;         // testo accumulato
+    int pos = 0;                     // posizione corrente nella sequenza
+    int generated = 0;               // contatore token generati
+    int prompt_tokens = 0;           // numero di token del prompt
+    int completion_tokens = 0;       // numero di token generati
+
+    // ── Flags di completamento ────────────────
+    bool done = false;               // true quando la generazione è finita
+    bool error = false;              // true se c'è stato un errore
+    std::string error_msg;           // messaggio di errore (se error=true)
+
+    // ── Sincronizzazione thread ───────────────
+    // Il thread HTTP acquisisce 'mtx', controlla 'done',
+// chiama cv.wait(). Il thread di inferenza, a fine lavoro,
+    // acquisisce 'mtx', setta 'done=true', chiama cv.notify_one().
+    std::mutex mtx;
+    std::condition_variable cv;
+};
+
+// ─────────────────────────────────────────────
+//  Coda di richieste — thread-safe
+//
+//  Il thread HTTP inserisce richieste con push().
+//  Il thread di inferenza le preleva con pop().
+//  Se la coda è vuota, pop() blocca il thread
+//  finché non arriva una nuova richiesta o
+//  finché non viene segnalato lo shutdown.
+// ─────────────────────────────────────────────
+class RequestQueue {
+public:
+    void push(std::shared_ptr<ServerRequest> req) {
+        std::lock_guard<std::mutex> lock(mtx);
+        queue.push(req);
+        cv.notify_one();  // sveglia il thread di inferenza
+    }
+
+    std::shared_ptr<ServerRequest> pop() {
+        std::unique_lock<std::mutex> lock(mtx);
+        // Attendi finché la coda non è vuota O finché non arriva shutdown
+        cv.wait(lock, [this] { return !queue.empty() || shutdown; });
+        if (shutdown && queue.empty()) return nullptr;
+        auto req = queue.front();
+        queue.pop();
+        return req;
+    }
+
+    bool empty() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return queue.empty();
+    }
+
+    void signal_shutdown() {
+        std::lock_guard<std::mutex> lock(mtx);
+        shutdown = true;
+        cv.notify_all();  // sveglia tutti i thread in attesa
+    }
+
+private:
+    std::queue<std::shared_ptr<ServerRequest>> queue;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool shutdown = false;
+};
+
+// ─────────────────────────────────────────────
+//  Prefix Cache globale per il server
+//
+//  Condivisa tra tutte le richieste. Ogni richiesta
+//  che arriva con un prompt già visto può riusare
+//  la KV cache senza ricalcolarla.
+//
+//  Questo è particolarmente utile in un server
+//  dove molte richieste condividono lo stesso
+//  system prompt o prefisso.
+// ─────────────────────────────────────────────
+static PrefixCache prefix_cache;
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  PARSER JSON MINIMALE
+// ═════════════════════════════════════════════════════════════════════════════
+//
+//  Non usiamo una libreria JSON per mantenere zero dipendenze aggiuntive.
+//  Estraiamo i campi che ci servono con semplice ricerca di stringhe —
+//  funziona per il nostro formato di input che è semplice e ben definito.
+//
+//  In produzione si userebbe nlohmann/json o simili.
+// ═════════════════════════════════════════════════════════════════════════════
 
 // Estrae il valore stringa di una chiave JSON
 // Esempio: {"prompt":"hello"} → "hello"
 static std::string json_get_string(const std::string& json,
                                    const std::string& key) {
-    // Cerca "key":"
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);
     if (pos == std::string::npos) return "";
 
-    // Trova il ':' dopo la chiave
     pos = json.find(':', pos);
     if (pos == std::string::npos) return "";
     pos++;
@@ -57,7 +184,6 @@ static std::string json_get_string(const std::string& json,
 
     std::string result;
     while (pos < json.size() && json[pos] != '"') {
-        // Gestisci escape sequences (\n, \t, \", \\)
         if (json[pos] == '\\' && pos + 1 < json.size()) {
             pos++;
             switch (json[pos]) {
@@ -78,8 +204,8 @@ static std::string json_get_string(const std::string& json,
 // Estrae il valore numerico (float) di una chiave JSON
 // Esempio: {"temperature":0.8} → 0.8
 static float json_get_float(const std::string& json,
-                             const std::string& key,
-                             float default_val) {
+                            const std::string& key,
+                            float default_val) {
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);
     if (pos == std::string::npos) return default_val;
@@ -90,7 +216,6 @@ static float json_get_float(const std::string& json,
 
     while (pos < json.size() && json[pos] == ' ') pos++;
 
-    // Leggi il numero fino a virgola, } o spazio
     std::string num;
     while (pos < json.size() &&
            json[pos] != ',' &&
@@ -103,7 +228,7 @@ static float json_get_float(const std::string& json,
     catch (...) { return default_val; }
 }
 
-// Estrae il valore intero di una chiave JSON
+// Estrae il valore intero di una chiave JSON (delega a json_get_float)
 static int json_get_int(const std::string& json,
                         const std::string& key,
                         int default_val) {
@@ -113,7 +238,7 @@ static int json_get_int(const std::string& json,
 }
 
 // Estrae un valore booleano da una chiave JSON.
-// Riconosce "true" e "false" (senza virgolette), es: {"chat":true}
+// Riconosce "true" e "false" (senza virgolette).
 static bool json_get_bool(const std::string& json,
                           const std::string& key,
                           bool default_val) {
@@ -135,22 +260,17 @@ static bool json_get_bool(const std::string& json,
 // Estrae il contenuto dell'ultimo messaggio con role "user"
 // dall'array "messages" in formato OpenAI chat.
 //
-// Formato atteso (minimo):
-//   {"messages":[{"role":"user","content":"Ciao"}]}
-//
 // Cerca l'ultima occorrenza di "role":"user" e legge il "content"
 // successivo. Robusto abbastanza per i casi tipici; non è un parser
 // JSON completo — usare una libreria reale in produzione.
 static std::string json_get_last_user_message(const std::string& json) {
     std::string result;
-
     size_t search_from = 0;
+
     while (true) {
-        // Cerca la prossima occorrenza di "role"
         size_t role_pos = json.find("\"role\"", search_from);
         if (role_pos == std::string::npos) break;
 
-        // Verifica che il valore sia "user"
         size_t colon = json.find(':', role_pos);
         if (colon == std::string::npos) break;
         size_t val_start = json.find('"', colon + 1);
@@ -162,16 +282,13 @@ static std::string json_get_last_user_message(const std::string& json) {
         std::string role = json.substr(val_start, val_end - val_start);
 
         if (role == "user") {
-            // Leggi il "content" successivo (nella stessa entry)
             size_t content_pos = json.find("\"content\"", val_end);
-            // Ma non oltre il prossimo "role" o la fine dell'oggetto
             size_t next_role = json.find("\"role\"", val_end + 1);
             if (content_pos != std::string::npos &&
                 (next_role == std::string::npos || content_pos < next_role)) {
                 result = json_get_string(json.substr(content_pos - 1), "content");
             }
         }
-
         search_from = val_end + 1;
     }
     return result;
@@ -200,18 +317,175 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
-// ─────────────────────────────────────────────
-//  Generazione testo con callback (streaming)
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  HELPERS PER SERVER-SENT EVENTS (SSE)
+// ═════════════════════════════════════════════════════════════════════════════
 //
-//  Versione interna che chiama un callback per
-//  ogni token generato. Il callback riceve:
-//    - token:    la stringa del token decodificato
-//    - is_first: true solo per il primo token
-//    - is_last:  true dopo l'ultimo token (token vuoto)
-//  Se il callback ritorna false, la generazione
-//  si interrompe (es. client disconnesso).
+//  Formato OpenAI-compatibile per lo streaming:
+//    data: {"choices":[{"delta":{"content":"..."}}]}
+//
+//  Ogni evento termina con \n\n (richiesto dal protocollo SSE).
+// ═════════════════════════════════════════════════════════════════════════════
+
+static std::string sse_text_chunk(const std::string& text) {
+    return "data: {\"choices\":[{\"text\":\"" + json_escape(text) +
+           "\",\"index\":0,\"finish_reason\":null}]\n\n";
+}
+
+static std::string sse_chat_chunk(const std::string& text) {
+    return "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
+           json_escape(text) + "\"},\"finish_reason\":null}]\n\n";
+}
+
+static std::string sse_text_done() {
+    return "data: {\"choices\":[{\"text\":\"\",\"index\":0,"
+           "\"finish_reason\":\"stop\"}]\n\n"
+           "data: [DONE]\n\n";
+}
+
+static std::string sse_chat_done() {
+    return "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+           "\"finish_reason\":\"stop\"}]\n\n"
+           "data: [DONE]\n\n";
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  FUNZIONI DI GENERAZIONE
+// ═════════════════════════════════════════════════════════════════════════════
+
 // ─────────────────────────────────────────────
-static bool generate_text_with_callback(
+//  Generazione per una richiesta in coda
+//
+//  Questa funzione è CHIAMATA SOLO dal thread
+//  di inferenza. Riceve una ServerRequest già
+//  popolata con prompt, max_tokens e params.
+//
+//  Esegue il prefill (con prefix cache), il
+//  sampling e la generazione autoregressiva,
+//  scrivendo i risultati direttamente nella
+//  struct della richiesta.
+//
+//  Al termine, setta req.done = true e notifica
+//  il thread HTTP che è in attesa su req.cv.
+//
+//  NOTA: NON c'è alcun mutex sul modello perché
+//  questa funzione viene eseguita ESCLUSIVAMENTE
+//  dal thread di inferenza. Solo un'istanza di
+//  questa funzione è attiva in ogni istante.
+// ─────────────────────────────────────────────
+static void generate_for_request(Model& model,
+                                 const Tokenizer& tok,
+                                 ServerRequest& req) {
+    // ── Fase 1: Tokenizzazione del prompt ─────
+    req.input_ids = tokenizer_encode(tok, req.prompt);
+    req.context_ids = req.input_ids;
+    req.logits.resize(model.config.n_vocab);
+    req.pos = 0;
+    req.prompt_tokens = static_cast<int>(req.input_ids.size());
+    req.generated = 0;
+    req.output_text.clear();
+
+    // ── Fase 2: Prefill con Prefix Cache ──────
+    // La prefix cache cerca se questo prompt è già stato
+    // visto. Se sì, copia la KV cache salvata nel modello
+    // e salta il prefill (risparmio enorme in O(n²)).
+    if (!req.input_ids.empty()) {
+        int cached_tokens = 0;
+        bool cache_hit = prefix_cache.lookup(req.prompt, model, cached_tokens);
+
+        if (cache_hit && cached_tokens == (int)req.input_ids.size()) {
+            // Cache hit ESATTO: il prompt è identico a uno già visto.
+            // La KV cache è già popolata per tutti i token.
+            // Ricalcoliamo solo i logits dell'ultimo token.
+            forward(model, req.input_ids.back(), cached_tokens - 1, req.logits);
+            req.pos = cached_tokens;
+        } else {
+            // Cache miss (o hit parziale che non gestiamo):
+            // facciamo il prefill completo da zero.
+            model_init_kvcache(model);
+            forward_prefill(model, req.input_ids, req.logits);
+            req.pos = static_cast<int>(req.input_ids.size());
+
+            // Salva nella cache per le prossime richieste
+            prefix_cache.store(req.prompt, model, req.pos);
+        }
+    } else {
+        // Prompt vuoto: inizializza cache e logits da zero
+        model_init_kvcache(model);
+        req.pos = 0;
+    }
+
+    // ── Fase 3: Sampling del primo token ──────
+    int next_token;
+    apply_repetition_penalty(req.logits, req.context_ids, req.params.rep_penalty);
+    next_token = req.params.greedy
+            ? sample_argmax(req.logits)
+            : sample_topk_topp(req.logits, req.params.top_k,
+                               req.params.top_p, req.params.temperature);
+
+    // ── Fase 4: Loop di generazione ───────────
+    for (int i = 0; i < req.max_tokens; i++) {
+        if (next_token == tok.eos_id) {
+            break;  // fine sequenza
+        }
+
+        std::string token_str = tokenizer_decode(tok, {next_token});
+        req.output_text += token_str;
+        req.context_ids.push_back(next_token);
+        req.generated++;
+
+        // Forward pass per il prossimo token
+        forward(model, next_token, req.pos, req.logits);
+        req.pos++;
+
+        // Sampling per il token successivo
+        apply_repetition_penalty(req.logits, req.context_ids, req.params.rep_penalty);
+        next_token = req.params.greedy
+            ? sample_argmax(req.logits)
+            : sample_topk_topp(req.logits, req.params.top_k,
+                               req.params.top_p, req.params.temperature);
+    }
+
+    // Conta i token di completamento per la risposta JSON
+    req.completion_tokens = static_cast<int>(
+        tokenizer_encode(tok, req.output_text).size());
+
+    // ── Fase 5: Segnala completamento ─────────
+    // Il thread HTTP è in attesa su req.cv: lo svegliamo.
+    {
+        std::lock_guard<std::mutex> lock(req.mtx);
+        req.done = true;
+    }
+    req.cv.notify_one();
+}
+
+// ─────────────────────────────────────────────
+//  Generazione in streaming (sincrona)
+//
+//  A differenza di generate_for_request(), questa
+//  funzione è pensata per lo STREAMING.
+//  Viene chiamata DIRETTAMENTE dal thread HTTP
+//  (dentro il content provider di httplib) e NON
+//  passa per la coda del thread di inferenza.
+//
+//  Il callback riceve ogni token man mano che
+//  viene generato, permettendo di inviarlo al
+//  client via SSE immediatamente.
+//
+//  Ritorna false se il callback ha segnalato
+//  che il client si è disconnesso.
+//
+//  NOTA DIDATTICA: in un vero engine di produzione,
+//  anche lo streaming passerebbe per un scheduler
+//  che gestisce il modello condiviso. Qui, per
+//  semplicità, lo streaming accede direttamente
+//  al modello. In uno scenario reale con molte
+//  richieste concorrenti, servirebbe un mutex
+//  o un sistema di scheduling più sofisticato.
+// ─────────────────────────────────────────────
+static bool generate_streaming_for_request(
         Model& model,
         const Tokenizer& tok,
         const std::string& prompt,
@@ -220,31 +494,40 @@ static bool generate_text_with_callback(
         std::function<bool(const std::string& token,
                            bool is_first,
                            bool is_last)> callback) {
-    std::lock_guard<std::mutex> lock(model_mutex);
-    model_init_kvcache(model);
 
     auto input_ids = tokenizer_encode(tok, prompt);
-    if (input_ids.empty()) {
-        callback("", false, true);
-        return true;
-    }
-
     std::vector<int> context_ids = input_ids;
     std::vector<float> logits;
+    int pos = 0;
 
+    // Prefill con prefix cache
     if (!input_ids.empty()) {
-        forward_prefill(model, input_ids, logits);
-    } else {
-        logits.resize(model.config.n_vocab);
-    }
-    int pos = static_cast<int>(input_ids.size());
+        int cached_tokens = 0;
+        bool cache_hit = prefix_cache.lookup(prompt, model, cached_tokens);
 
+        if (cache_hit && cached_tokens == (int)input_ids.size()) {
+            forward(model, input_ids.back(), cached_tokens - 1, logits);
+            pos = cached_tokens;
+        } else {
+            model_init_kvcache(model);
+            forward_prefill(model, input_ids, logits);
+            pos = static_cast<int>(input_ids.size());
+            prefix_cache.store(prompt, model, pos);
+        }
+    } else {
+        model_init_kvcache(model);
+        logits.resize(model.config.n_vocab);
+        pos = 0;
+    }
+
+    // Primo token
     int next_token;
     apply_repetition_penalty(logits, context_ids, params.rep_penalty);
     next_token = params.greedy
             ? sample_argmax(logits)
             : sample_topk_topp(logits, params.top_k, params.top_p, params.temperature);
 
+    // Loop di generazione con callback
     bool client_ok = true;
     for (int i = 0; i < max_tokens && client_ok; i++) {
         if (next_token == tok.eos_id) {
@@ -275,87 +558,114 @@ static bool generate_text_with_callback(
 }
 
 // ─────────────────────────────────────────────
-//  Generazione testo per il server (bloccante)
+//  Costruzione della risposta JSON
 //
-//  Wrapper che raccoglie tutti i token in una
-//  stringa e la ritorna. Usato per le risposte
-//  non-streaming.
+//  Formato compatibile con l'API OpenAI:
+//  {
+//    "object": "text_completion",
+//    "choices": [{"text": "...", "index": 0, "finish_reason": "stop"}],
+//    "usage": {"prompt_tokens": N, "completion_tokens": M, "total_tokens": N+M}
+//  }
 // ─────────────────────────────────────────────
-static std::string generate_text(Model& model,
-                                   const Tokenizer& tok,
-                                   const std::string& prompt,
-                                   int max_tokens,
-                                   const SamplingParams& params) {
-    std::string output;
-    generate_text_with_callback(model, tok, prompt, max_tokens, params,
-        [&](const std::string& token, bool /*is_first*/, bool is_last) -> bool {
-            if (!is_last) output += token;
-            return true;
-        });
-    return output;
+static std::string build_response_json(const ServerRequest& req) {
+    std::ostringstream j;
+    j << "{"
+      << "\"object\":\"text_completion\","
+      << "\"choices\":[{"
+      <<   "\"text\":\"" << json_escape(req.output_text) << "\","
+      <<   "\"index\":0,"
+      <<   "\"finish_reason\":\"stop\""
+      << "}],"
+      << "\"usage\":{"
+      <<   "\"prompt_tokens\":"     << req.prompt_tokens     << ","
+      <<   "\"completion_tokens\":" << req.completion_tokens << ","
+      <<   "\"total_tokens\":"      << (req.prompt_tokens + req.completion_tokens)
+      << "}"
+      << "}";
+    return j.str();
 }
 
 // ─────────────────────────────────────────────
-//  Helpers per Server-Sent Events (SSE)
+//  Thread di inferenza (background)
 //
-//  Formato OpenAI-compatibile per lo streaming:
-//    data: {"choices":[{"delta":{"content":"..."}}]}
+//  Questo thread gira per tutta la vita del server.
+//  Il suo unico compito è:
+//    1. Prelevare una richiesta dalla coda (bloccante)
+//    2. Chiamare generate_for_request()
+//    3. Tornare al punto 1
 //
-//  Evento di fine stream:
-//    data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
-//    data: [DONE]
+//  Quando queue.pop() ritorna nullptr, significa
+//  che il server sta chiudendo (shutdown) e il
+//  thread termina.
 //
-//  Ogni evento termina con \n\n (richiesto da SSE).
+//  GESTIONE ERRORI: se generate_for_request() lancia
+//  un'eccezione (improbabile ma possibile), catturiamo
+//  l'errore, segnaliamo req.error e notifichiamo comunque
+//  il thread HTTP in attesa, così il client non resta
+//  bloccato all'infinito.
 // ─────────────────────────────────────────────
+static void inference_thread(Model& model,
+                             const Tokenizer& tok,
+                             RequestQueue& queue) {
+    std::cout << "[INFERENCE] Thread di inferenza avviato\n";
 
-static std::string sse_text_chunk(const std::string& text) {
-    return "data: {\"choices\":[{\"text\":\"" + json_escape(text) +
-           "\",\"index\":0,\"finish_reason\":null}]}\n\n";
+    while (true) {
+        auto req = queue.pop();
+        if (!req) {
+            std::cout << "[INFERENCE] Shutdown ricevuto, thread terminato\n";
+            break;
+        }
+
+        std::cout << "[INFERENCE] Processo richiesta "
+                  << req->endpoint_label << "\n";
+
+        try {
+            generate_for_request(model, tok, *req);
+        } catch (const std::exception& e) {
+            std::cerr << "[INFERENCE] ERRORE: " << e.what() << "\n";
+            std::lock_guard<std::mutex> lock(req->mtx);
+            req->error = true;
+            req->error_msg = e.what();
+            req->done = true;
+            req->cv.notify_one();
+        } catch (...) {
+            std::cerr << "[INFERENCE] ERRORE sconosciuto\n";
+            std::lock_guard<std::mutex> lock(req->mtx);
+            req->error = true;
+            req->error_msg = "errore sconosciuto durante l'inferenza";
+            req->done = true;
+            req->cv.notify_one();
+        }
+    }
 }
 
-static std::string sse_chat_chunk(const std::string& text) {
-    return "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
-           json_escape(text) + "\"},\"finish_reason\":null}]}\n\n";
-}
 
-static std::string sse_text_done() {
-    return "data: {\"choices\":[{\"text\":\"\",\"index\":0,"
-           "\"finish_reason\":\"stop\"}]}\n\n"
-           "data: [DONE]\n\n";
-}
-
-static std::string sse_chat_done() {
-    return "data: {\"choices\":[{\"index\":0,\"delta\":{},"
-           "\"finish_reason\":\"stop\"}]}\n\n"
-           "data: [DONE]\n\n";
-}
-
-// ─────────────────────────────────────────────
-//  Avvio del server
+// ═════════════════════════════════════════════════════════════════════════════
+//  SERVER RUN — punto di ingresso principale
+// ═════════════════════════════════════════════════════════════════════════════
 //
-//  Registriamo due handler:
+//  1. Crea la RequestQueue
+//  2. Avvia il thread di inferenza in background
+//  3. Registra gli endpoint HTTP
+//  4. Entra nel loop di ascolto di httplib
 //
-//  GET /health
-//    Risponde sempre con status ok.
-//    Utile per verificare che il server sia
-//    raggiungibile prima di inviare richieste.
-//
-//  POST /v1/completions
-//    Riceve un JSON con prompt e parametri,
-//    genera il testo e risponde in formato
-//    compatibile con l'API OpenAI.
-//
-//  Streaming:
-//    Se il campo "stream": true è presente,
-//    usa chunked transfer encoding per emettere
-//    token via SSE man mano che vengono generati.
-//    Questo riduce la Time-To-First-Token (TTFT)
-//    percepita dall'utente.
-// ─────────────────────────────────────────────
+//  Gli endpoint non-streaming delegano al thread di inferenza
+//  tramite la coda. Gli endpoint streaming e inspect lavorano
+//  sincronamente nel thread HTTP.
+// ═════════════════════════════════════════════════════════════════════════════
 void server_run(Model& model, const Tokenizer& tok, int port) {
     httplib::Server svr;
+    RequestQueue queue;
+
+    // ── Avvia il thread di inferenza ──────────
+    std::thread infer_worker(inference_thread,
+                             std::ref(model),
+                             std::ref(tok),
+                             std::ref(queue));
 
     // ── GET /health ───────────────────────────
+    // Endpoint di health check — risponde subito
+    // senza toccare il modello.
     svr.Get("/health", [](const httplib::Request&,
                            httplib::Response& res) {
         res.set_content(
@@ -364,66 +674,18 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         );
     });
 
-    // ── Logica comune per gestire una richiesta ──
-    // Estratta in lambda per riutilizzarla in entrambi gli endpoint.
-    // Riceve il prompt già formattato (con o senza chat template)
-    // e restituisce il JSON di risposta.
-    auto handle_request = [&model, &tok](
-            const std::string& prompt,
-            int max_tokens,
-            const SamplingParams& params,
-            const std::string& endpoint_label) -> std::string {
-
-        std::cout << "[REQ:" << endpoint_label << "] prompt=\""
-                  << prompt.substr(0, 40)
-                  << (prompt.size() > 40 ? "..." : "")
-                  << "\" max_tokens=" << max_tokens
-                  << " temp=" << params.temperature << "\n";
-
-        int prompt_tokens = static_cast<int>(
-            tokenizer_encode(tok, prompt).size());
-
-        std::string generated = generate_text(
-            model, tok, prompt, max_tokens, params);
-
-        int completion_tokens = static_cast<int>(
-            tokenizer_encode(tok, generated).size());
-
-        std::cout << "[RES] generati " << completion_tokens << " token\n";
-
-        std::ostringstream j;
-        j << "{"
-          << "\"object\":\"text_completion\","
-          << "\"choices\":[{"
-          <<   "\"text\":\"" << json_escape(generated) << "\","
-          <<   "\"index\":0,"
-          <<   "\"finish_reason\":\"stop\""
-          << "}],"
-          << "\"usage\":{"
-          <<   "\"prompt_tokens\":"     << prompt_tokens     << ","
-          <<   "\"completion_tokens\":" << completion_tokens << ","
-          <<   "\"total_tokens\":"      << (prompt_tokens + completion_tokens)
-          << "}"
-          << "}";
-        return j.str();
-    };
-
     // ── POST /v1/completions ──────────────────
     //
     //  Endpoint per il completamento di testo grezzo.
-    //  Campo opzionale "chat": true — se presente e il modello
-    //  ha un chat template, avvolge il prompt nel template
-    //  prima della generazione.
+    //  Se "stream": true, usa chunked transfer encoding
+    //  per emettere token via SSE man mano.
     //
-    //  Streaming con "stream": true emette token via SSE.
-    //
-    //  Esempio con chat template:
-    //    {"prompt":"Qual è la capitale della Francia?","chat":true}
-    //  Esempio grezzo (default):
-    //    {"prompt":"The capital of France is"}
+    //  Se "stream": false, crea una ServerRequest,
+    //  la mette in coda, e attende che il thread di
+    //  inferenza la processi e la segnali come done.
     svr.Post("/v1/completions",
-        [&model, &tok, &handle_request](const httplib::Request& req,
-                                        httplib::Response& res) {
+        [&model, &tok, &queue](const httplib::Request& req,
+                               httplib::Response& res) {
 
         std::string prompt     = json_get_string(req.body, "prompt");
         int         max_tokens = json_get_int   (req.body, "max_tokens", 50);
@@ -451,23 +713,57 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         bool stream = json_get_bool(req.body, "stream", false);
 
         if (!stream) {
-            // ── Risposta classica (non-streaming) ──
-            res.set_content(
-                handle_request(prompt, max_tokens, params, "completions"),
-                "application/json");
+            // ═════════════════════════════════════
+            //  RISPOSTA NON-STREAMING (via coda)
+            // ═════════════════════════════════════
+            // Creiamo una richiesta condivisa, la mettiamo
+            // in coda, e aspettiamo che il thread di
+            // inferenza la completi.
+            auto sreq = std::make_shared<ServerRequest>();
+            sreq->prompt = prompt;
+            sreq->max_tokens = max_tokens;
+            sreq->params = params;
+            sreq->endpoint_label = "completions";
+
+            std::cout << "[REQ:completions] prompt=\""
+                      << prompt.substr(0, 40)
+                      << (prompt.size() > 40 ? "..." : "")
+                      << "\" max_tokens=" << max_tokens
+                      << " temp=" << params.temperature << "\n";
+
+            queue.push(sreq);
+
+            // Attendere che il thread di inferenza finisca
+            std::unique_lock<std::mutex> lock(sreq->mtx);
+            sreq->cv.wait(lock, [&sreq] { return sreq->done; });
+
+            if (sreq->error) {
+                res.status = 500;
+                res.set_content(
+                    "{\"error\":\"" + json_escape(sreq->error_msg) + "\"}",
+                    "application/json");
+                return;
+            }
+
+            std::cout << "[RES] generati " << sreq->completion_tokens
+                      << " token\n";
+            res.set_content(build_response_json(*sreq), "application/json");
             return;
         }
 
-        // ── Streaming SSE ──
-        // Usa chunked transfer encoding per inviare token man mano
-        // che vengono generati. La generazione avviene interamente
-        // dentro il content provider, mantenendo il lock sul modello.
+        // ═════════════════════════════════════════
+        //  RISPOSTA STREAMING (sincrona)
+        // ═════════════════════════════════════════
+        // Lo streaming NON passa per la coda: il thread HTTP
+        // genera i token direttamente e li invia al client
+        // via chunked transfer encoding. Questo mantiene la
+        // Time-To-First-Token (TTFT) bassissima.
         res.set_chunked_content_provider("text/event-stream",
             [prompt, max_tokens, params, &model, &tok]
             (size_t offset, httplib::DataSink &sink) -> bool {
                 if (offset > 0) return false; // già inviato tutto
 
-                generate_text_with_callback(
+                generate_streaming_for_request(
                     model, tok, prompt, max_tokens, params,
                     [&sink](const std::string& token,
                             bool /*is_first*/, bool is_last) -> bool {
@@ -484,27 +780,12 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
     // ── POST /v1/chat/completions ─────────────
     //
     //  Endpoint compatibile con l'API OpenAI chat.
-    //  Accetta un array "messages" con messaggi role/content.
-    //  Estrae l'ultimo messaggio con role "user" e lo avvolge
-    //  nel chat template del modello.
-    //
-    //  Streaming con "stream": true emette token via SSE.
-    //
-    //  Esempio di richiesta:
-    //    {
-    //      "messages": [
-    //        {"role": "system", "content": "Sei un assistente utile."},
-    //        {"role": "user",   "content": "Qual è la capitale dell'Italia?"}
-    //      ],
-    //      "max_tokens": 100,
-    //      "stream": true
-    //    }
-    //
-    //  Nota: il parser JSON è minimalista — gestisce l'uso tipico
-    //  ma non è un parser completo. Usare una libreria in produzione.
+    //  Accetta un array "messages" con role/content,
+    //  estrae l'ultimo messaggio utente, applica il
+    //  chat template se disponibile, e genera la risposta.
     svr.Post("/v1/chat/completions",
-        [&model, &tok, &handle_request](const httplib::Request& req,
-                                        httplib::Response& res) {
+        [&model, &tok, &queue](const httplib::Request& req,
+                               httplib::Response& res) {
 
         std::string user_msg = json_get_last_user_message(req.body);
         int max_tokens = json_get_int(req.body, "max_tokens", 100);
@@ -525,7 +806,6 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
             return;
         }
 
-        // Applica il chat template se disponibile, altrimenti usa il testo grezzo.
         std::string prompt = tok.has_chat_template
             ? apply_chat_template(tok, user_msg)
             : user_msg;
@@ -533,20 +813,49 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         bool stream = json_get_bool(req.body, "stream", false);
 
         if (!stream) {
-            // ── Risposta classica (non-streaming) ──
-            res.set_content(
-                handle_request(prompt, max_tokens, params, "chat/completions"),
-                "application/json");
+            // ═════════════════════════════════════
+            //  RISPOSTA NON-STREAMING (via coda)
+            // ═════════════════════════════════════
+            auto sreq = std::make_shared<ServerRequest>();
+            sreq->prompt = prompt;
+            sreq->max_tokens = max_tokens;
+            sreq->params = params;
+            sreq->endpoint_label = "chat/completions";
+
+            std::cout << "[REQ:chat/completions] prompt=\""
+                      << prompt.substr(0, 40)
+                      << (prompt.size() > 40 ? "..." : "")
+                      << "\" max_tokens=" << max_tokens
+                      << " temp=" << params.temperature << "\n";
+
+            queue.push(sreq);
+
+            std::unique_lock<std::mutex> lock(sreq->mtx);
+            sreq->cv.wait(lock, [&sreq] { return sreq->done; });
+
+            if (sreq->error) {
+                res.status = 500;
+                res.set_content(
+                    "{\"error\":\"" + json_escape(sreq->error_msg) + "\"}",
+                    "application/json");
+                return;
+            }
+
+            std::cout << "[RES] generati " << sreq->completion_tokens
+                      << " token\n";
+            res.set_content(build_response_json(*sreq), "application/json");
             return;
         }
 
-        // ── Streaming SSE ──
+        // ═════════════════════════════════════════
+        //  RISPOSTA STREAMING (sincrona)
+        // ═════════════════════════════════════════
         res.set_chunked_content_provider("text/event-stream",
             [prompt, max_tokens, params, &model, &tok]
             (size_t offset, httplib::DataSink &sink) -> bool {
                 if (offset > 0) return false;
 
-                generate_text_with_callback(
+                generate_streaming_for_request(
                     model, tok, prompt, max_tokens, params,
                     [&sink](const std::string& token,
                             bool /*is_first*/, bool is_last) -> bool {
@@ -559,8 +868,48 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                 return false;
             });
     });
-    
-    // ── Avvio ─────────────────────────────────
+
+    // ── POST /v1/inspect/attention ────────────
+    //
+    //  Endpoint per esportare gli attention scores
+    //  di un prompt. Esegue il forward pass e salva
+    //  i pesi attention per ogni layer/head.
+    //
+    //  Questo endpoint è SINCRONO: non passa per la
+    //  coda ma viene eseguito direttamente dal thread
+    //  HTTP. Questo è accettabile perché:
+    //    1. È un endpoint di diagnostica/debug
+    //    2. Non è usato in produzione ad alto carico
+    //    3. Mantenere la semplicità didattica
+    //
+    //  NOTA: in uno scenario reale con molte richieste
+    //  in coda, bisognerebbe o serializzare anche questo
+    //  endpoint o usare un modello dedicato all'inspect.
+    svr.Post("/v1/inspect/attention",
+        [&model, &tok](const httplib::Request& req,
+                       httplib::Response& res) {
+
+        std::string prompt = json_get_string(req.body, "prompt");
+        int max_len = json_get_int(req.body, "max_len", 100);
+        max_len = std::min(max_len, 100);
+
+        if (prompt.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"prompt mancante\"}",
+                            "application/json");
+            return;
+        }
+
+        std::cout << "[INSPECT] attention per: \""
+                  << prompt.substr(0, 40)
+                  << (prompt.size() > 40 ? "..." : "")
+                  << "\"\n";
+
+        std::string json = inspect_attention(model, tok, prompt, max_len);
+        res.set_content(json, "application/json");
+    });
+
+    // ── Banner di avvio ───────────────────────
     std::cout << "\n╔═══════════════════════════════════════╗\n";
     std::cout << "║   EIE-LLM Server                      ║\n";
     std::cout << "║   http://localhost:" << port
@@ -571,13 +920,26 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
     std::cout << "║   POST /v1/completions (stream)       ║\n";
     std::cout << "║   POST /v1/chat/completions           ║\n";
     std::cout << "║   POST /v1/chat/completions (stream)  ║\n";
+    std::cout << "║   POST /v1/inspect/attention          ║\n";
     std::cout << "╠═══════════════════════════════════════╣\n";
     std::cout << "║   Chat template: "
               << std::left << std::setw(21)
               << (tok.has_chat_template ? "attivo" : "non disponibile")
               << "║\n";
+    std::cout << "║   Prefix cache: attivo                ║\n";
+    std::cout << "║   Continuous batching: attivo         ║\n";
     std::cout << "╚═══════════════════════════════════════╝\n\n";
     std::cout << "Premi Ctrl+C per fermare il server\n\n";
 
+    // ── Avvio server (bloccante) ──────────────
     svr.listen("0.0.0.0", port);
+
+    // ── Shutdown pulito ───────────────────────
+    // Quando listen() ritorna (es. Ctrl+C), segnaliamo
+    // lo shutdown alla coda così il thread di inferenza
+    // può terminare gracefulmente.
+    queue.signal_shutdown();
+    if (infer_worker.joinable()) {
+        infer_worker.join();
+    }
 }

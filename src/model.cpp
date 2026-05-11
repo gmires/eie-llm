@@ -1,10 +1,29 @@
 #include "model.hpp"
+#include "tokenizer.hpp"
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <unordered_set>
+
+// Helper locale: escape caratteri speciali per JSON
+static std::string json_escape_local(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
 
 // ─────────────────────────────────────────────
 //  Helper: leggi uint32 dai metadata
@@ -380,7 +399,7 @@ void embedding_lookup(const float* token_embd, const float* pos_embd, int token_
 //  - al passo pos=n Q viene da pos n,
 //    ma K e V vengono da pos 0..n
 // ─────────────────────────────────────────────
-void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs) {
+void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs, AttentionSnapshot* snap) {
 
     const int n_embd  = cfg.n_embd;
     const int n_head  = cfg.n_head;
@@ -431,6 +450,16 @@ void self_attention(const float* x, float* out, const LayerWeights& lw, KVCache&
         }
 
         softmax(bufs.scores.data(), pos + 1);
+
+        // Salva gli attention scores nello snapshot (se richiesto)
+        // Gli scores dopo softmax sono i pesi di attenzione che
+        // indicano "quanto" ogni token precedente influenza il token
+        // corrente. Questi sono i dati per la heatmap.
+        if (snap) {
+            for (int t = 0; t <= pos; t++) {
+                snap->at(layer, h, pos, t) = bufs.scores[t];
+            }
+        }
 
         float* acc_h = bufs.attn_acc.data() + h_off;
         for (int t = 0; t <= pos; t++) {
@@ -502,7 +531,7 @@ void feed_forward(const float* x, float* out,
 //     condivide lo stesso head K e V
 //     kv_head = q_head / (n_head / n_head_kv)
 // ─────────────────────────────────────────────
-void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs) {
+void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KVCache& cache, const ModelConfig& cfg, int layer, int pos, InferBuffers& bufs, AttentionSnapshot* snap) {
 
     const int n_head    = cfg.n_head;
     const int n_head_kv = cfg.n_head_kv;
@@ -559,6 +588,13 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
         }
 
         softmax(bufs.scores.data(), pos + 1);
+
+        // Salva gli attention scores nello snapshot (se richiesto)
+        if (snap) {
+            for (int t = 0; t <= pos; t++) {
+                snap->at(layer, h, pos, t) = bufs.scores[t];
+            }
+        }
 
         float* acc_h = bufs.attn_acc.data() + h_off;
         for (int t = 0; t <= pos; t++) {
@@ -638,7 +674,7 @@ void feed_forward_llama(const float* x, float* out, const LayerWeights& lw, cons
 //  lm_head è la STESSA di token_embd trasposta.
 //  Questo riduce i parametri e migliora la qualità.
 // ─────────────────────────────────────────────
-void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bool bench_mode) {
+void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bool bench_mode, AttentionSnapshot* snap) {
 
     const ModelConfig& cfg = model.config;
     const ModelWeights& w  = model.weights;
@@ -682,12 +718,14 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
                        lw.ln1_b.data(), b.ln_out.data(), n_embd);
 
         // ── Self-Attention ────────────────────
+        // Passa snap alle funzioni di attention: se non nullptr,
+        // salveranno gli scores post-softmax per questa posizione.
         if (is_llama)
             self_attention_llama(b.ln_out.data(), b.attn_out.data(),
-                                 lw, model.kv_cache, cfg, l, pos, b);
+                                 lw, model.kv_cache, cfg, l, pos, b, snap);
         else
             self_attention(b.ln_out.data(), b.attn_out.data(),
-                           lw, model.kv_cache, cfg, l, pos, b);
+                           lw, model.kv_cache, cfg, l, pos, b, snap);
 
         auto ta1 = now();
 
@@ -744,6 +782,105 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
     }
 }
 
+// ─────────────────────────────────────────────
+//  Esporta gli attention scores per un prompt
+//
+//  Esegue il forward pass sequenziale su tutti i
+//  token del prompt, salvando gli attention scores
+//  (post-softmax) per ogni layer, head, query e key.
+//
+//  Il formato JSON restituito è compatto:
+//    {
+//      "tokens": ["Hello", " world"],
+//      "layers": [
+//        {
+//          "layer": 0,
+//          "heads": [
+//            {
+//              "head": 0,
+//              "weights": [
+//                [0.5, 0.0],
+//                [0.3, 0.7]
+//              ]
+//            }
+//          ]
+//        }
+//      ]
+//    }
+//
+//  Ogni matrice weights[q][k] contiene il peso con
+//  cui il token query q "guarda" il token key k.
+//  La causal mask fa sì che weights[q][k] = 0 per k > q.
+//
+//  Limiti: max_len = 100 token (memoria O(seq_len²)).
+// ─────────────────────────────────────────────
+std::string inspect_attention(Model& model, const Tokenizer& tok,
+                               const std::string& prompt, int max_len) {
+    auto input_ids = tokenizer_encode(tok, prompt);
+    if (input_ids.empty()) return "{\"error\":\"prompt vuoto\"}";
+
+    if ((int)input_ids.size() > max_len) {
+        input_ids.resize(max_len);
+    }
+
+    const int seq_len = static_cast<int>(input_ids.size());
+    const int n_layer = model.config.n_layer;
+    const int n_head  = model.config.n_head;
+
+    // Alloca lo snapshot
+    AttentionSnapshot snap;
+    snap.init(n_layer, n_head, seq_len);
+
+    // Forward sequenziale su tutti i token con snapshot
+    model_init_kvcache(model);
+    std::vector<float> logits;
+    for (int pos = 0; pos < seq_len; pos++) {
+        forward(model, input_ids[pos], pos, logits, false, &snap);
+    }
+
+    // Decodifica i token per le etichette
+    std::vector<std::string> tokens;
+    for (int id : input_ids) {
+        tokens.push_back(tokenizer_decode(tok, {id}));
+    }
+
+    // Costruisci JSON
+    std::ostringstream j;
+    j << "{\"tokens\":[";
+    for (int i = 0; i < seq_len; i++) {
+        if (i > 0) j << ",";
+        j << "\"" << json_escape_local(tokens[i]) << "\"";
+    }
+    j << "],\"layers\":[";
+
+    for (int l = 0; l < n_layer; l++) {
+        if (l > 0) j << ",";
+        j << "{\"layer\":" << l << ",\"heads\":[";
+        for (int h = 0; h < n_head; h++) {
+            if (h > 0) j << ",";
+            j << "{\"head\":" << h << ",\"weights\":";
+            j << "[";
+            for (int q = 0; q < seq_len; q++) {
+                if (q > 0) j << ",";
+                j << "[";
+                for (int k = 0; k < seq_len; k++) {
+                    if (k > 0) j << ",";
+                    float w = snap.at(l, h, q, k);
+                    // Evita -0.000 e arrotonda a 4 decimali
+                    if (w < 0.00005f) w = 0.0f;
+                    j << std::fixed << std::setprecision(4) << w;
+                }
+                j << "]";
+            }
+            j << "]}";
+        }
+        j << "]}";
+    }
+    j << "]}";
+
+    return j.str();
+}
+
 // ═════════════════════════════════════════════
 //  PREFILL BATCH — ottimizzazione del prompt
 // ═════════════════════════════════════════════
@@ -760,9 +897,20 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
 //    ogni posizione contro tutti i token precedenti
 //    usando la cache appena popolata
 // ─────────────────────────────────────────────
+// Self-attention GPT-2 — versione batch con supporto a posizione iniziale variabile
+//
+// Parametro base_pos:
+//   Quando base_pos = 0 (caso normale), i token del batch vengono scritti
+//   nelle posizioni 0..N-1 della KV cache.
+//   Quando base_pos > 0 (speculative decoding), i token vengono scritti
+//   nelle posizioni base_pos..base_pos+N-1, e l'attention calcola i
+//   score contro TUTTO il contesto precedente (0..base_pos+pos).
+//   Questo è essenziale perché il modello deve "vedere" i token già
+//   generati per predire correttamente i token draft.
 static void self_attention_prefill(const float* x_batch, float* out_batch,
                                     const LayerWeights& lw, KVCache& cache,
-                                    const ModelConfig& cfg, int layer, int N) {
+                                    const ModelConfig& cfg, int layer, int N,
+                                    int base_pos = 0) {
     const int n_embd = cfg.n_embd;
     const int n_head = cfg.n_head;
     const int d_head = cfg.d_head;
@@ -777,16 +925,17 @@ static void self_attention_prefill(const float* x_batch, float* out_batch,
         vec_add(qkv_t, lw.attn_qkv_b.data(), qkv_t, 3 * n_embd);
     }
 
-    // Salva K e V nella cache per tutte le posizioni
+    // Salva K e V nella cache alle posizioni base_pos + t
     for (int t = 0; t < N; t++) {
-        float* k_pos = cache.k[layer].data() + t * n_embd;
-        float* v_pos = cache.v[layer].data() + t * n_embd;
+        float* k_pos = cache.k[layer].data() + (base_pos + t) * n_embd;
+        float* v_pos = cache.v[layer].data() + (base_pos + t) * n_embd;
         vec_copy(qkv_batch.data() + t * 3 * n_embd + n_embd, k_pos, n_embd);
         vec_copy(qkv_batch.data() + t * 3 * n_embd + 2 * n_embd, v_pos, n_embd);
     }
 
-    // Attention causale batch
-    std::vector<float> scores(N);
+    // Attention causale batch — attende a TUTTI i token 0..base_pos+pos
+    int max_cache = base_pos + N;
+    std::vector<float> scores(max_cache);
     std::vector<float> attn_acc(N * n_embd);
     std::fill(attn_acc.begin(), attn_acc.end(), 0.0f);
     float scale = 1.0f / sqrtf((float)d_head);
@@ -794,10 +943,11 @@ static void self_attention_prefill(const float* x_batch, float* out_batch,
     for (int h = 0; h < n_head; h++) {
         int h_off = h * d_head;
         for (int pos = 0; pos < N; pos++) {
+            int global_pos = base_pos + pos;
             const float* Qh = qkv_batch.data() + pos * 3 * n_embd + h_off;
 
-            // Score contro tutti i token 0..pos
-            for (int t = 0; t <= pos; t++) {
+            // Score contro tutti i token 0..global_pos
+            for (int t = 0; t <= global_pos; t++) {
                 const float* Kh = cache.k[layer].data() + t * n_embd + h_off;
                 float dot = 0.0f;
                 for (int d = 0; d < d_head; d++)
@@ -805,14 +955,14 @@ static void self_attention_prefill(const float* x_batch, float* out_batch,
                 scores[t] = dot * scale;
             }
             // Causal mask: posizioni future → -inf
-            for (int t = pos + 1; t < N; t++)
+            for (int t = global_pos + 1; t < max_cache; t++)
                 scores[t] = -1e9f;
 
-            softmax(scores.data(), N);
+            softmax(scores.data(), global_pos + 1);
 
-            // Weighted sum di V
+            // Weighted sum di V su tutto il contesto
             float* acc_h = attn_acc.data() + pos * n_embd + h_off;
-            for (int t = 0; t < N; t++) {
+            for (int t = 0; t <= global_pos; t++) {
                 const float* Vh = cache.v[layer].data() + t * n_embd + h_off;
                 for (int d = 0; d < d_head; d++)
                     acc_h[d] += scores[t] * Vh[d];
@@ -865,9 +1015,17 @@ static void feed_forward_prefill(const float* x_batch, float* out_batch,
 //  - GQA (raggruppamento K/V)
 //  - No bias
 // ─────────────────────────────────────────────
+// Self-attention LLaMA — versione batch con supporto a posizione iniziale variabile
+//
+// Vedi commento di self_attention_prefill per il significato di base_pos.
+// In più, qui gestiamo GQA (Grouped Query Attention) e RoPE.
+// Il parametro base_pos influenza anche il RoPE: le frequenze
+// sinusoidali dipendono dalla posizione ASSOLUTA del token, non
+// relativa al batch, quindi passiamo global_t = base_pos + t a rope().
 static void self_attention_llama_prefill(const float* x_batch, float* out_batch,
                                           const LayerWeights& lw, KVCache& cache,
-                                          const ModelConfig& cfg, int layer, int N) {
+                                          const ModelConfig& cfg, int layer, int N,
+                                          int base_pos = 0) {
     const int n_head    = cfg.n_head;
     const int n_head_kv = cfg.n_head_kv;
     const int d_head    = cfg.d_head;
@@ -885,22 +1043,24 @@ static void self_attention_llama_prefill(const float* x_batch, float* out_batch,
     matvec_quant_batch(lw.attn_k_w, x_batch, K_batch.data(), N);
     matvec_quant_batch(lw.attn_v_w, x_batch, V_batch.data(), N);
 
-    // RoPE per tutte le posizioni
+    // RoPE per tutte le posizioni (globali)
     for (int t = 0; t < N; t++) {
-        rope(Q_batch.data() + t * n_embd, t, n_head,    d_head, rope_dim, cfg.rope_freq_base);
-        rope(K_batch.data() + t * kv_dim, t, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+        int global_t = base_pos + t;
+        rope(Q_batch.data() + t * n_embd, global_t, n_head,    d_head, rope_dim, cfg.rope_freq_base);
+        rope(K_batch.data() + t * kv_dim, global_t, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
     }
 
-    // Salva K e V nella cache
+    // Salva K e V nella cache alle posizioni base_pos + t
     for (int t = 0; t < N; t++) {
-        float* k_pos = cache.k[layer].data() + t * kv_dim;
-        float* v_pos = cache.v[layer].data() + t * kv_dim;
+        float* k_pos = cache.k[layer].data() + (base_pos + t) * kv_dim;
+        float* v_pos = cache.v[layer].data() + (base_pos + t) * kv_dim;
         vec_copy(K_batch.data() + t * kv_dim, k_pos, kv_dim);
         vec_copy(V_batch.data() + t * kv_dim, v_pos, kv_dim);
     }
 
-    // Attention causale batch
-    std::vector<float> scores(N);
+    // Attention causale batch — attende a TUTTI i token 0..base_pos+pos
+    int max_cache = base_pos + N;
+    std::vector<float> scores(max_cache);
     std::vector<float> attn_acc(N * n_embd);
     std::fill(attn_acc.begin(), attn_acc.end(), 0.0f);
     float scale = 1.0f / sqrtf((float)d_head);
@@ -911,22 +1071,23 @@ static void self_attention_llama_prefill(const float* x_batch, float* out_batch,
         int kv_off = kv_h * d_head;
 
         for (int pos = 0; pos < N; pos++) {
+            int global_pos = base_pos + pos;
             const float* Qh = Q_batch.data() + pos * n_embd + h_off;
 
-            for (int t = 0; t <= pos; t++) {
+            for (int t = 0; t <= global_pos; t++) {
                 const float* Kh = cache.k[layer].data() + t * kv_dim + kv_off;
                 float dot = 0.0f;
                 for (int d = 0; d < d_head; d++)
                     dot += Qh[d] * Kh[d];
                 scores[t] = dot * scale;
             }
-            for (int t = pos + 1; t < N; t++)
+            for (int t = global_pos + 1; t < max_cache; t++)
                 scores[t] = -1e9f;
 
-            softmax(scores.data(), N);
+            softmax(scores.data(), global_pos + 1);
 
             float* acc_h = attn_acc.data() + pos * n_embd + h_off;
-            for (int t = 0; t < N; t++) {
+            for (int t = 0; t <= global_pos; t++) {
                 const float* Vh = cache.v[layer].data() + t * kv_dim + kv_off;
                 for (int d = 0; d < d_head; d++)
                     acc_h[d] += scores[t] * Vh[d];
@@ -1094,6 +1255,124 @@ void forward_prefill(Model& model, const std::vector<int>& token_ids, std::vecto
     // Salva lo stato dell'ultimo token per la generazione sequenziale
     vec_copy(ln_out_batch.data() + (N - 1) * n_embd, model.bufs.x.data(), n_embd);
     model.kv_cache.n_cached = N;
+}
+
+// ─────────────────────────────────────────────
+//  Forward pass BATCH per verifica (Speculative Decoding)
+//
+//  Come forward_prefill, ma:
+//  - parte dalla posizione base_pos (non da 0)
+//  - restituisce i logits per TUTTI i token del batch
+//  - gli attention attendono a TUTTO il contesto precedente
+//
+//  Usato nel speculative decoding per verificare K token
+//  draft in un unico passaggio: il target model processa
+//  i draft token e confronta argmax(logits_i) con draft_{i+1}.
+// ─────────────────────────────────────────────
+void forward_verify(Model& model, const std::vector<int>& token_ids,
+                    int base_pos, std::vector<std::vector<float>>& all_logits) {
+    const int N = static_cast<int>(token_ids.size());
+    if (N == 0) return;
+
+    // Per batch piccoli (≤ 8) il loop sequenziale è più semplice
+    // e corretto: ogni forward() vede la cache aggiornata.
+    if (N <= 8) {
+        all_logits.resize(N);
+        int pos = base_pos;
+        for (int i = 0; i < N; i++) {
+            forward(model, token_ids[i], pos, all_logits[i], false);
+            pos++;
+        }
+        return;
+    }
+
+    const ModelConfig& cfg = model.config;
+    const ModelWeights& w = model.weights;
+    const int n_embd = cfg.n_embd;
+    const bool is_llama = (cfg.arch == ArchType::LLAMA);
+
+    std::vector<float> x_batch(N * n_embd);
+    std::vector<float> residual_batch(N * n_embd);
+    std::vector<float> ln_out_batch(N * n_embd);
+    std::vector<float> attn_out_batch(N * n_embd);
+    std::vector<float> ffn_out_batch(N * n_embd);
+
+    // Embedding lookup batch (posizioni globali)
+    for (int t = 0; t < N; t++) {
+        dequant_row(w.token_embd, token_ids[t], x_batch.data() + t * n_embd);
+        if (!is_llama) {
+            const float* pe = w.pos_embd.data() + (base_pos + t) * n_embd;
+            vec_add(x_batch.data() + t * n_embd, pe, x_batch.data() + t * n_embd, n_embd);
+        }
+    }
+
+    // Loop sui layer
+    for (int l = 0; l < cfg.n_layer; l++) {
+        const LayerWeights& lw = w.layers[l];
+        residual_batch = x_batch;
+
+        for (int t = 0; t < N; t++) {
+            if (is_llama)
+                rms_norm(x_batch.data() + t * n_embd, lw.ln1_w.data(),
+                         ln_out_batch.data() + t * n_embd, n_embd, cfg.norm_eps);
+            else
+                layer_norm(x_batch.data() + t * n_embd, lw.ln1_w.data(),
+                           lw.ln1_b.data(), ln_out_batch.data() + t * n_embd, n_embd);
+        }
+
+        if (is_llama)
+            self_attention_llama_prefill(ln_out_batch.data(), attn_out_batch.data(),
+                                         lw, model.kv_cache, cfg, l, N, base_pos);
+        else
+            self_attention_prefill(ln_out_batch.data(), attn_out_batch.data(),
+                                   lw, model.kv_cache, cfg, l, N, base_pos);
+
+        for (int t = 0; t < N; t++)
+            vec_add(attn_out_batch.data() + t * n_embd, residual_batch.data() + t * n_embd,
+                    x_batch.data() + t * n_embd, n_embd);
+
+        residual_batch = x_batch;
+
+        for (int t = 0; t < N; t++) {
+            if (is_llama)
+                rms_norm(x_batch.data() + t * n_embd, lw.ln2_w.data(),
+                         ln_out_batch.data() + t * n_embd, n_embd, cfg.norm_eps);
+            else
+                layer_norm(x_batch.data() + t * n_embd, lw.ln2_w.data(),
+                           lw.ln2_b.data(), ln_out_batch.data() + t * n_embd, n_embd);
+        }
+
+        if (is_llama)
+            feed_forward_llama_prefill(ln_out_batch.data(), ffn_out_batch.data(), lw, cfg, N);
+        else
+            feed_forward_prefill(ln_out_batch.data(), ffn_out_batch.data(), lw, cfg, N);
+
+        for (int t = 0; t < N; t++)
+            vec_add(ffn_out_batch.data() + t * n_embd, residual_batch.data() + t * n_embd,
+                    x_batch.data() + t * n_embd, n_embd);
+    }
+
+    // Norm finale
+    for (int t = 0; t < N; t++) {
+        if (is_llama)
+            rms_norm(x_batch.data() + t * n_embd, w.ln_f_w.data(),
+                     ln_out_batch.data() + t * n_embd, n_embd, cfg.norm_eps);
+        else
+            layer_norm(x_batch.data() + t * n_embd, w.ln_f_w.data(),
+                       w.ln_f_b.data(), ln_out_batch.data() + t * n_embd, n_embd);
+    }
+
+    // lm_head: logits per TUTTI i token
+    all_logits.resize(N);
+    const QuantTensor& lm_head = is_llama ? w.output_w : w.token_embd;
+    for (int t = 0; t < N; t++) {
+        all_logits[t].resize(cfg.n_vocab);
+        matvec_quant(lm_head, ln_out_batch.data() + t * n_embd, all_logits[t].data());
+    }
+
+    // Salva lo stato dell'ultimo token per la generazione sequenziale
+    vec_copy(ln_out_batch.data() + (N - 1) * n_embd, model.bufs.x.data(), n_embd);
+    model.kv_cache.n_cached = base_pos + N;
 }
 
 // ─────────────────────────────────────────────

@@ -24,7 +24,4 @@ Thumbs.db
 # Compilati
 venv/
 
-# Dipendenze esterne — scaricate da setup.sh
-third_party/
-
-Testing/
+.eie_history

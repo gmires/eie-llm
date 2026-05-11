@@ -546,10 +546,10 @@ Per questo parallelizziamo solo il loop interno più costoso (il matvec) e lasci
 - [x] Fase 16 — Prefill batch per prompt lunghi (matvec_quant_batch + forward_prefill)
 - [x] Fase 17 — OpenMP su matvec e ops vettoriali con soglia automatica
 - [x] Fase 18 — Streaming HTTP (Server-Sent Events, token per token)
-- [ ] Fase 19 — Speculative Decoding: draft & verify per accelerare la generazione
-- [ ] Fase 20 — KV Cache Prefix Sharing: riuso della cache per prefissi comuni
-- [ ] Fase 21 — Attention Heatmap Export: "guardare dentro" il modello
-- [ ] Fase 22 — Continuous Batching: throughput del server su richieste multiple
+- [x] Fase 19 — Speculative Decoding: draft & verify per accelerare la generazione
+- [x] Fase 20 — KV Cache Prefix Sharing: riuso della cache per prefissi comuni
+- [x] Fase 21 — Attention Heatmap Export: "guardare dentro" il modello
+- [x] Fase 22 — Continuous Batching: throughput del server su richieste multiple
 
 ---
 
@@ -591,62 +591,209 @@ curl -N -X POST http://localhost:8080/v1/chat/completions \
 
 **Perché**: è una delle ottimizzazioni più eleganti degli engine moderni (llama.cpp, vLLM, TGI). La verifica batch di N token è molto più veloce della generazione sequenziale di N token.
 
-**Implementazione semplificata** (educational):
-- Usare il modello stesso come "draft": generare K token greedy in avanti (veloce perché non serve sampling)
-- Verificarli tutti insieme con un forward pass batch
-- Accettare i token finché il draft è corretto; al primo errore, rigenerare da lì
-- Il guadagno dipende dalla qualità del draft (tipicamente 2-3×)
+**Implementazione** (`src/shell.cpp`, `src/model.cpp`):
 
-**Cosa si impara**: il trade-off qualità/velocità del draft, e perché la verifica in batch batte la generazione sequenziale.
+Il speculative decoding richiede due componenti chiave:
+
+1. **`forward_verify()` in `model.cpp`**: come `forward_prefill()` ma con due differenze fondamentali:
+   - Accetta un parametro `base_pos` per indicare da quale posizione nella KV cache iniziare. Questo permette di verificare token draft che si aggiungono a token già generati.
+   - Gli attention prefill (`self_attention_prefill` e `self_attention_llama_prefill`) sono stati modificati per supportare `base_pos`: scrivono K,V alle posizioni `base_pos + t` e calcolano attention scores su TUTTO il contesto precedente (token 0..`base_pos+pos`), non solo sui token del batch.
+   - Restituisce i logits per **ogni** token del batch in `all_logits`, non solo per l'ultimo. `all_logits[i]` contiene i logits predetti dal modello dopo aver processato il token `i`.
+
+2. **`generate_speculative()` in `shell.cpp`**: implementa l'algoritmo draft & verify:
+   ```
+   while (non finito):
+       // DRAFT: genera K token greedy (senza stamparli)
+       draft = [d1, d2, ..., dK]
+       
+       // ROLLBACK: annulla le modifiche alla KV cache e al contesto
+       // (i draft non sono ancora "ufficiali")
+       
+       // VERIFY: forward_verify(draft, base_pos) → all_logits
+       
+       // VERIFICA sequenziale:
+       // - d1 è corretto? sample(logits_correnti) == d1 ?
+       // - d2 è corretto? sample(all_logits[0]) == d2 ?
+       // - d3 è corretto? sample(all_logits[1]) == d3 ?
+       // - ...
+       
+       // Se di verifica fallisce al token i:
+       //   - Accetta d1..d_{i-1}
+       //   - Usa il token campionato dai logits_i come di
+       //   - Tronca la KV cache e rigenera da lì
+       
+       // Se tutti K passano:
+       //   - Accetta tutti i draft
+       //   - Campiona il prossimo token da all_logits.back()
+   ```
+
+**Comandi shell**:
+```
+:speculative    attiva/disattiva speculative decoding
+:draft <n>      imposta il numero di token draft (default 4)
+```
+
+**Cosa si impara**:
+- La verifica batch è corretta perché i logits `all_logits[i]` dipendono solo dai token fino alla posizione `i`, non dai token successivi nel draft. Quindi anche se processiamo tutti i draft insieme, i logits per il token `i` sono validi per verificare `draft[i+1]`.
+- Il rollback della KV cache è semplice: basta reimpostare `n_cached` alla posizione precedente. I dati "extra" rimangono nell'array ma non vengono letti.
+- Con lo stesso modello come draft, il guadagno di velocità è limitato (il draft non è più veloce del target). In sistemi reali, il draft è un modello più piccolo o con layer saltati. Il pattern rimane identico.
 
 ---
 
 ### Fase 20 — KV Cache Prefix Sharing
 **Obiettivo**: condividere la KV cache del prefisso tra richieste multiple.
 
-**Perché**: nei server reali, il 50-80% dei token nei prompt è un system prompt identico per tutti. Ricalcolare la KV cache ogni volta è uno spreco enorme.
+**Perché**: nei server reali, il 50-80% dei token nei prompt è un system prompt identico per tutti. Ricalcolare la KV cache ogni volta è uno spreco enorme. Con la prefix cache, la seconda richiesta con lo stesso prompt salta completamente il prefill.
 
-**Implementazione**:
-- `PrefixCache` globale nel server: `hash(system_prompt) → KVCache`
-- Quando arriva una richiesta, controlla se il prefisso è già in cache
-- Se sì, copia la KV cache invece di ricalcolarla
-- Eviction LRU quando la cache è piena
+**Implementazione** (`include/prefix_cache.hpp`, `src/prefix_cache.cpp`, `src/server.cpp`, `src/shell.cpp`):
 
-**Cosa si impara**: la KV cache è un bottleneck di memoria; la deduplication del prefisso è una delle ottimizzazioni più impattanti nel deployment.
+- **`PrefixCache`**: classe thread-safe con mutex che mappa `hash(prompt) → KVCache`. Ogni entry contiene:
+  - `kv_cache`: copia completa di K e V per tutti i layer
+  - `n_tokens`: quanti token sono memorizzati
+  - `last_used`: timestamp per LRU eviction
+
+- **Lookup (`server.cpp` e `shell.cpp`)**: prima del prefill, `prefix_cache.lookup(prompt, model, n_tokens)`:
+  - Se il prompt è in cache e `n_tokens == input_ids.size()` (hit esatto): copia la KV cache nel modello, esegue un `forward()` sull'ultimo token per ricalcolare i logits (non salvati nella cache), e salta il prefill.
+  - Se miss: `model_init_kvcache()` + `forward_prefill()` + `prefix_cache.store()`.
+
+- **LRU Eviction**: quando la cache raggiunge `MAX_ENTRIES = 5`, rimuove l'entry con `last_used` più vecchio. Il limite è basso perché ogni entry copia l'intera KV cache (layer × pos × head × d_head float) → memoria cresce rapidamente.
+
+- **Statistiche**: comandi `:cacheinfo` (shell) mostrano hit/miss e hit rate.
+
+**Esempio**:
+```bash
+# Prima richiesta: miss (prefill completo)
+curl -X POST ... -d '{"prompt":"Hello world",...}'
+
+# Seconda richiesta: hit (skippato prefill)
+curl -X POST ... -d '{"prompt":"Hello world",...}'
+# Nel log server: [CACHE HIT] prompt in cache, saltato prefill
+```
+
+**Cosa si impara**:
+- La KV cache è il bottleneck di memoria più grande dell'inferenza. Condividerla tra richieste riduce drasticamente il tempo di prefill ripetuti.
+- La copia della KV cache (`model.kv_cache = entry.kv_cache`) è costosa ma fattibile per pochi entry. In produzione si userebbe memoria condivisa (reference counting o mmap).
+- Il troncamento della cache avviene semplicemente reimpostando `n_cached`: i dati "extra" rimangono nell'array ma non vengono mai letti.
 
 ---
 
 ### Fase 21 — Attention Heatmap Export
 **Obiettivo**: un endpoint che restituisce i pesi attention per ogni layer/head.
 
-**Perché**: vedere quali token si guardano tra loro (es. il pronome "essa" guarda "Francia" 10 token prima) rende concreto il meccanismo della self-attention.
+**Perché**: vedere quali token si guardano tra loro (es. il pronome "essa" guarda "Francia" 10 token prima) rende concreto il meccanismo della self-attention. I pesi attention sono numeri tra 0 e 1: la somma di ogni riga è 1.0. Un peso alto (vicino a 1.0) significa "questo token è molto rilevante per predire il prossimo".
 
-**Implementazione**:
-- Flag `save_attention` in `InferBuffers`; durante la self-attention, salvare `scores` dopo softmax
-- Endpoint `GET /v1/inspect/attention` → JSON con matrici attention
-- Endpoint `GET /v1/inspect/logits` → top-k logits per posizione
-- Tool Python opzionale per visualizzare la heatmap
+**Implementazione** (`include/model.hpp`, `src/model.cpp`, `src/server.cpp`):
 
-**Cosa si impara**: l'attention non è "magia", è una matrice di pesi che il modello apprende per puntare a token rilevanti.
+- **`AttentionSnapshot`** in `model.hpp`: struttura che memorizza i pesi attention in un vettore flat:
+  ```cpp
+  struct AttentionSnapshot {
+      int n_layers, n_heads, seq_len;
+      std::vector<float> data;  // [layer][head][q][k]
+      void init(int nl, int nh, int sl);
+      float& at(int layer, int head, int q_pos, int k_pos);
+  };
+  ```
+  La memoria cresce come O(seq_len²), quindi limitiamo a 100 token.
+
+- **`self_attention` e `self_attention_llama`**: aggiunto parametro opzionale `AttentionSnapshot* snap`. Dopo `softmax()`, se `snap != nullptr`, copiano `bufs.scores[0..pos]` nello snapshot per il layer e head correnti:
+  ```cpp
+  if (snap) {
+      for (int t = 0; t <= pos; t++) {
+          snap->at(layer, h, pos, t) = bufs.scores[t];
+      }
+  }
+  ```
+
+- **`forward()`**: aggiunto parametro `AttentionSnapshot* snap = nullptr` che viene passato alle funzioni di attention.
+
+- **`inspect_attention()` in `model.cpp`**: esegue il forward sequenziale su tutti i token del prompt con `snap` attivo, poi formatta i dati in JSON:
+  ```json
+  {
+    "tokens": ["The", " cat", " sat"],
+    "layers": [
+      {
+        "layer": 0,
+        "heads": [
+          {
+            "head": 0,
+            "weights": [
+              [1.0000, 0.0000, 0.0000],
+              [0.7060, 0.2940, 0.0000],
+              [0.6041, 0.1051, 0.2908]
+            ]
+          }
+        ]
+      }
+    ]
+  }
+  ```
+  Ogni riga `weights[q]` è la distribuzione di attenzione del token query `q` sui token precedenti. La causal mask fa sì che `weights[q][k] = 0` per `k > q`.
+
+- **Endpoint `POST /v1/inspect/attention`**: accetta `{"prompt":"...","max_len":100}` e restituisce il JSON.
+- **Comando shell `:inspect <testo>`**: stampa il JSON direttamente sulla console.
+
+**Cosa si impara**:
+- L'attention non è "magia", è una matrice di pesi che il modello apprende per puntare a token rilevanti.
+- La causal mask è visibile nei dati: la parte superiore della matrice è triangolare inferiore (solo token precedenti).
+- Alcune head sono "locali" (attendono solo ai token vicini), altre sono "globali" (attendono a token lontani). Questa specializzazione emerge dall'addestramento.
 
 ---
 
 ### Fase 22 — Continuous Batching
-**Obiettivo**: processare un batch di token (uno per richiesta) ad ogni step.
+**Obiettivo**: processare più richieste concorrenti senza bloccare il thread HTTP.
 
-**Perché**: nei server reali, le richieste arrivano in momenti diversi. Se le processiamo una alla volta, la CPU è in idle. Il continuous batching massimizza l'utilizzo.
+**Perché**: nei server reali, le richieste arrivano in momenti diversi. Se il thread HTTP esegue direttamente l'inferenza, le richieste successive restano in attesa (bloccate) finché la prima non finisce. Il throughput crolla.
 
-**Implementazione semplificata**:
-- `RequestQueue` nel server: ogni richiesta ha uno stato (prefill_needed, generating, done)
-- Thread di inferenza in loop:
-  1. Prende tutte le richieste attive
-  2. Prefill per le nuove
-  3. UN forward pass batch con il token corrente di ogni richiesta
-  4. Distribuisce i logits per il sampling
-  5. Marca done le richieste terminate
-- Questo è un continuous batching "statico" ma sufficiente a spiegare il concetto
+**Implementazione** (`src/server.cpp`):
 
-**Cosa si impara**: la latenza di una singola richiesta aumenta leggermente, ma il **throughput totale** del server aumenta drasticamente. Questo è il trade-off fondamentale nei sistemi di produzione.
+- **`ServerRequest`**: struttura che contiene tutto lo stato di una richiesta:
+  - `prompt`, `max_tokens`, `params` — parametri di input
+  - `output_text`, `generated`, `prompt_tokens` — stato di output
+  - `done`, `error`, `error_msg` — stato di completamento
+  - `std::mutex mtx` + `std::condition_variable cv` — sincronizzazione tra thread HTTP e thread di inferenza
+
+- **`RequestQueue`**: coda thread-safe con `push()`, `pop()`, `signal_shutdown()`. Il thread HTTP inserisce richieste con `push()`. Il thread di inferenza le preleva con `pop()` (bloccante se vuota).
+
+- **`inference_thread()`**: loop infinito che:
+  1. Preleva una richiesta dalla coda (`pop()` blocca se vuota)
+  2. Esegue `generate_for_request()` — prefill + generazione
+  3. Segnala `done = true` e notifica il thread HTTP con `cv.notify_all()`
+  4. Ripete
+  
+  Questo thread è l'UNICO che tocca il modello, evitando race condition sulla KV cache.
+
+- **`generate_for_request()`**: come `generate_text()` ma scrive direttamente in `ServerRequest::output_text`. Supporta prefix cache (lookup prima del prefill, store dopo).
+
+- **`server_run()`**: avvia `std::thread(inference_thread, ...)` in background. Gli endpoint **non-streaming**:
+  1. Creano una `ServerRequest`
+  2. La mettono in coda con `queue.push(sreq)`
+  3. Bloccano il thread HTTP su `sreq->cv.wait()` finché `done` non diventa `true`
+  4. Costruiscono il JSON di risposta
+
+  Gli endpoint **streaming** eseguono la generazione direttamente nel content provider (sincrono), per poter emettere token via SSE in tempo reale.
+
+- **Graceful shutdown**: quando il server riceve `Ctrl+C`, `queue.signal_shutdown()` sveglia il thread di inferenza che esce dal loop, poi `inf_thread.join()` attende la terminazione.
+
+**Architettura**:
+```
+Thread HTTP (N connessioni)
+  → accetta richiesta
+  → crea ServerRequest
+  → queue.push(req)
+  → cv.wait() finché done
+  → risponde al client
+
+Thread Inferenza (1 solo)
+  → queue.pop() (bloccante)
+  → generate_for_request()
+  → done = true; cv.notify_all()
+  → ripete
+```
+
+**Cosa si impara**:
+- La separazione thread HTTP / thread inferenza è il pattern fondamentale nei server di produzione. Il thread HTTP deve essere libero di accettare connessioni senza essere bloccato dalla lentezza del modello.
+- Il trade-off: la latenza di una singola richiesta aumenta leggermente (deve aspettare in coda), ma il **throughput totale** del server aumenta drasticamente perché non ci sono più richieste bloccate in attesa.
+- In un engine reale (vLLM, TGI), il thread di inferenza farebbe UN forward pass batch con il token corrente di TUTTE le richieste attive, massimizzando il riutilizzo dei pesi in cache. La nostra implementazione è sequenziale (una richiesta alla volta) per semplicità, ma l'architettura della coda è identica.
 
 ---
 
