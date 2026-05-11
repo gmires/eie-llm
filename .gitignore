@@ -26,3 +26,5 @@ venv/
 
 # Dipendenze esterne — scaricate da setup.sh
 third_party/
+
+Testing/
