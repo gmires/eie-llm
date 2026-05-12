@@ -867,6 +867,38 @@ Ogni task include:
 - Test attention heatmap
 - Benchmark e aggiornamento documentazione
 
+---
+
+## Integrazioni future
+
+### KV Cache persistente su file
+
+**Problema:** In conversazioni lunghe (es. 500+ token), il prefill deve rielaborare l'intera history ad ogni nuovo messaggio. Questo è O(n²) e diventa molto lento — con Qwen2.5, 500 token di history richiedono ~15-20 secondi di prefill.
+
+**Soluzione proposta:** Salvare la KV cache su file alla fine di ogni turno di conversazione, e ricaricarla all'inizio del turno successivo. La KV cache per un modello 1.5B con context 8192 occupa:
+- K cache: `n_layer × n_ctx × n_head_kv × d_head × 4 byte` ≈ 28 × 8192 × 2 × 128 × 4 ≈ **234 MB**
+- V cache: uguale ≈ **234 MB**
+- Totale: ~**470 MB** per conversazione — gestibile su SSD moderni.
+
+**Implementazione:**
+1. Aggiungere `model_save_kvcache(const Model&, const std::string& path)` — serializza K e V in formato binario raw (float32).
+2. Aggiungere `model_load_kvcache(Model&, const std::string& path)` — deserializza e verifica dimensioni (n_layer, n_ctx, kv_dim).
+3. Aggiungere un campo `conversation_id` nelle richieste HTTP della Web UI, e un meccanismo di mappaggio `conversation_id → file_cache` nel server.
+4. La Web UI salva `conversation_id` in `localStorage` insieme alla cronologia chat; il server salva/ripristina la KV cache associata.
+
+**Vantaggi:**
+- Prefill di conversazioni lunghe passa da O(n²) a O(m) dove m è la lunghezza del nuovo messaggio.
+- UX della Web UI molto più fluida su conversazioni lunghe.
+- Implementazione relativamente semplice: la KV cache è già flat e contigua in memoria.
+
+**Limitazioni:**
+- Ogni conversazione occupa ~470 MB su disco.
+- Non è adatto a deployment multi-utente con migliaia di conversazioni attive (servirebbe un eviction policy LRU).
+
+**Priorità:** Media — miglioramento significativo dell'UX ma non bloccante per l'uso didattico.
+
+---
+
 ## Piano di sviluppo — Fasi 18-22
 
 ### Fase 18 — Streaming SSE (Server-Sent Events)

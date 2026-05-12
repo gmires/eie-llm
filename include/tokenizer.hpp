@@ -100,5 +100,19 @@ std::string apply_chat_template(const Tokenizer& tok,
                                 const std::string& user_msg,
                                 const std::string& system_msg = "");
 
+// Applica il chat template a una conversazione multi-turn.
+//
+// Ogni messaggio è una coppia {role, content} dove role può essere
+// "system", "user" o "assistant". Costruisce il prompt completo
+// con tutta la history della conversazione.
+//
+// Esempio ChatML con 2 turni:
+//   [{"user","Ciao"},{"assistant","Ciao!"},{"user","Come stai?"}]
+//   → "<|im_start|>user\nCiao<|im_end|>\n<|im_start|>assistant\nCiao!<|im_end|>\n"
+//      "<|im_start|>user\nCome stai?<|im_end|>\n<|im_start|>assistant\n"
+std::string apply_chat_template_conversation(
+    const Tokenizer& tok,
+    const std::vector<std::pair<std::string, std::string>>& messages);
+
 // Info debug
 void tokenizer_print_info(const Tokenizer& tok);

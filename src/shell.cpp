@@ -145,7 +145,8 @@ static void print_help(bool chat_mode, bool speculative_mode, int draft_k) {
         << "  :chat                modalità chat (applica template)\n"
         << "  :raw                 modalità raw  (prompt diretto)\n"
         << "  :params              mostra parametri correnti\n"
-        << "  :reset               azzera la KV cache\n"
+        << "  :history             mostra la conversazione corrente\n"
+        << "  :reset               azzera KV cache e conversazione\n"
         << "  :quit                esci\n"
         << "  qualsiasi testo      genera completamento\n"
         << "\n  Modalità corrente: " << (chat_mode ? "chat" : "raw")
@@ -188,7 +189,8 @@ static void generate(Model& model,
                      const SamplingParams& params,
                      int max_tokens,
                      bool print_prompt = true,
-                     PrefixCache* pcache = nullptr) {
+                     PrefixCache* pcache = nullptr,
+                     std::string* out_text = nullptr) {
 
     auto input_ids = tokenizer_encode(tok, prompt);
     if (input_ids.empty()) {
@@ -238,6 +240,7 @@ static void generate(Model& model,
 
     // Generazione
     int generated = 0;
+    std::string generated_text;
     while (generated < max_tokens) {
         apply_repetition_penalty(logits, context_ids,
                                  params.rep_penalty);
@@ -255,8 +258,10 @@ static void generate(Model& model,
 
         // Sanitizza prima di stampare
         std::string raw = tokenizer_decode(tok, {next_token});
-        std::cout << sanitize_output(raw);
+        std::string sanitized = sanitize_output(raw);
+        std::cout << sanitized;
         std::cout.flush();
+        if (out_text) generated_text += sanitized;
 
         context_ids.push_back(next_token);
         forward(model, next_token, pos, logits);
@@ -264,6 +269,7 @@ static void generate(Model& model,
         generated++;
     }
 
+    if (out_text) *out_text = generated_text;
     std::cout << "\n\n";
 }
 
@@ -291,8 +297,11 @@ static void generate_speculative(Model& model,
                                   const SamplingParams& params,
                                   int max_tokens,
                                   int draft_k = 4,
-                                  bool print_prompt = true) {
-    model_init_kvcache(model);
+                                  bool print_prompt = true,
+                                  std::string* out_text = nullptr,
+                                  int base_pos = 0) {
+    // NON azzerare la KV cache qui: se base_pos > 0 la cache contiene
+    // già la conversazione precedente e viene riutilizzata.
 
     auto input_ids = tokenizer_encode(tok, prompt);
     if (input_ids.empty()) {
@@ -310,7 +319,15 @@ static void generate_speculative(Model& model,
 
     // Prefill
     if (!input_ids.empty()) {
-        forward_prefill(model, input_ids, logits);
+        if (base_pos == 0) {
+            // Primo turno: usa forward_prefill batch (più veloce)
+            forward_prefill(model, input_ids, logits);
+        } else {
+            // Turni successivi: forward sequenziale solo sui token nuovi
+            for (int i = base_pos; i < (int)input_ids.size(); i++) {
+                forward(model, input_ids[i], i, logits, false);
+            }
+        }
     } else {
         logits.resize(model.config.n_vocab);
     }
@@ -323,6 +340,7 @@ static void generate_speculative(Model& model,
         : sample_topk_topp(logits, params.top_k, params.top_p, params.temperature);
 
     int generated = 0;
+    std::string generated_text;
     while (generated < max_tokens && next_token != tok.eos_id) {
 
         // =====================================================================
@@ -420,8 +438,10 @@ static void generate_speculative(Model& model,
                 // Il modello concorda col draft: questo token è valido!
                 accepted++;
                 context_ids.push_back(draft_tokens[i]);
-                std::cout << sanitize_output(tokenizer_decode(tok, {draft_tokens[i]}));
+                std::string out = sanitize_output(tokenizer_decode(tok, {draft_tokens[i]}));
+                std::cout << out;
                 std::cout.flush();
+                if (out_text) generated_text += out;
                 generated++;
 
                 // Passa ai logits successivi per verificare il prossimo draft
@@ -435,8 +455,10 @@ static void generate_speculative(Model& model,
                 // Usiamo il token "corretto" (quello campionato) e
                 // tronchiamo la KV cache ai soli token accettati.
                 context_ids.push_back(verified_token);
-                std::cout << sanitize_output(tokenizer_decode(tok, {verified_token}));
+                std::string out = sanitize_output(tokenizer_decode(tok, {verified_token}));
+                std::cout << out;
                 std::cout.flush();
+                if (out_text) generated_text += out;
                 generated++;
 
                 // Tronca la cache: rimuove i draft rifiutati
@@ -483,6 +505,7 @@ static void generate_speculative(Model& model,
         }
     }
 
+    if (out_text) *out_text = generated_text;
     std::cout << "\n\n";
 }
 
@@ -505,6 +528,15 @@ void shell_run(Model& model, const Tokenizer& tok) {
     // Modalità chat attiva automaticamente se il modello ha un template.
     bool chat_mode = (model.config.arch == ArchType::LLAMA &&
                       tok.has_chat_template);
+
+    // Conversazione multi-turn in modalità chat.
+    // Ogni messaggio è una coppia {role, content}.
+    std::vector<std::pair<std::string, std::string>> conversation;
+
+    // Traccia quanti token sono già stati scritti nella KV cache.
+    // Usato per il prefill incrementale in modalità chat multi-turn:
+    // solo i token nuovi vengono processati, quelli vecchi sono riutilizzati.
+    int shell_cache_len = 0;
 
     // Configura linenoise
     linenoise::SetMultiLine(false);
@@ -548,7 +580,20 @@ void shell_run(Model& model, const Tokenizer& tok) {
             }
             else if (line == ":reset") {
                 model_init_kvcache(model);
-                std::cout << "  KV cache azzerata\n\n";
+                conversation.clear();
+                shell_cache_len = 0;
+                std::cout << "  KV cache e conversazione azzerate\n\n";
+            }
+            else if (line == ":history") {
+                if (conversation.empty()) {
+                    std::cout << "  Nessuna conversazione in corso.\n\n";
+                } else {
+                    std::cout << "  ── Conversazione ──\n";
+                    for (const auto& [role, content] : conversation) {
+                        std::cout << "  " << role << ": " << content << "\n";
+                    }
+                    std::cout << "\n";
+                }
             }
             else if (line == ":greedy") {
                 params.greedy = true;
@@ -660,15 +705,91 @@ void shell_run(Model& model, const Tokenizer& tok) {
             }
         } else {
             if (chat_mode) {
-                std::string formatted = apply_chat_template(tok, line);
+                // ═══════════════════════════════════════════════════════
+                //  CHAT MULTI-TURN CON PREFILL INCREMENTALE
+                //
+                //  Invece di passare l'intero prompt a generate() che
+                //  azzera la cache e rifà il prefill completo, gestiamo
+                //  direttamente il forward pass nella shell.
+                //
+                //  Algoritmo:
+                //    1. Formatta il prompt con tutta la conversazione
+                //    2. Tokenizza il prompt completo
+                //    3. Se shell_cache_len == 0 (primo turno):
+                //         usa forward_prefill() batch (veloce)
+                //       Altrimenti:
+                //         forward() sequenziale solo per i token NUOVI
+                //    4. Genera la risposta con forward() sequenziale
+                //       o speculative decoding (se attivo)
+                //    5. Aggiorna shell_cache_len = prompt_len + gen_len
+                // ═══════════════════════════════════════════════════════
+
+                conversation.push_back({"user", line});
+                std::string formatted = apply_chat_template_conversation(tok, conversation);
                 std::cout << "\nAssistente: ";
                 std::cout.flush();
-                if (speculative_mode)
+
+                std::string assistant_reply;
+                if (speculative_mode) {
                     generate_speculative(model, tok, formatted, params, max_tokens,
-                                         draft_k, /*print_prompt=*/false);
-                else
-                    generate(model, tok, formatted, params, max_tokens,
-                             /*print_prompt=*/false, &shell_prefix_cache);
+                                         draft_k, /*print_prompt=*/false,
+                                         &assistant_reply, shell_cache_len);
+                    shell_cache_len = model.kv_cache.n_cached;
+                } else {
+                    auto input_ids = tokenizer_encode(tok, formatted);
+                    std::vector<int> context_ids = input_ids;
+                    std::vector<float> logits;
+
+                    // Se la cache è più lunga del prompt (anomalia, es. cambio
+                    // template o tokenizzazione diversa), resetta tutto.
+                    if (shell_cache_len > (int)input_ids.size()) {
+                        model_init_kvcache(model);
+                        shell_cache_len = 0;
+                    }
+
+                    // Prefill incrementale
+                    if (shell_cache_len == 0) {
+                        // Primo turno: usa forward_prefill batch (più veloce)
+                        forward_prefill(model, input_ids, logits);
+                    } else {
+                        // Turni successivi: forward() solo sui token nuovi.
+                        // La cache contiene già i token 0..shell_cache_len-1.
+                        for (int i = shell_cache_len; i < (int)input_ids.size(); i++) {
+                            forward(model, input_ids[i], i, logits);
+                        }
+                    }
+
+                    int pos = (int)input_ids.size();
+                    int generated = 0;
+
+                    while (generated < max_tokens) {
+                        apply_repetition_penalty(logits, context_ids, params.rep_penalty);
+
+                        int next_token;
+                        if (params.greedy)
+                            next_token = sample_argmax(logits);
+                        else
+                            next_token = sample_topk_topp(logits, params.top_k,
+                                                          params.top_p, params.temperature);
+
+                        if (next_token == tok.eos_id) break;
+
+                        std::string raw = tokenizer_decode(tok, {next_token});
+                        std::string sanitized = sanitize_output(raw);
+                        std::cout << sanitized;
+                        std::cout.flush();
+                        assistant_reply += sanitized;
+
+                        context_ids.push_back(next_token);
+                        forward(model, next_token, pos, logits);
+                        pos++;
+                        generated++;
+                    }
+                    std::cout << "\n\n";
+                    shell_cache_len = pos;
+                }
+                conversation.push_back({"assistant", assistant_reply});
+
             } else {
                 if (speculative_mode)
                     generate_speculative(model, tok, line, params, max_tokens,

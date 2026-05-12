@@ -295,6 +295,84 @@ static std::string json_get_last_user_message(const std::string& json) {
     return result;
 }
 
+// Estrae tutti i messaggi dall'array "messages" in formato OpenAI chat.
+// Restituisce un vettore di coppie {role, content} nell'ordine originale.
+static std::vector<std::pair<std::string, std::string>>
+json_get_chat_messages(const std::string& json) {
+    std::vector<std::pair<std::string, std::string>> result;
+
+    // Cerca l'inizio dell'array "messages"
+    size_t messages_pos = json.find("\"messages\"");
+    if (messages_pos == std::string::npos) return result;
+
+    size_t arr_start = json.find('[', messages_pos);
+    if (arr_start == std::string::npos) return result;
+
+    size_t arr_end = json.find(']', arr_start);
+    if (arr_end == std::string::npos) return result;
+
+    std::string arr = json.substr(arr_start + 1, arr_end - arr_start - 1);
+
+    // Per ogni oggetto nell'array, estrai role e content
+    size_t obj_start = 0;
+    while ((obj_start = arr.find('{', obj_start)) != std::string::npos) {
+        size_t obj_end = arr.find('}', obj_start);
+        if (obj_end == std::string::npos) break;
+
+        std::string obj = arr.substr(obj_start + 1, obj_end - obj_start - 1);
+
+        std::string role;
+        std::string content;
+
+        // Estrai role
+        size_t rpos = obj.find("\"role\"");
+        if (rpos != std::string::npos) {
+            size_t rc = obj.find(':', rpos);
+            if (rc != std::string::npos) {
+                rc++;
+                while (rc < obj.size() && (obj[rc] == ' ' || obj[rc] == '"')) rc++;
+                size_t re = rc;
+                while (re < obj.size() && obj[re] != '"') re++;
+                role = obj.substr(rc, re - rc);
+            }
+        }
+
+        // Estrai content
+        size_t cpos = obj.find("\"content\"");
+        if (cpos != std::string::npos) {
+            size_t cc = obj.find(':', cpos);
+            if (cc != std::string::npos) {
+                cc++;
+                while (cc < obj.size() && (obj[cc] == ' ' || obj[cc] == '"')) cc++;
+                // Leggi content gestendo escape
+                while (cc < obj.size() && obj[cc] != '"') {
+                    if (obj[cc] == '\\' && cc + 1 < obj.size()) {
+                        cc++;
+                        switch (obj[cc]) {
+                            case 'n': content += '\n'; break;
+                            case 't': content += '\t'; break;
+                            case '"': content += '"'; break;
+                            case '\\': content += '\\'; break;
+                            default: content += obj[cc]; break;
+                        }
+                    } else {
+                        content += obj[cc];
+                    }
+                    cc++;
+                }
+            }
+        }
+
+        if (!role.empty()) {
+            result.push_back({role, content});
+        }
+
+        obj_start = obj_end + 1;
+    }
+
+    return result;
+}
+
 // ─────────────────────────────────────────────
 //  Escape caratteri speciali per JSON
 //
@@ -862,8 +940,8 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
     //
     //  Endpoint compatibile con l'API OpenAI chat.
     //  Accetta un array "messages" con role/content,
-    //  estrae l'ultimo messaggio utente, applica il
-    //  chat template se disponibile, e genera la risposta.
+    //  estrae TUTTA la conversazione, applica il chat
+    //  template multi-turn se disponibile, e genera la risposta.
     svr.Post("/v1/chat/completions",
         [&model, &tok, &queue](const httplib::Request& req,
                                httplib::Response& res) {
@@ -871,7 +949,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         std::cout << "[SERVER] POST /v1/chat/completions arrivata"
                   << " (body=" << req.body.size() << " bytes)\n";
 
-        std::string user_msg = json_get_last_user_message(req.body);
+        auto messages = json_get_chat_messages(req.body);
         int max_tokens = json_get_int(req.body, "max_tokens", 100);
         max_tokens = std::min(max_tokens, 500);
 
@@ -882,17 +960,17 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         params.rep_penalty = json_get_float(req.body, "repetition_penalty", 1.1f);
         params.greedy      = (params.temperature <= 0.0f);
 
-        if (user_msg.empty()) {
+        if (messages.empty()) {
             res.status = 400;
             res.set_content(
-                "{\"error\":\"nessun messaggio utente trovato in messages\"}",
+                "{\"error\":\"nessun messaggio trovato in messages\"}",
                 "application/json");
             return;
         }
 
         std::string prompt = tok.has_chat_template
-            ? apply_chat_template(tok, user_msg)
-            : user_msg;
+            ? apply_chat_template_conversation(tok, messages)
+            : json_get_last_user_message(req.body);
 
         bool stream = json_get_bool(req.body, "stream", false);
         std::cout << "[SERVER] /v1/chat/completions stream=" << (stream ? "true" : "false") << "\n";

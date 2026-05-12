@@ -556,6 +556,72 @@ std::string apply_chat_template(const Tokenizer& tok,
 }
 
 // ─────────────────────────────────────────────
+//  apply_chat_template_conversation
+//
+//  Come apply_chat_template ma per conversazioni multi-turn.
+//  Itera su tutti i messaggi e li formatta secondo il template.
+//  Aggiunge il tag assistant finale per invitare il modello a rispondere.
+// ─────────────────────────────────────────────
+std::string apply_chat_template_conversation(
+    const Tokenizer& tok,
+    const std::vector<std::pair<std::string, std::string>>& messages) {
+
+    const std::string& eos = tok.eos_token_str;
+
+    bool is_llama_chat = tok.chat_template.find("<|user|>")     != std::string::npos;
+    bool is_chatml     = tok.chat_template.find("<|im_start|>") != std::string::npos;
+    bool is_llama3     = tok.chat_template.find("<|start_header_id|>") != std::string::npos;
+
+    std::string result;
+
+    if (is_llama3) {
+        // Formato LLaMA-3 / Llama-3.2
+        for (const auto& [role, content] : messages) {
+            if (role == "system") {
+                result += "<|start_header_id|>system<|end_header_id|>\n\n"
+                       +  content + "<|eot_id|>";
+            } else if (role == "user") {
+                result += "<|start_header_id|>user<|end_header_id|>\n\n"
+                       +  content + "<|eot_id|>";
+            } else if (role == "assistant") {
+                result += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                       +  content + "<|eot_id|>";
+            }
+        }
+        result += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+
+    } else if (is_llama_chat) {
+        // Formato TinyLlama / LLaMA-chat
+        for (const auto& [role, content] : messages) {
+            if (role == "system") {
+                result += "<|system|>\n" + content + eos + "\n";
+            } else if (role == "user") {
+                result += "<|user|>\n" + content + eos + "\n";
+            } else if (role == "assistant") {
+                result += "<|assistant|>\n" + content + eos + "\n";
+            }
+        }
+        result += "<|assistant|>\n";
+
+    } else if (is_chatml) {
+        // Formato ChatML (Mistral/Qwen)
+        for (const auto& [role, content] : messages) {
+            result += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+        }
+        result += "<|im_start|>assistant\n";
+
+    } else {
+        // Fallback: concatenazione grezza
+        for (const auto& [role, content] : messages) {
+            result += role + ": " + content + "\n";
+        }
+        result += "assistant: ";
+    }
+
+    return result;
+}
+
+// ─────────────────────────────────────────────
 //  Print info
 // ─────────────────────────────────────────────
 void tokenizer_print_info(const Tokenizer& tok) {
