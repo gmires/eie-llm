@@ -44,10 +44,13 @@ static uint32_t get_u32(const GGUFContext& ctx,
 //  vengono sempre acceduti come float32.
 // ─────────────────────────────────────────────
 static std::vector<float> load_tensor(const GGUFContext& ctx,
-                                      const std::string& name) {
+                                       const std::string& name,
+                                       bool required = true) {
     const GGUFTensor* t = gguf_find_tensor(ctx, name);
     if (!t) {
-        std::cerr << "[ERRORE] Tensore non trovato: " << name << "\n";
+        if (required) {
+            std::cerr << "[ERRORE] Tensore non trovato: " << name << "\n";
+        }
         return {};
     }
     return tensor_to_float(*t);
@@ -61,10 +64,13 @@ static std::vector<float> load_tensor(const GGUFContext& ctx,
 //  durante matvec_quant() al momento del calcolo.
 // ─────────────────────────────────────────────
 static QuantTensor load_quant_tensor(const GGUFContext& ctx,
-                                     const std::string& name) {
+                                     const std::string& name,
+                                     bool required = true) {
     const GGUFTensor* t = gguf_find_tensor(ctx, name);
     if (!t) {
-        std::cerr << "[ERRORE] Tensore non trovato: " << name << "\n";
+        if (required) {
+            std::cerr << "[ERRORE] Tensore non trovato: " << name << "\n";
+        }
         return {};
     }
     QuantTensor qt;
@@ -97,27 +103,35 @@ bool model_load_config(ModelConfig& cfg, const GGUFContext& ctx) {
             if (auto* s = kv.value.get_if<std::string>())
                 arch_str = *s;
 
-    if (arch_str == "llama") {
+    if (arch_str == "llama" || arch_str == "qwen2") {
+        // Qwen2 è architetturalmente identico a LLaMA:
+        // RMSNorm, RoPE, GQA, SwiGLU. Le differenze sono solo
+        // nei nomi dei metadata (qwen2.* invece di llama.*)
+        // e in alcuni dettagli (es. bias su Q/K/V).
         cfg.arch = ArchType::LLAMA;
 
+        std::string prefix = (arch_str == "qwen2") ? "qwen2." : "llama.";
+
         cfg.n_vocab  = get_u32(ctx, "tokenizer.ggml.vocab_size", 32000);
-        cfg.n_ctx    = get_u32(ctx, "llama.context_length",      2048);
-        cfg.n_embd   = get_u32(ctx, "llama.embedding_length",    2048);
-        cfg.n_head   = get_u32(ctx, "llama.attention.head_count", 32);
-        cfg.n_head_kv= get_u32(ctx, "llama.attention.head_count_kv", cfg.n_head);
-        cfg.n_layer  = get_u32(ctx, "llama.block_count",         22);
-        cfg.n_ff     = get_u32(ctx, "llama.feed_forward_length", 5632);
-        cfg.rope_dim = get_u32(ctx, "llama.rope.dimension_count", 0);
+        cfg.n_ctx    = get_u32(ctx, prefix + "context_length",      2048);
+        cfg.n_embd   = get_u32(ctx, prefix + "embedding_length",    2048);
+        cfg.n_head   = get_u32(ctx, prefix + "attention.head_count", 32);
+        cfg.n_head_kv= get_u32(ctx, prefix + "attention.head_count_kv", cfg.n_head);
+        cfg.n_layer  = get_u32(ctx, prefix + "block_count",         22);
+        cfg.n_ff     = get_u32(ctx, prefix + "feed_forward_length", 5632);
+        cfg.rope_dim = get_u32(ctx, prefix + "rope.dimension_count", 0);
 
         // RMSNorm epsilon
+        std::string eps_key = prefix + "attention.layer_norm_rms_epsilon";
         for (const auto& kv : ctx.metadata)
-            if (kv.key == "llama.attention.layer_norm_rms_epsilon")
+            if (kv.key == eps_key)
                 if (auto* v = kv.value.get_if<float>())
                     cfg.norm_eps = *v;
 
         // RoPE freq base
+        std::string freq_key = prefix + "rope.freq_base";
         for (const auto& kv : ctx.metadata)
-            if (kv.key == "llama.rope.freq_base")
+            if (kv.key == freq_key)
                 if (auto* v = kv.value.get_if<float>())
                     cfg.rope_freq_base = *v;
 
@@ -137,35 +151,31 @@ bool model_load_config(ModelConfig& cfg, const GGUFContext& ctx) {
 
     cfg.d_head = cfg.n_embd / cfg.n_head;
 
+    // Limita n_ctx per evitare OOM con modelli che dichiarano
+    // context window enormi (es. Llama-3.2: 128K → KV cache ~84GB).
+    // In pratica 4K-8K sono sufficienti per la maggior parte dei casi.
+    const int MAX_CTX = 8192;
+    if (cfg.n_ctx > MAX_CTX) {
+        std::cerr << "  [AVVISO] n_ctx=" << cfg.n_ctx
+                  << " limitato a " << MAX_CTX
+                  << " per risparmiare memoria (KV cache).\n"
+                  << "          Usa --context N per override.\n";
+        cfg.n_ctx = MAX_CTX;
+    }
+
     // rope_dim fallback: se non specificato nei metadata usa d_head
     if (cfg.arch == ArchType::LLAMA && cfg.rope_dim == 0)
         cfg.rope_dim = cfg.d_head;
 
-    if (cfg.n_embd == 0 || cfg.n_head == 0 || cfg.n_layer == 0) {
-        std::cerr << "[ERRORE] Configurazione non valida\n";
-        return false;
-    }
+    // Qwen2 usa RoPE tipo NEOX (coppie scambiate), non NORM
+    if (arch_str == "qwen2")
+        cfg.rope_type = RopeType::NEOX;
+
     return true;
 }
 
 // ─────────────────────────────────────────────
 //  Carica tutti i pesi del modello
-//
-//  I nomi dei tensori in GPT-2 GGUF seguono
-//  questa convenzione:
-//
-//  Globali:
-//    token_embd.weight       → token embeddings
-//    position_embd.weight    → positional embeddings
-//    output_norm.weight/bias → layer norm finale
-//
-//  Per layer i (0-based):
-//    blk.i.attn_norm.weight/bias  → ln1
-//    blk.i.attn_qkv.weight/bias   → Q/K/V proiez.
-//    blk.i.attn_output.weight/bias → out proiez.
-//    blk.i.ffn_norm.weight/bias   → ln2
-//    blk.i.ffn_up.weight/bias     → fc1
-//    blk.i.ffn_down.weight/bias   → fc2
 // ─────────────────────────────────────────────
 bool model_load_weights(Model& model, const GGUFContext& ctx) {
     const ModelConfig& cfg = model.config;
@@ -192,9 +202,13 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
 
     } else {
         // LLaMA: lm_head separato, no positional embedding
-        w.output_w = load_quant_tensor(ctx, "output.weight");
-        if (w.output_w.empty()) return false;
+        w.output_w = load_quant_tensor(ctx, "output.weight", false);
+        // Se output.weight non esiste (tie embedding, es. Llama-3.x),
+        // il lm_head è condiviso con token_embd. Non fallire.
         // ln_f_b non esiste in LLaMA — lascia vuoto
+
+        // Qwen2: bias opzionale sul lm_head
+        w.output_b = load_tensor(ctx, "output.bias", false);
     }
 
     // ── Pesi per layer ────────────────────────
@@ -225,11 +239,15 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
             }
 
         } else {
-            // LLaMA: no bias, Q/K/V separati
+            // LLaMA / Qwen2: Q/K/V separati, bias opzionali
             lw.ln1_w      = load_tensor      (ctx, p + "attn_norm.weight");
             lw.attn_q_w   = load_quant_tensor(ctx, p + "attn_q.weight");
             lw.attn_k_w   = load_quant_tensor(ctx, p + "attn_k.weight");
             lw.attn_v_w   = load_quant_tensor(ctx, p + "attn_v.weight");
+            // Qwen2 ha bias su Q/K/V; LLaMA standard no — usiamo required=false
+            lw.attn_q_b   = load_tensor      (ctx, p + "attn_q.bias", false);
+            lw.attn_k_b   = load_tensor      (ctx, p + "attn_k.bias", false);
+            lw.attn_v_b   = load_tensor      (ctx, p + "attn_v.bias", false);
             lw.attn_out_w = load_quant_tensor(ctx, p + "attn_output.weight");
             lw.ln2_w      = load_tensor      (ctx, p + "ffn_norm.weight");
             lw.ffn_gate_w = load_quant_tensor(ctx, p + "ffn_gate.weight");
@@ -545,6 +563,11 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
     matvec_quant(lw.attn_k_w, x, bufs.K.data());
     matvec_quant(lw.attn_v_w, x, bufs.V.data());
 
+    // Aggiungi bias se presenti (Qwen2 ha bias su Q/K/V)
+    if (!lw.attn_q_b.empty()) vec_add(bufs.Q.data(), lw.attn_q_b.data(), bufs.Q.data(), cfg.n_embd);
+    if (!lw.attn_k_b.empty()) vec_add(bufs.K.data(), lw.attn_k_b.data(), bufs.K.data(), kv_dim);
+    if (!lw.attn_v_b.empty()) vec_add(bufs.V.data(), lw.attn_v_b.data(), bufs.V.data(), kv_dim);
+
     // ── Step 2: applica RoPE a Q e K ─────────
     //
     // RoPE ruota ogni coppia di dimensioni in base
@@ -552,8 +575,13 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
     // in cache in modo che la cache contenga già
     // i vettori ruotati — non bisogna ricalcolare
     // la rotazione per i token già in cache.
-    rope(bufs.Q.data(), pos, n_head,    d_head, rope_dim, cfg.rope_freq_base);
-    rope(bufs.K.data(), pos, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+    if (cfg.rope_type == RopeType::NEOX) {
+        rope_neox(bufs.Q.data(), pos, n_head,    d_head, rope_dim, cfg.rope_freq_base);
+        rope_neox(bufs.K.data(), pos, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+    } else {
+        rope(bufs.Q.data(), pos, n_head,    d_head, rope_dim, cfg.rope_freq_base);
+        rope(bufs.K.data(), pos, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+    }
 
     // ── Step 3: salva K e V nella cache ──────
     float* k_pos = cache.k[layer].data() + pos * kv_dim;
@@ -768,10 +796,16 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
                    w.ln_f_b.data(), b.ln_final.data(), n_embd);
 
     // ── Step 4: lm_head → logits ──────────────
-    logits.resize(cfg.n_vocab);
-    // LLaMA: lm_head separato | GPT2: weight tying con token_embd
-    const QuantTensor& lm_head = is_llama ? w.output_w : w.token_embd;
+    // LLaMA: lm_head separato (o tie embedding se output_w è vuoto)
+    // GPT2: weight tying con token_embd
+    const QuantTensor& lm_head = (is_llama && !w.output_w.empty()) ? w.output_w : w.token_embd;
+    // Defensive: resize in base alla vera dimensione del lm_head,
+    // non a cfg.n_vocab (che potrebbe essere errata nei metadata).
+    logits.resize(lm_head.n_rows);
     matvec_quant(lm_head, b.ln_final.data(), logits.data());
+    if (!w.output_b.empty()) {
+        vec_add(logits.data(), w.output_b.data(), logits.data(), static_cast<int>(lm_head.n_rows));
+    }
 
     // ── Accumula tempi benchmark ───────────────
     if (bench_mode) {
@@ -1043,11 +1077,30 @@ static void self_attention_llama_prefill(const float* x_batch, float* out_batch,
     matvec_quant_batch(lw.attn_k_w, x_batch, K_batch.data(), N);
     matvec_quant_batch(lw.attn_v_w, x_batch, V_batch.data(), N);
 
+    // Aggiungi bias se presenti (Qwen2 ha bias su Q/K/V)
+    if (!lw.attn_q_b.empty()) {
+        for (int t = 0; t < N; t++)
+            vec_add(Q_batch.data() + t * n_embd, lw.attn_q_b.data(), Q_batch.data() + t * n_embd, n_embd);
+    }
+    if (!lw.attn_k_b.empty()) {
+        for (int t = 0; t < N; t++)
+            vec_add(K_batch.data() + t * kv_dim, lw.attn_k_b.data(), K_batch.data() + t * kv_dim, kv_dim);
+    }
+    if (!lw.attn_v_b.empty()) {
+        for (int t = 0; t < N; t++)
+            vec_add(V_batch.data() + t * kv_dim, lw.attn_v_b.data(), V_batch.data() + t * kv_dim, kv_dim);
+    }
+
     // RoPE per tutte le posizioni (globali)
     for (int t = 0; t < N; t++) {
         int global_t = base_pos + t;
-        rope(Q_batch.data() + t * n_embd, global_t, n_head,    d_head, rope_dim, cfg.rope_freq_base);
-        rope(K_batch.data() + t * kv_dim, global_t, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+        if (cfg.rope_type == RopeType::NEOX) {
+            rope_neox(Q_batch.data() + t * n_embd, global_t, n_head,    d_head, rope_dim, cfg.rope_freq_base);
+            rope_neox(K_batch.data() + t * kv_dim, global_t, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+        } else {
+            rope(Q_batch.data() + t * n_embd, global_t, n_head,    d_head, rope_dim, cfg.rope_freq_base);
+            rope(K_batch.data() + t * kv_dim, global_t, n_head_kv, d_head, rope_dim, cfg.rope_freq_base);
+        }
     }
 
     // Salva K e V nella cache alle posizioni base_pos + t
@@ -1248,9 +1301,12 @@ void forward_prefill(Model& model, const std::vector<int>& token_ids, std::vecto
     }
 
     // ── lm_head: solo l'ULTIMO token serve ──────
-    logits.resize(cfg.n_vocab);
-    const QuantTensor& lm_head = is_llama ? w.output_w : w.token_embd;
+    const QuantTensor& lm_head = (is_llama && !w.output_w.empty()) ? w.output_w : w.token_embd;
+    logits.resize(lm_head.n_rows);
     matvec_quant(lm_head, ln_out_batch.data() + (N - 1) * n_embd, logits.data());
+    if (!w.output_b.empty()) {
+        vec_add(logits.data(), w.output_b.data(), logits.data(), static_cast<int>(lm_head.n_rows));
+    }
 
     // Salva lo stato dell'ultimo token per la generazione sequenziale
     vec_copy(ln_out_batch.data() + (N - 1) * n_embd, model.bufs.x.data(), n_embd);
@@ -1364,10 +1420,13 @@ void forward_verify(Model& model, const std::vector<int>& token_ids,
 
     // lm_head: logits per TUTTI i token
     all_logits.resize(N);
-    const QuantTensor& lm_head = is_llama ? w.output_w : w.token_embd;
+    const QuantTensor& lm_head = (is_llama && !w.output_w.empty()) ? w.output_w : w.token_embd;
     for (int t = 0; t < N; t++) {
-        all_logits[t].resize(cfg.n_vocab);
+        all_logits[t].resize(lm_head.n_rows);
         matvec_quant(lm_head, ln_out_batch.data() + t * n_embd, all_logits[t].data());
+        if (!w.output_b.empty()) {
+            vec_add(all_logits[t].data(), w.output_b.data(), all_logits[t].data(), static_cast<int>(lm_head.n_rows));
+        }
     }
 
     // Salva lo stato dell'ultimo token per la generazione sequenziale

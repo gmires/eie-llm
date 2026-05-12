@@ -590,14 +590,21 @@ void matvec_quant_batch(const QuantTensor& A, const float* x_batch, float* y_bat
         case GGMLType::Q6_K: {
             // Dequantizza una riga alla volta, accumula per tutti i token.
             // Il loop order j, t è cache-friendly: w è riutilizzato per tutti i token.
-            std::vector<float> row(in_dim);
-            #pragma omp parallel for if(out_dim > 512)
-            for (int i = 0; i < out_dim; i++) {
-                dequant_row(A, i, row.data());
-                for (int j = 0; j < in_dim; j++) {
-                    float w = row[j];
-                    for (int t = 0; t < N; t++) {
-                        y_batch[t * out_dim + i] += w * x_batch[t * in_dim + j];
+            //
+            // BUG FIX: row deve essere PRIVATE per ogni thread OpenMP.
+            // Prima era dichiarata fuori dal parallel for → shared → data race
+            // e potenziale memory corruption con molti thread.
+            #pragma omp parallel if(out_dim > 512)
+            {
+                std::vector<float> row(in_dim);
+                #pragma omp for
+                for (int i = 0; i < out_dim; i++) {
+                    dequant_row(A, i, row.data());
+                    for (int j = 0; j < in_dim; j++) {
+                        float w = row[j];
+                        for (int t = 0; t < N; t++) {
+                            y_batch[t * out_dim + i] += w * x_batch[t * in_dim + j];
+                        }
                     }
                 }
             }
@@ -833,8 +840,8 @@ void rms_norm(const float* x, const float* w,
 //  rimangono invariate.
 // ─────────────────────────────────────────────
 void rope(float* x, int pos,
-          int n_heads, int d_head,
-          int rope_dim, float freq_base) {
+           int n_heads, int d_head,
+           int rope_dim, float freq_base) {
     // Numero di coppie su cui applicare RoPE
     int half_dim = rope_dim / 2;
 
@@ -856,6 +863,42 @@ void rope(float* x, int pos,
             // Applica la rotazione
             xh[2 * i]     = x0 * cos_t - x1 * sin_t;
             xh[2 * i + 1] = x0 * sin_t + x1 * cos_t;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+//  RoPE tipo NEOX (usato da Qwen2, Phi, Gemma)
+//
+//  Differenza rispetto a RoPE NORM (LLaMA):
+//  Invece di ruotare coppie consecutive (0,1), (2,3)...
+//  ruota coppie scambiate: (0, half_dim), (1, half_dim+1)...
+//
+//  Per ogni head h e ogni dimensione i in [0, half_dim):
+//    θ = pos / (freq_base ^ (2i / rope_dim))
+//    x[h*d_head + i]              = x[i] * cos(θ) - x[i + half_dim] * sin(θ)
+//    x[h*d_head + i + half_dim]   = x[i] * sin(θ) + x[i + half_dim] * cos(θ)
+// ─────────────────────────────────────────────
+void rope_neox(float* x, int pos,
+               int n_heads, int d_head,
+               int rope_dim, float freq_base) {
+    int half_dim = rope_dim / 2;
+
+    for (int h = 0; h < n_heads; h++) {
+        float* xh = x + h * d_head;
+
+        for (int i = 0; i < half_dim; i++) {
+            float theta = (float)pos /
+                powf(freq_base, (2.0f * i) / (float)rope_dim);
+
+            float cos_t = cosf(theta);
+            float sin_t = sinf(theta);
+
+            float x0 = xh[i];
+            float x1 = xh[i + half_dim];
+
+            xh[i]           = x0 * cos_t - x1 * sin_t;
+            xh[i + half_dim] = x0 * sin_t + x1 * cos_t;
         }
     }
 }

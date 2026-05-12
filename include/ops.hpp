@@ -224,6 +224,11 @@ void rms_norm(const float* x, const float* w, float* out, int n, float eps);
 // ─────────────────────────────────────────────
 void rope(float* x, int pos, int n_heads, int d_head, int rope_dim, float freq_base);
 
+// RoPE tipo NEOX (usato da Qwen2, Phi, Gemma).
+// Ruota coppie scambiate (i, i+half_dim) invece
+// di coppie consecutive (2i, 2i+1).
+void rope_neox(float* x, int pos, int n_heads, int d_head, int rope_dim, float freq_base);
+
 // ─────────────────────────────────────────────
 //  SiLU activation
 //

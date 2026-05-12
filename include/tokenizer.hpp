@@ -67,6 +67,11 @@ struct Tokenizer {
 
     // true se il GGUF contiene un chat template riconoscibile.
     bool has_chat_template = false;
+
+    // Token speciali (controllo) per modelli come Llama-3.
+    // Popolati durante l'init: tutti i token con token_type == 3,
+    // ordinati per lunghezza decrescente per il matching greedy.
+    std::vector<std::pair<std::string, int>> special_tokens;
 };
 
 // Inizializza il tokenizer dai metadata GGUF

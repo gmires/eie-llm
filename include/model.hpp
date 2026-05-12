@@ -15,6 +15,19 @@ enum class ArchType {
 };
 
 // ─────────────────────────────────────────────
+//  Tipo di RoPE (Rotary Position Embedding)
+//
+//  NORM  — LLaMA standard: ruota coppie consecutive
+//          (x[0],x[1]), (x[2],x[3])...
+//  NEOX  — Qwen2, Phi, Gemma: ruota coppie scambiate
+//          (x[0],x[half]), (x[1],x[half+1])...
+// ─────────────────────────────────────────────
+enum class RopeType {
+    NORM,
+    NEOX
+};
+
+// ─────────────────────────────────────────────
 //  Iperparametri del modello
 //
 //  Tutti i valori vengono letti dai metadata
@@ -35,7 +48,8 @@ struct ModelConfig {
     int d_head;    // dimensione per head     (64  = n_embd / n_head)
     int rope_dim         = 0;   // dimensioni RoPE (LLaMA)
     float norm_eps       = 1e-5f;  // epsilon per RMSNorm/LayerNorm
-    float rope_freq_base = 10000.0f;    
+    float rope_freq_base = 10000.0f;
+    RopeType rope_type   = RopeType::NORM;  // tipo di RoPE (NORM/NEOX)
 };
 
 // ─────────────────────────────────────────────
@@ -64,6 +78,10 @@ struct LayerWeights {
     QuantTensor attn_q_w;
     QuantTensor attn_k_w;
     QuantTensor attn_v_w;
+    // Qwen2 ha bias su Q, K, V (LLaMA standard no)
+    std::vector<float> attn_q_b;
+    std::vector<float> attn_k_b;
+    std::vector<float> attn_v_b;
 
     // Output projection (comune a entrambi)
     QuantTensor        attn_out_w;
@@ -106,6 +124,9 @@ struct ModelWeights {
 
     // LLaMA: lm_head separato — grande (n_vocab × n_embd), rimane quantizzato
     QuantTensor output_w;
+
+    // Qwen2: bias opzionale sul lm_head (output.bias)
+    std::vector<float> output_b;
 
     std::vector<LayerWeights> layers;
 };

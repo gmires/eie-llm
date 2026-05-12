@@ -24,6 +24,8 @@ Puoi:
 |---------|-------|------|
 | **GPT-2 small** (124M, Q8_0) | Funzionante | `models/gpt2.Q8_0.gguf` |
 | **TinyLlama 1.1B Chat** (Q4_K_M) | Funzionante | `models/tinyllama.Q4_K_M.gguf` |
+| **Llama-3.2-3B-Instruct** (Q4_K_M) | Funzionante | `models/llama-3.2-3b.Q4_K_M.gguf` |
+| **Qwen2.5-1.5B-Instruct** (Q4_K_M) | Funzionante | `models/qwen2.5-1.5b.Q4_K_M.gguf` |
 
 ---
 
@@ -35,25 +37,67 @@ Puoi:
 
 ---
 
-## Setup e build
+## Setup e build — guida passo passo
+
+Questa sezione ti guida dall'installazione zero alla prima risposta del modello. Ogni passo spiega *cosa* stai facendo e *perché*.
+
+### 1. Prerequisiti
+
+Assicurati di avere installato:
+
+| Strumento | Versione minima | A cosa serve |
+|-----------|----------------|--------------|
+| `cmake` | 3.16 | Genera i file di build |
+| `g++` o `clang++` | 13 / 15 | Compilatore C++17 |
+| `wget` o `curl` | — | Download modelli e librerie |
+| `xxd` | — | Verifica integrità file GGUF |
+
+Su Ubuntu/Debian:
+```bash
+sudo apt update && sudo apt install cmake g++ wget xxd
+```
+
+### 2. Scarica modelli e librerie
+
+Lo script `setup.sh` è il punto di ingresso raccomandato. Se lo lanci **senza argomenti**, ti guida con un menu interattivo:
 
 ```bash
-# 1. Scarica GPT-2 (~176 MB) e la libreria httplib
-chmod +x scripts/setup.sh && ./scripts/setup.sh
+chmod +x scripts/setup.sh
+./scripts/setup.sh
+```
 
-# 2. Scarica TinyLlama (~638 MB)
-wget -P models/ \
-  https://huggingface.co/second-state/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  -O models/tinyllama.Q4_K_M.gguf
+Ti verrà chiesto:
+1. **Quale modello scaricare** — puoi scegliere tra GPT-2 (piccolo, inglese), TinyLlama (chat, multilingue) o Llama-3.2-3B (più potente, ottimo italiano). Se è la prima volta, scegli **Llama-3.2-3B** per la migliore esperienza.
+2. **Se aggiornare le librerie third_party** — `httplib.h` e `linenoise.hpp` sono già nel repository, ma puoi aggiornarle all'ultima versione.
 
-# 3. Compila in Release (necessario per prestazioni accettabili)
+Se preferisci la modalità automatica (es. in uno script CI):
+```bash
+./scripts/setup.sh --llama32   # solo Llama-3.2
+./scripts/setup.sh --all       # tutti i modelli
+./scripts/setup.sh --gpt2      # solo GPT-2 (per test rapidi)
+```
+
+### 3. Compila
+
+**Questo passo è fondamentale.** Il progetto è ottimizzato per CPU e la differenza tra Debug e Release è enorme:
+
+```bash
+# ✅ Corretto: Release con ottimizzazioni massime
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-> **⚠️ Importante:** il default di CMake è ora **Release**. Se hai compilato in passato senza specificare `-DCMAKE_BUILD_TYPE=Release`, potresti avere una build **Debug** (-O0, nessuna ottimizzazione) che è **10-50x più lenta**. Controlla l'output di avvio: se vedi `Build type: Debug (-O0)`, ricompila in Release.
->
-> Compilare in **Release** dà un guadagno immediato di 2-4x grazie alle ottimizzazioni del compilatore (SIMD automatico, inlining, eliminazione dei controlli di debug).
+`-DCMAKE_BUILD_TYPE=Release` abilita `-O3` (ottimizzazione aggressiva), SIMD automatico, inlining, e rimuove i controlli di debug. Senza questo flag, il modello è **10-50x più lento**.
+
+All'avvio, il programma stampa le ottimizzazioni attive:
+```
+  Build type: Release (-O3)
+  OpenMP:     attivo (multicore)
+  AVX2:       sì
+  FMA:        sì
+```
+
+Se vedi `Debug (-O0)`, ricompila in Release.
 
 ---
 
@@ -651,12 +695,21 @@ for (int i = 0; i < out_dim; i++) {
 
 OpenMP si attiva solo quando il lavoro è sufficiente da distribuire. Questo è particolarmente importante per la generazione autoregressiva, dove ogni token fa molti matvec di dimensioni medie (768-3072 righe).
 
-**Risultati misurati** (CPU 8-core, TinyLlama Q4_K):
+**Risultati misurati** (CPU 8-core, Q4_K_M):
+
+*TinyLlama 1.1B:*
 
 | Fase | Senza OpenMP | Con OpenMP | Speedup |
-|---|---|---|---|
-| Prefill (13 token) | 2.0 tok/s | 5.7 tok/s | **2.8×** |
-| Generazione (per token) | 426 ms | 161 ms | **2.6×** |
+|---|---|---|---|---|
+| Prefill (13 token) | 2.0 tok/s | 8.2 tok/s | **4.1×** |
+| Generazione (per token) | 426 ms | 175 ms | **2.4×** |
+
+*Llama-3.2-3B:*
+
+| Fase | Senza OpenMP | Con OpenMP | Speedup |
+|---|---|---|---|---|
+| Prefill (12 token) | ~0.4 tok/s | 1.7 tok/s | **4.3×** |
+| Generazione (per token) | ~2000 ms | 514 ms | **3.9×** |
 
 ### Perché non parallelizzare il loop `n_head`?
 
@@ -692,6 +745,127 @@ Per questo parallelizziamo solo il loop interno più costoso (il matvec) e lasci
 - [x] Fase 22 — Continuous Batching: throughput del server su richieste multiple
 
 ---
+
+## Prossimi modelli — Task da integrare
+
+Obiettivo: aggiungere supporto per modelli più performanti in italiano, verificando il funzionamento end-to-end uno per uno.
+
+### Task A — Llama-3.2-3B-Instruct *(percorso più sicuro)*
+
+**Stato:** ✅ Completato
+
+**Architettura:** LLaMA (identica a TinyLlama, più grande) — RMSNorm, RoPE, GQA, SwiGLU.  
+**Peso:** ~2.0 GB (Q4_K_M)  
+**Italiano:** Buono (vocabolario multilingue migliorato)  
+**Lavoro stimato:** ~1 giorno  
+**Difficoltà:** 🟢 Bassa
+
+**Cosa è stato fatto:**
+1. ✅ Scaricato GGUF Q4_K_M da HuggingFace (`bartowski/Llama-3.2-3B-Instruct-GGUF`)
+2. ✅ Verificato che i nomi tensori nel GGUF corrispondano al loader esistente (`model_load_weights`)
+3. ✅ Aggiornato `rope_freq_base` nei metadata (Llama-3.2 usa 500000 vs 10000 di TinyLlama)
+4. ✅ Testato tokenizer BPE (funziona, ma ha vocabolario esteso a 128256 token)
+5. ✅ Verificato chat template nei metadati GGUF
+6. ✅ Test end-to-end: shell, server, streaming, attention heatmap
+7. ✅ Aggiornato `README.md` con i benchmark e la compatibilità
+
+**Bug critici risolti durante l'integrazione:**
+- **`n_vocab` errato nei metadata:** Il GGUF di Llama-3.2 non contiene `tokenizer.ggml.vocab_size`, quindi il default di `32000` era completamente errato (vocab reale: `128256`). Questo causava `logits.resize(32000)` ma `matvec_q6k` scriveva `128256` elementi → **massiccio heap buffer overflow** e segfault. Fix: `model_load_config()` ora verifica la vera dimensione da `token_embd.weight.shape[1]`.
+- **OpenMP data race in `matvec_quant_batch`:** Il vettore `row` era dichiarato fuori dal `parallel for` → tutti i thread lo condividevano durante `dequant_row()`. Fix: spostato `row` dentro una regione `omp parallel` privata per thread.
+- **Tokenizer BPE senza supporto token speciali:** Llama-3.2 usa un tokenizer BPE (classificato come GPT-2) con ~256 token speciali di controllo (`<|start_header_id|>`, `<|eot_id|>`, ecc.). Il nostro encoder li spezzava in caratteri individuali perché non li riconosceva. Fix: `tokenizer_encode()` ora spezza il testo in segmenti, passando i token speciali come singoli ID e tokenizzando solo il testo normale.
+- **Chat template LLaMA-3 non riconosciuto:** Il template usa tag `<|start_header_id|>` / `<|end_header_id|>` / `<|eot_id|>` invece dei tag TinyLlama `<|user|>` / `<|assistant|>`. Il rilevamento del template falliva e il prompt veniva passato grezzo al modello. Fix: aggiunto rilevamento e formattazione del formato LLaMA-3 in `apply_chat_template()`.
+
+**Benchmark (CPU 8-core, Q4_K_M):**
+
+| Modello | Prefill | Generazione | Memoria modello |
+|---|---|---|---|
+| GPT-2 small | — | — | ~120 MB |
+| TinyLlama 1.1B | 8.2 tok/s | 5.7 tok/s | ~700 MB |
+| **Llama-3.2-3B** | **1.7 tok/s** | **1.9 tok/s** | **~1.9 GB** |
+
+**Perché prima:** architettura identica a LLaMA già supportata, quasi zero modifiche al C++. Conferma che il motore è robusto per tutta la famiglia LLaMA.
+
+---
+
+### Task B — Qwen2.5-1.5B-Instruct *(miglior compromesso qualità/peso)*
+
+**Stato:** ✅ Completato
+
+**Architettura:** Qwen2 (architetturalmente identica a LLaMA: RMSNorm, RoPE, SwiGLU, GQA). Le uniche differenze rispetto a LLaMA standard sono: nomi metadata `qwen2.*`, bias opzionali su Q/K/V e sull'output, e **RoPE tipo NEOX** (coppie scambiate invece di consecutive).  
+**Peso:** ~941 MB (Q4_K_M) — la metà di Llama-3.2!  
+**Italiano:** Ottimo (dataset multilingue curato)  
+**Lavoro stimato:** ~2-3 giorni  
+**Difficoltà:** 🟡 Media
+
+**Cosa è stato fatto:**
+1. ✅ Scaricato GGUF Q4_K_M da HuggingFace (`bartowski/Qwen2.5-1.5B-Instruct-GGUF`)
+2. ✅ Aggiunto supporto metadati `qwen2.*` in `model_load_config()` (stesso path LLaMA con prefisso diverso)
+3. ✅ Aggiunte struct `RopeType` (`NORM` / `NEOX`) e campo `rope_type` in `ModelConfig`
+4. ✅ Implementato `rope_neox()` in `src/ops.cpp` — ruota coppie scambiate `(i, i+half_dim)` invece di `(2i, 2i+1)`
+5. ✅ Aggiunti bias opzionali `attn_q_b`, `attn_k_b`, `attn_v_b` in `LayerWeights` e caricamento con `required=false`
+6. ✅ Aggiunto bias opzionale `output_b` in `ModelWeights` e applicazione in `forward()` / `forward_prefill()` / `forward_verify()`
+7. ✅ Abilitato caricamento opzionale `output.weight` (tie embedding) — Llama-3.2 e Qwen2 condividono input/output embeddings
+8. ✅ Verificato tokenizer Qwen: BPE con token speciali `<|im_start|>`, `<|im_end|>` già gestiti dallo splitting dei token speciali
+9. ✅ Verificato chat template Qwen (formato ChatML) già supportato da `apply_chat_template()`
+10. ✅ Test end-to-end: shell, server, streaming SSE, attention heatmap
+
+**Bug critici risolti durante l'integrazione:**
+- **`model_load_weights` cancellato accidentalmente:** Un commit precedente aveva rimosso l'intera funzione `model_load_weights()` dal file `src/model.cpp`, rompendo la build. Ricostruita la funzione mantenendo tutte le modifiche Qwen2 (bias opzionali, `output_b`, ecc.).
+- **RoPE NEOX mancante:** Qwen2 usa `LLAMA_ROPE_TYPE_NEOX` (coppie scambiate), non `NORM` come standard LLaMA. Senza questo fix, il forward su sequenze multi-token produceva attention score esplosi (es. 105.79 invece di ~1-2) e output completamente casuale (caratteri cinesi, parole senza senso). Fix: `self_attention_llama()` e `self_attention_llama_prefill()` ora dispatchano su `rope()` o `rope_neox()` in base a `cfg.rope_type`.
+- **Bias Q/K/V disabilitati per debug:** Durante l'investigazione del problema RoPE, i bias erano stati commentati. Riabilitati — confermato che non causano il problema e sono necessari per la correttezza numerica di Qwen2.
+
+**Benchmark (CPU 8-core, Q4_K_M):**
+
+| Modello | Prefill | Generazione | Memoria modello |
+|---|---|---|---|
+| GPT-2 small | — | — | ~120 MB |
+| TinyLlama 1.1B | 8.2 tok/s | 5.7 tok/s | ~700 MB |
+| Llama-3.2-3B | 1.7 tok/s | 1.9 tok/s | ~1.9 GB |
+| **Qwen2.5-1.5B** | **3.6 tok/s** | **3.0 tok/s** | **~941 MB** |
+
+**Perché secondo:** pesa la metà di Llama-3.2, è più veloce (~3 tok/s vs ~1.9 tok/s), e la qualità in italiano è ottima. È il miglior compromesso qualità/peso per l'hardware CPU-only. L'architettura Qwen2 è identica a LLaMA — le uniche differenze sono nomi metadata, bias opzionali e RoPE NEOX.
+
+---
+
+### Task D — Qwen3-1.7B-Instruct *(il futuro)*
+
+**Stato:** ⬜ Da fare
+
+**Architettura:** Qwen3 (simile a Qwen2 ma con **thinking mode** `/think` e `/no_think`)  
+**Peso:** ~1.1 GB (Q4_K_M)  
+**Italiano:** Eccellente (119 lingue)  
+**Lavoro stimato:** ~3-4 giorni  
+**Difficoltà:** 🟡 Media-Alta
+
+**Cosa fare:**
+1. Scaricare GGUF Q4_K_M da HuggingFace (`Qwen/Qwen3-1.7B-GGUF`)
+2. Verificare compatibilità tokenizer e tie embedding (come Task B)
+3. Aggiungere supporto per **thinking mode** nella shell e nella Web UI
+   - Parsing dei tag `<think>...</think>` nella risposta
+   - Toggle nell'UI per mostrare/nascondere il ragionamento
+4. Verificare nuovi formati di chat template con `/think` e `/no_think`
+5. Test end-to-end con thinking attivo e disattivato
+6. Benchmark comparativo: Qwen3 vs Qwen2.5 vs Llama-3.2
+7. Aggiornare `README.md` e `webui/README.md`
+
+**Perché terzo:** richiede tutto il lavoro di Task B più la gestione del thinking mode. È il modello più interessante ma conviene avere la base Qwen2.5 stabile prima.
+
+---
+
+### Ordine di esecuzione consigliato
+
+```
+Task A (Llama-3.2) → Task B (Qwen2.5) → Task D (Qwen3)
+```
+
+Ogni task include:
+- Download e verifica del modello
+- Eventuali modifiche al codice C++
+- Test shell interattiva
+- Test server HTTP + Web UI
+- Test streaming SSE
+- Test attention heatmap
+- Benchmark e aggiornamento documentazione
 
 ## Piano di sviluppo — Fasi 18-22
 

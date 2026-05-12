@@ -91,6 +91,22 @@ bool tokenizer_init(Tokenizer& tok, const GGUFContext& ctx) {
                 tok.token_type.push_back(*i);
     }
 
+    // ── Token speciali (controllo) per modelli come Llama-3 ──
+    // Questi token NON devono essere normalizzati (SentencePiece aggiungerebbe
+    // ▁ all'inizio o sostituirebbe gli spazi). Vengono estratti e passati
+    // attraverso come token singoli durante l'encode.
+    for (int id = 0; id < tok.vocab_size; id++) {
+        if (id < (int)tok.token_type.size() && tok.token_type[id] == 3) {
+            tok.special_tokens.push_back({tok.id_to_token[id], id});
+        }
+    }
+    // Ordina per lunghezza decrescente: matching greedy preferisce
+    // token lunghi (es. <|start_header_id|> prima di <|eot_id|>).
+    std::sort(tok.special_tokens.begin(), tok.special_tokens.end(),
+              [](const auto& a, const auto& b) {
+                  return a.first.size() > b.first.size();
+              });
+
     // ── Merge rules (usate solo per GPT-2 BPE) ───
     const GGUFArray* merges_arr = find_array(ctx, "tokenizer.ggml.merges");
     if (merges_arr) {
@@ -241,27 +257,15 @@ static std::vector<int> encode_gpt2(const Tokenizer& tok,
 //    Partendo dalla fine, si risale la catena di best_tok
 //    e best_prev per ricostruire la sequenza di token.
 // ─────────────────────────────────────────────
-static std::vector<int> encode_sentencepiece(const Tokenizer& tok,
-                                              const std::string& text) {
-    static const std::string SP = "\xe2\x96\x81";  // ▁ in UTF-8
+// ─────────────────────────────────────────────
+//  Viterbi su testo già normalizzato
+// ─────────────────────────────────────────────
+static std::vector<int> viterbi_sentencepiece(const Tokenizer& tok,
+                                                const std::string& norm) {
+    int n = (int)norm.size();
+    if (n == 0) return {};
 
-    if (text.empty()) return {};
-
-    // ── 1. Normalizzazione ────────────────────
-    // Prepone ▁ e sostituisce ogni spazio con ▁.
-    // Nota: ▁ è parte del carattere, non un separatore —
-    // il Viterbi lavora poi sull'intera stringa normalizzata.
-    std::string norm;
-    norm.reserve(text.size() + SP.size());
-    norm = SP;
-    for (char c : text) {
-        if (c == ' ') norm += SP;
-        else          norm += c;
-    }
-
-    // ── 2. Precalcola mappa byte → token di fallback ──
-    // SentencePiece include "<0x00>".."<0xFF>" nel vocabolario
-    // per gestire byte altrimenti non rappresentabili.
+    // Precalcola mappa byte → token di fallback
     std::array<int, 256> byte_tok;
     byte_tok.fill(tok.unk_id);
     for (int b = 0; b < 256; b++) {
@@ -272,12 +276,6 @@ static std::vector<int> encode_sentencepiece(const Tokenizer& tok,
             byte_tok[b] = it->second;
     }
 
-    // ── 3. Viterbi forward ────────────────────
-    int n = (int)norm.size();
-
-    // best_score[i]: massima somma log-prob per coprire norm[0..i)
-    // best_tok[i]:   token che termina in posizione i nella soluzione ottima
-    // best_prev[i]:  posizione di partenza di quel token
     std::vector<float> best_score(n + 1, -1e30f);
     std::vector<int>   best_tok  (n + 1, -1);
     std::vector<int>   best_prev (n + 1, -1);
@@ -287,16 +285,12 @@ static std::vector<int> encode_sentencepiece(const Tokenizer& tok,
     for (int i = 0; i < n; i++) {
         if (best_score[i] < -1e29f) continue;
 
-        // Prova tutti i token del vocabolario che iniziano in i.
-        // max_token_len limita la lunghezza massima del substr da cercare.
         int end = std::min(n, i + tok.max_token_len);
         for (int j = i + 1; j <= end; j++) {
             auto it = tok.token_to_id.find(norm.substr(i, j - i));
             if (it == tok.token_to_id.end()) continue;
 
             int   tid   = it->second;
-            // Punteggio del token: log-prob dal campo scores del GGUF.
-            // Se scores non è disponibile (GPT-2 puro) usa 0 come default.
             float score = (!tok.scores.empty() && tid < (int)tok.scores.size())
                           ? tok.scores[tid] : 0.0f;
             float ns    = best_score[i] + score;
@@ -308,21 +302,16 @@ static std::vector<int> encode_sentencepiece(const Tokenizer& tok,
             }
         }
 
-        // Fallback: se la posizione i+1 è ancora irraggiungibile,
-        // emetti il byte-token per norm[i]. Questo garantisce che
-        // il Viterbi raggiunga sempre la fine del testo.
         if (i + 1 <= n && best_score[i + 1] < -1e29f) {
             unsigned char b = (unsigned char)norm[i];
             int tid  = byte_tok[b];
-            float ns = best_score[i] - 10.0f;  // penalità byte sconosciuto
+            float ns = best_score[i] - 10.0f;
             best_score[i + 1] = ns;
             best_tok  [i + 1] = tid;
             best_prev [i + 1] = i;
         }
     }
 
-    // ── 4. Backtrace ──────────────────────────
-    // Ricostruisce la sequenza ottima partendo dalla fine.
     std::vector<int> result;
     int pos = n;
     while (pos > 0 && best_tok[pos] != -1) {
@@ -334,11 +323,37 @@ static std::vector<int> encode_sentencepiece(const Tokenizer& tok,
 }
 
 // ─────────────────────────────────────────────
+//  Encode SentencePiece con supporto token speciali
+//
+//  Spezza il testo in segmenti separati dai token speciali
+//  (token_type == 3, es. <|start_header_id|> di Llama-3).
+//  I token speciali NON vengono normalizzati (SentencePiece
+//  aggiungerebbe ▁ all'inizio), ma passano attraverso
+//  come token singoli. Il testo tra i token speciali viene
+//  normalizzato e tokenizzato con Viterbi come al solito.
+// ─────────────────────────────────────────────
+static std::vector<int> encode_sentencepiece(const Tokenizer& tok,
+                                              const std::string& text) {
+    static const std::string SP = "\xe2\x96\x81";  // ▁ in UTF-8
+
+    if (text.empty()) return {};
+
+    std::string norm;
+    norm.reserve(text.size() + SP.size());
+    norm = SP;
+    for (char c : text) {
+        if (c == ' ') norm += SP;
+        else          norm += c;
+    }
+    return viterbi_sentencepiece(tok, norm);
+}
+
+// ─────────────────────────────────────────────
 //  Encode pubblico
 // ─────────────────────────────────────────────
 std::vector<int> tokenizer_encode(const Tokenizer& tok,
-                                  const std::string& text,
-                                  bool add_bos) {
+                                   const std::string& text,
+                                   bool add_bos) {
     if (text.empty()) return {};
 
     std::vector<int> ids;
@@ -347,11 +362,61 @@ std::vector<int> tokenizer_encode(const Tokenizer& tok,
     if (add_bos && tok.type == TokenizerType::SENTENCEPIECE)
         ids.push_back(tok.bos_id);
 
-    auto encoded = (tok.type == TokenizerType::SENTENCEPIECE)
-        ? encode_sentencepiece(tok, text)
-        : encode_gpt2(tok, text);
+    // Se non ci sono token speciali, usa l'encoder nativo direttamente
+    if (tok.special_tokens.empty()) {
+        auto encoded = (tok.type == TokenizerType::SENTENCEPIECE)
+            ? encode_sentencepiece(tok, text)
+            : encode_gpt2(tok, text);
+        ids.insert(ids.end(), encoded.begin(), encoded.end());
+        return ids;
+    }
 
-    ids.insert(ids.end(), encoded.begin(), encoded.end());
+    // ── Token speciali splitting (GPT-2 e SentencePiece) ──
+    // Spezza il testo in segmenti: testo normale | token speciale.
+    // I token speciali (control) passano attraverso senza essere
+    // processati dall'encoder (che li spezzerebbe in caratteri).
+    struct Segment { bool is_special; std::string text; int special_id; };
+    std::vector<Segment> segments;
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        bool found = false;
+        for (const auto& [tok_str, tok_id] : tok.special_tokens) {
+            if (!tok_str.empty() && text.compare(pos, tok_str.size(), tok_str) == 0) {
+                segments.push_back({true, tok_str, tok_id});
+                pos += tok_str.size();
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+
+        size_t next_special = std::string::npos;
+        for (const auto& [tok_str, tok_id] : tok.special_tokens) {
+            size_t found = text.find(tok_str, pos);
+            if (found != std::string::npos && found < next_special)
+                next_special = found;
+        }
+
+        if (next_special == std::string::npos) {
+            segments.push_back({false, text.substr(pos), -1});
+            break;
+        } else {
+            segments.push_back({false, text.substr(pos, next_special - pos), -1});
+            pos = next_special;
+        }
+    }
+
+    for (const auto& seg : segments) {
+        if (seg.is_special) {
+            ids.push_back(seg.special_id);
+        } else {
+            auto encoded = (tok.type == TokenizerType::SENTENCEPIECE)
+                ? encode_sentencepiece(tok, seg.text)
+                : encode_gpt2(tok, seg.text);
+            ids.insert(ids.end(), encoded.begin(), encoded.end());
+        }
+    }
     return ids;
 }
 
@@ -453,10 +518,23 @@ std::string apply_chat_template(const Tokenizer& tok,
     // Rilevamento del formato dal template grezzo
     bool is_llama_chat = tok.chat_template.find("<|user|>")     != std::string::npos;
     bool is_chatml     = tok.chat_template.find("<|im_start|>") != std::string::npos;
+    bool is_llama3     = tok.chat_template.find("<|start_header_id|>") != std::string::npos;
 
     std::string result;
 
-    if (is_llama_chat) {
+    if (is_llama3) {
+        // ── Formato LLaMA-3 / Llama-3.2 ───────────
+        // Il tokenizer SentencePiece aggiunge automaticamente BOS (128000)
+        // all'inizio della sequenza, quindi non serve <|begin_of_text|>.
+        if (!system_msg.empty()) {
+            result += "<|start_header_id|>system<|end_header_id|>\n\n"
+                   +  system_msg + "<|eot_id|>";
+        }
+        result += "<|start_header_id|>user<|end_header_id|>\n\n"
+               +  user_msg + "<|eot_id|>"
+               +  "<|start_header_id|>assistant<|end_header_id|>\n\n";
+
+    } else if (is_llama_chat) {
         // ── Formato TinyLlama / LLaMA-chat ───────
         if (!system_msg.empty())
             result += "<|system|>\n" + system_msg + eos + "\n";
