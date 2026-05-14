@@ -268,6 +268,19 @@ bool model_load_weights(Model& model, const GGUFContext& ctx);
 // Chiamarla di nuovo resetta la KV cache (nuova conversazione).
 void model_init_kvcache(Model& model);
 
+// Salva la KV cache su file per riutilizzo tra richieste API.
+// Formato: magic(4) + version(4) + n_layer(4) + kv_dim(4) + n_cached(4)
+//          + k_flat[n_layer * kv_dim * n_cached * 4]
+//          + v_flat[n_layer * kv_dim * n_cached * 4]
+// Restituisce true se il salvataggio è riuscito.
+bool model_save_kvcache(const Model& model, const std::string& path);
+
+// Carica la KV cache da file.
+// Il modello deve avere già la KV cache allocata con model_init_kvcache().
+// n_layer e kv_dim devono coincidere (vengono verificati).
+// Restituisce true se il caricamento è riuscito.
+bool model_load_kvcache(Model& model, const std::string& path);
+
 // Stampa la configurazione del modello
 void model_print_config(const ModelConfig& cfg);
 
@@ -353,6 +366,15 @@ void forward(Model& model, int token_id, int pos, std::vector<float>& logits, bo
 // La generazione autoregressiva continua con
 // forward() token per token come al solito.
 void forward_prefill(Model& model, const std::vector<int>& token_ids, std::vector<float>& logits);
+
+// Forward pass BATCH incrementale per multi-turn chat.
+//
+// Come forward_prefill ma parte da base_pos invece che da 0.
+// I token 0..base_pos-1 sono già nella KV cache e vengono riutilizzati.
+// Processa solo i token da base_pos a token_ids.size()-1.
+// Dopo l'esecuzione, kv_cache.n_cached = token_ids.size().
+void forward_prefill_inc(Model& model, const std::vector<int>& token_ids,
+                          int base_pos, std::vector<float>& logits);
 
 // Forward pass BATCH per verifica (Speculative Decoding).
 //

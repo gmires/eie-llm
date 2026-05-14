@@ -128,7 +128,7 @@ menu_models() {
     echo "  2) TinyLlama 1.1B Q4_K_M  (~670 MB) — chat, multilingue"
     echo "  3) Llama-3.2-3B Q4_K_M   (~2.0 GB) — chat, italiano, più potente"
     echo "  4) Qwen2.5-1.5B Q4_K_M   (~941 MB) — chat, italiano, veloce"
-    echo "  5) Qwen3-1.7B Q8_0       (~1.8 GB) — chat, italiano, thinking mode"
+    echo "  5) Qwen3-1.7B Q4_K_M     (~1.3 GB) — chat, italiano, thinking mode"
     echo "  6) Tutti i modelli"
     echo "  7) Nessuno (salta)"
     echo ""
@@ -223,10 +223,10 @@ fi
 if [ "$DOWNLOAD_QWEN3" = true ]; then
     [ "$DOWNLOAD_GPT2" = false ] && [ "$DOWNLOAD_LLAMA" = false ] && [ "$DOWNLOAD_LLAMA32" = false ] && [ "$DOWNLOAD_QWEN25" = false ] && echo "" && echo "─────────────────────────────────────────────" && echo "  Download modelli" && echo "─────────────────────────────────────────────"
     download_model \
-        "Qwen3-1.7B Q8_0" \
-        "$MODEL_DIR/qwen3-1.7b.Q8_0.gguf" \
-        "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf" \
-        "1.8 GB"
+        "Qwen3-1.7B Q4_K_M" \
+        "$MODEL_DIR/qwen3-1.7b.Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf" \
+        "1.3 GB"
 fi
 
 # ── Riepilogo ─────────────────────────────────
@@ -244,13 +244,13 @@ echo "║  Uso:                                     ║"
 [ -f "$MODEL_DIR/tinyllama.Q4_K_M.gguf" ] && echo "║    ./build/eie-llm models/tinyllama.Q4_K_M.gguf    → TinyLlama shell  ║"
 [ -f "$MODEL_DIR/llama-3.2-3b.Q4_K_M.gguf" ] && echo "║    ./build/eie-llm models/llama-3.2-3b.Q4_K_M.gguf → Llama-3.2 shell  ║"
 [ -f "$MODEL_DIR/qwen2.5-1.5b.Q4_K_M.gguf" ] && echo "║    ./build/eie-llm models/qwen2.5-1.5b.Q4_K_M.gguf → Qwen2.5 shell  ║"
-[ -f "$MODEL_DIR/qwen3-1.7b.Q8_0.gguf" ] && echo "║    ./build/eie-llm models/qwen3-1.7b.Q8_0.gguf     → Qwen3 shell    ║"
+[ -f "$MODEL_DIR/qwen3-1.7b.Q4_K_M.gguf" ] && echo "║    ./build/eie-llm models/qwen3-1.7b.Q4_K_M.gguf   → Qwen3 shell    ║"
 echo "║                                           ║"
 echo "║  Server HTTP + Web UI:                    ║"
 [ -f "$MODEL_DIR/llama-3.2-3b.Q4_K_M.gguf" ] && echo "║    ./build/eie-llm models/llama-3.2-3b.Q4_K_M.gguf --server 8080    ║"
 [ -f "$MODEL_DIR/qwen2.5-1.5b.Q4_K_M.gguf" ] && echo "║    ./build/eie-llm models/qwen2.5-1.5b.Q4_K_M.gguf --server 8080    ║"
-[ -f "$MODEL_DIR/qwen3-1.7b.Q8_0.gguf" ] && echo "║    ./build/eie-llm models/qwen3-1.7b.Q8_0.gguf     --server 8080    ║"
-[ -f "$MODEL_DIR/llama-3.2-3b.Q4_K_M.gguf" ] || [ -f "$MODEL_DIR/qwen2.5-1.5b.Q4_K_M.gguf" ] || [ -f "$MODEL_DIR/qwen3-1.7b.Q8_0.gguf" ] || [ -f "$MODEL_DIR/tinyllama.Q4_K_M.gguf" ] && echo "║    # poi apri http://localhost:8080       ║"
+[ -f "$MODEL_DIR/qwen3-1.7b.Q4_K_M.gguf" ] && echo "║    ./build/eie-llm models/qwen3-1.7b.Q4_K_M.gguf   --server 8080    ║"
+[ -f "$MODEL_DIR/llama-3.2-3b.Q4_K_M.gguf" ] || [ -f "$MODEL_DIR/qwen2.5-1.5b.Q4_K_M.gguf" ] || [ -f "$MODEL_DIR/qwen3-1.7b.Q4_K_M.gguf" ] || [ -f "$MODEL_DIR/tinyllama.Q4_K_M.gguf" ] && echo "║    # poi apri http://localhost:8080       ║"
 echo "║                                           ║"
 echo "╚═══════════════════════════════════════════╝"
 echo ""

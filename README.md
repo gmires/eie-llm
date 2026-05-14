@@ -26,7 +26,7 @@ Puoi:
 | **TinyLlama 1.1B Chat** (Q4_K_M) | Funzionante | `models/tinyllama.Q4_K_M.gguf` |
 | **Llama-3.2-3B-Instruct** (Q4_K_M) | Funzionante | `models/llama-3.2-3b.Q4_K_M.gguf` |
 | **Qwen2.5-1.5B-Instruct** (Q4_K_M) | Funzionante | `models/qwen2.5-1.5b.Q4_K_M.gguf` |
-| **Qwen3-1.7B-Instruct** (Q8_0) | Funzionante | `models/qwen3-1.7b.Q8_0.gguf` |
+| **Qwen3-1.7B-Instruct** (Q4_K_M) | Funzionante | `models/qwen3-1.7b.Q4_K_M.gguf` |
 
 ### Parametri di sampling consigliati per modello
 
@@ -851,7 +851,7 @@ Obiettivo: aggiungere supporto per modelli più performanti in italiano, verific
 | TinyLlama 1.1B (Q4_K_M) | 8.2 tok/s | 5.7 tok/s | ~700 MB |
 | Llama-3.2-3B (Q4_K_M) | 1.7 tok/s | 1.9 tok/s | ~1.9 GB |
 | **Qwen2.5-1.5B (Q4_K_M)** | **3.6 tok/s** | **3.0 tok/s** | **~941 MB** |
-| **Qwen3-1.7B (Q8_0)** | **2.4 tok/s** | **5.8 tok/s** | **~1.8 GB** |
+| **Qwen3-1.7B (Q4_K_M)** | **3.1 tok/s** | **3.1 tok/s** | **~1.3 GB** |
 
 **Perché prima:** architettura identica a LLaMA già supportata, quasi zero modifiche al C++. Conferma che il motore è robusto per tutta la famiglia LLaMA.
 

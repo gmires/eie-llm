@@ -7,8 +7,10 @@ Interfaccia web moderna per EIE-LLM, ispirata a OpenWebUI. Si connette direttame
 - **Chat streaming in tempo reale** — i token arrivano man mano che vengono generati (SSE)
 - **Cronologia conversazioni** — salvata automaticamente nel browser (`localStorage`)
 - **Markdown + syntax highlighting** — messaggi formattati con marked.js e highlight.js
-- **Pannello impostazioni** — temperatura, top-k, top-p, repetition penalty, greedy, streaming toggle, modalità chat
-- **Attention Heatmap interattiva** — visualizza i pesi attention per ogni layer/head con canvas HTML5, tooltip al passaggio del mouse e valori numerici nelle celle
+- **Pannello impostazioni** — temperatura, top-k, top-p, repetition penalty, greedy, streaming toggle, modalità chat, **thinking mode** (Qwen3)
+- **Parametri consigliati automatici** — il server comunica i parametri ottimali per il modello caricato; la Web UI li applica al primo avvio
+- **KV Cache persistente su file** — ogni conversazione ha un `conversation_id` inviato al server; la KV cache viene salvata su disco tra una richiesta e l'altra, eliminando il prefill completo ad ogni turno. La cache viene eliminata automaticamente quando elimini la chat
+- **Attention Heatmap interattiva** — visualizza i pesi attention per ogni layer/head con colormap uniforme (blu→ciano→giallo→rosso), zoom con rotellina, pan con trascinamento, tooltip con percentuale
 - **Tema chiaro/scuro** — toggle immediato con persistenza
 - **Importa/Esporta chat** — formato JSON per backup e condivisione
 - **Responsive** — funziona su desktop e mobile
@@ -45,15 +47,19 @@ Il server serve automaticamente i file statici dalla directory `webui/`.
 
 ### Impostazioni
 - Clicca **⚙️** nell'header per aprire il pannello
-- Regola temperatura, max tokens, top-k, top-p, repetition penalty
-- Attiva/disattiva streaming, greedy sampling, modalità chat
-- Le impostazioni vengono salvate automaticamente
+- Regola temperatura, max tokens (fino a 800), top-k, top-p, repetition penalty
+- Attiva/disattiva streaming, greedy sampling, modalità chat, **thinking mode** (Qwen3)
+- I parametri consigliati per il modello vengono applicati automaticamente al primo avvio
+- Le impostazioni vengono salvate automaticamente nel browser
 
 ### Attention Heatmap
 - Clicca **🔥** nell'header per aprire il pannello attention
 - Inserisci un testo breve (max 100 token) e premi **Analizza**
 - Scegli layer e head specifici, oppure visualizza la **media** su tutti
-- La heatmap mostra con i colori (blu → rosso) quanto ogni token "guarda" gli altri
+- **Zoom** con la rotellina del mouse — esplora i dettagli delle celle
+- **Pan** con trascinamento del mouse — sposta la vista
+- La heatmap usa una **colormap uniforme** (blu → ciano → giallo → rosso) per una migliore leggibilità
+- Il tooltip mostra la percentuale di attenzione esatta
 
 #### Come leggere la heatmap
 
@@ -91,7 +97,8 @@ Il modello ha molteplici layer (strati) e head (teste d'attenzione). Ogni head s
 - **Zero build step** — HTML/CSS/JS vanilla, nessun bundler
 - **Zero dipendenze locali** — marked.js e highlight.js caricati da CDN
 - **SPA (Single Page Application)** — tutta la logica è in `app.js`
-- **API REST** — si connette agli endpoint `/v1/chat/completions`, `/v1/completions` e `/v1/inspect/attention`
+- **API REST** — si connette agli endpoint `/v1/chat/completions`, `/v1/completions`, `/v1/inspect/attention` e `/v1/cache/<id>` (DELETE)
+- **KV Cache su file** — ogni richiesta di chat invia `conversation_id: chat.id`; il server salva la cache su disco per evitare il ricalcolo del prefill nei turni successivi. La cache viene eliminata chiamando `DELETE /v1/cache/<id>` quando si cancella una chat
 - **File statici** — serviti nativamente da `httplib::Server::set_mount_point`
 
 ## File

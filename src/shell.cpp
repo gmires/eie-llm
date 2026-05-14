@@ -678,14 +678,12 @@ void shell_run(Model& model, const Tokenizer& tok) {
 
                     auto t0 = now();
 
-                    // Prefill incrementale
-                    if (shell_cache_len == 0) {
-                        forward_prefill(model, input_ids, logits);
-                    } else {
-                        for (int i = shell_cache_len; i < (int)input_ids.size(); i++) {
-                            forward(model, input_ids[i], i, logits);
-                        }
-                    }
+                    // Prefill: la cache viene sempre azzerata perché la
+                    // tokenizzazione del prompt formattato non è garantita
+                    // essere identica ai token originali generati.
+                    // Q4_K_M rende il prefill abbastanza veloce (~3s).
+                    model_init_kvcache(model);
+                    forward_prefill(model, input_ids, logits);
 
                     int pos = (int)input_ids.size();
                     int generated = 0;

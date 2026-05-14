@@ -6,6 +6,8 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <filesystem>
+namespace fs = std::filesystem;
 #include <mutex>
 #include <functional>
 #include <atomic>
@@ -70,6 +72,7 @@ struct ServerRequest {
     int max_tokens;              // quanti token generare al massimo
     SamplingParams params;       // temperatura, top_p, top_k, ecc.
     std::string endpoint_label;  // "completions" o "chat/completions"
+    std::string conversation_id; // per KV cache persistente su file
 
     // ── Stato della generazione (scritto dal thread di inferenza) ──
     std::vector<int> input_ids;      // token del prompt
@@ -472,32 +475,51 @@ static void generate_for_request(Model& model,
     req.generated = 0;
     req.output_text.clear();
 
-    // ── Fase 2: Prefill con Prefix Cache ──────
-    // La prefix cache cerca se questo prompt è già stato
-    // visto. Se sì, copia la KV cache salvata nel modello
-    // e salta il prefill (risparmio enorme in O(n²)).
+    // ── Fase 2: Prefill con Cache ────────────
+    // Tre livelli di cache, dal più veloce al più lento:
+    //   1. PrefixCache (prompt identico in memoria)
+    //   2. KV cache su file (conversation_id, multi-turn)
+    //   3. Prefill completo da zero
     if (!req.input_ids.empty()) {
         int cached_tokens = 0;
         bool cache_hit = prefix_cache.lookup(req.prompt, model, cached_tokens);
+        bool file_cache_loaded = false;
+        int file_cached = 0;
 
+        // Livello 1: PrefixCache — prompt ESATTAMENTE identico
         if (cache_hit && cached_tokens == (int)req.input_ids.size()) {
-            // Cache hit ESATTO: il prompt è identico a uno già visto.
-            // La KV cache è già popolata per tutti i token.
-            // Ricalcoliamo solo i logits dell'ultimo token.
             forward(model, req.input_ids.back(), cached_tokens - 1, req.logits);
             req.pos = cached_tokens;
-        } else {
-            // Cache miss (o hit parziale che non gestiamo):
-            // facciamo il prefill completo da zero.
+        }
+        // Livello 2: KV cache su file (conversation_id)
+        else if (!req.conversation_id.empty()) {
+            std::string cache_path = "cache/conversations/" + req.conversation_id + ".kvcache";
+            file_cache_loaded = model_load_kvcache(model, cache_path);
+            if (file_cache_loaded) {
+                file_cached = model.kv_cache.n_cached;
+                // Prefill solo dei token nuovi
+                if (file_cached < (int)req.input_ids.size()) {
+                    forward_prefill_inc(model, req.input_ids, file_cached, req.logits);
+                } else {
+                    // Cache più lunga del prompt: logits dell'ultimo token
+                    forward(model, req.input_ids.back(), (int)req.input_ids.size() - 1, req.logits);
+                }
+                req.pos = static_cast<int>(req.input_ids.size());
+            } else {
+                // Nessuna cache su file: prefill completo
+                model_init_kvcache(model);
+                forward_prefill(model, req.input_ids, req.logits);
+                req.pos = static_cast<int>(req.input_ids.size());
+            }
+        }
+        // Livello 3: prefill completo
+        else {
             model_init_kvcache(model);
             forward_prefill(model, req.input_ids, req.logits);
             req.pos = static_cast<int>(req.input_ids.size());
-
-            // Salva nella cache per le prossime richieste
             prefix_cache.store(req.prompt, model, req.pos);
         }
     } else {
-        // Prompt vuoto: inizializza cache e logits da zero
         model_init_kvcache(model);
         req.pos = 0;
     }
@@ -549,7 +571,18 @@ static void generate_for_request(Model& model,
               << prefill_ms << "ms gen=" << gen_ms << "ms total=" << total_ms << "ms"
               << " (" << (req.generated / (gen_ms / 1000.0)) << " tok/s)" << std::endl;
 
-    // ── Fase 5: Segnala completamento ─────────
+    // ── Fase 5: Salva KV cache su file ─────────
+    if (!req.conversation_id.empty() && model.kv_cache.n_cached > 0) {
+        std::string cache_dir = "cache/conversations";
+        try {
+            if (!fs::exists(cache_dir))
+                fs::create_directories(cache_dir);
+        } catch (...) {}
+        std::string cache_path = cache_dir + "/" + req.conversation_id + ".kvcache";
+        model_save_kvcache(model, cache_path);
+    }
+
+    // ── Fase 6: Segnala completamento ─────────
     // Il thread HTTP è in attesa su req.cv: lo svegliamo.
     {
         std::lock_guard<std::mutex> lock(req.mtx);
@@ -786,6 +819,22 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                              std::ref(tok),
                              std::ref(queue));
 
+    // ── Crea directory per cache su file ──────
+    try {
+        fs::create_directories("cache/conversations");
+        // TTL cleanup: rimuovi cache più vecchie di 1 ora
+        auto now = std::chrono::system_clock::now();
+        for (const auto& entry : fs::directory_iterator("cache/conversations")) {
+            auto ftime = fs::last_write_time(entry.path());
+            auto age = std::chrono::duration_cast<std::chrono::hours>(
+                now - std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                    ftime - decltype(ftime)::clock::now() + now)).count();
+            if (age >= 1) {
+                fs::remove(entry.path());
+            }
+        }
+    } catch (...) {}
+
     // ── CORS globale ──────────────────────────
     // Permette alla Web UI (o a qualsiasi client)
     // di chiamare le API anche se servita da un
@@ -794,7 +843,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         [](const httplib::Request&, httplib::Response& res) {
             res.set_header("Access-Control-Allow-Origin", "*");
             res.set_header("Access-Control-Allow-Methods",
-                           "GET, POST, OPTIONS");
+                           "GET, POST, DELETE, OPTIONS");
             res.set_header("Access-Control-Allow-Headers",
                            "Content-Type");
         });
@@ -1011,6 +1060,9 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         // false = risposta diretta senza ragionamento (Qwen3).
         bool enable_thinking = json_get_bool(req.body, "enable_thinking", true);
 
+        // Conversation ID per KV cache persistente su file
+        std::string conversation_id = json_get_string(req.body, "conversation_id");
+
         std::string prompt = tok.has_chat_template
             ? apply_chat_template_conversation(tok, messages, enable_thinking)
             : json_get_last_user_message(req.body);
@@ -1027,6 +1079,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
             sreq->max_tokens = max_tokens;
             sreq->params = params;
             sreq->endpoint_label = "chat/completions";
+            sreq->conversation_id = conversation_id;
 
             std::cout << "[REQ:chat/completions] prompt=\""
                       << prompt.substr(0, 40)
@@ -1083,6 +1136,21 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                 sink.done();
                 return true;
             });
+    });
+
+    // ── DELETE /v1/cache/<id> ───────────────────
+    // Elimina la KV cache su file per una conversazione.
+    svr.Delete(R"(/v1/cache/(.*))",
+        [](const httplib::Request& req, httplib::Response& res) {
+        std::string cache_id = req.matches[1];
+        std::string cache_path = "cache/conversations/" + cache_id + ".kvcache";
+        bool deleted = false;
+        try {
+            deleted = fs::remove(cache_path);
+        } catch (...) {}
+        std::ostringstream j;
+        j << "{\"deleted\":" << (deleted ? "true" : "false") << "}";
+        res.set_content(j.str(), "application/json");
     });
 
     // ── POST /v1/inspect/attention ────────────

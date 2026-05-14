@@ -20,4 +20,4 @@
 # ═════════════════════════════════════════════════════════════════════════════
 set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec "$DIR/build/eie-llm" "$DIR/models/qwen3-1.7b.Q8_0.gguf" "$@"
+exec "$DIR/build/eie-llm" "$DIR/models/qwen3-1.7b.Q4_K_M.gguf" "$@"

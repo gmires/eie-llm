@@ -5,6 +5,7 @@
 #include <sstream>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <algorithm>
 #include <unordered_set>
 
@@ -264,6 +265,99 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
             }
         }
     }
+    return true;
+}
+
+// ─────────────────────────────────────────────
+//  KV Cache persistente su file
+// ─────────────────────────────────────────────
+static constexpr uint32_t KVCACHE_MAGIC = 0x4B564341; // "KVCA"
+static constexpr uint32_t KVCACHE_VERSION = 1;
+
+// ─────────────────────────────────────────────
+//  Salva la KV cache su file binario
+// ─────────────────────────────────────────────
+bool model_save_kvcache(const Model& model, const std::string& path) {
+    const KVCache& cache = model.kv_cache;
+    const ModelConfig& cfg = model.config;
+    int kv_dim = cfg.n_head_kv * cfg.d_head;
+    int n_cached = cache.n_cached;
+
+    if (n_cached == 0) return false;
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    // Header
+    f.write(reinterpret_cast<const char*>(&KVCACHE_MAGIC),   sizeof(KVCACHE_MAGIC));
+    f.write(reinterpret_cast<const char*>(&KVCACHE_VERSION),  sizeof(KVCACHE_VERSION));
+    uint32_t n_layer = cfg.n_layer;
+    uint32_t kv_dim_u = kv_dim;
+    uint32_t n_cached_u = n_cached;
+    f.write(reinterpret_cast<const char*>(&n_layer),   sizeof(n_layer));
+    f.write(reinterpret_cast<const char*>(&kv_dim_u),  sizeof(kv_dim_u));
+    f.write(reinterpret_cast<const char*>(&n_cached_u), sizeof(n_cached_u));
+
+    // K cache: n_layer × [n_cached × kv_dim]
+    for (int l = 0; l < cfg.n_layer; l++) {
+        const float* k_data = cache.k[l].data();
+        f.write(reinterpret_cast<const char*>(k_data), n_cached * kv_dim * sizeof(float));
+    }
+
+    // V cache: n_layer × [n_cached × kv_dim]
+    for (int l = 0; l < cfg.n_layer; l++) {
+        const float* v_data = cache.v[l].data();
+        f.write(reinterpret_cast<const char*>(v_data), n_cached * kv_dim * sizeof(float));
+    }
+
+    return f.good();
+}
+
+// ─────────────────────────────────────────────
+//  Carica la KV cache da file binario
+//  Verifica che n_layer e kv_dim coincidano.
+// ─────────────────────────────────────────────
+bool model_load_kvcache(Model& model, const std::string& path) {
+    KVCache& cache = model.kv_cache;
+    const ModelConfig& cfg = model.config;
+    int kv_dim = cfg.n_head_kv * cfg.d_head;
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    // Leggi header
+    uint32_t magic, version, file_n_layer, file_kv_dim, file_n_cached;
+    f.read(reinterpret_cast<char*>(&magic),         sizeof(magic));
+    f.read(reinterpret_cast<char*>(&version),       sizeof(version));
+    f.read(reinterpret_cast<char*>(&file_n_layer),  sizeof(file_n_layer));
+    f.read(reinterpret_cast<char*>(&file_kv_dim),   sizeof(file_kv_dim));
+    f.read(reinterpret_cast<char*>(&file_n_cached), sizeof(file_n_cached));
+
+    if (magic != KVCACHE_MAGIC || version != KVCACHE_VERSION) return false;
+    if ((int)file_n_layer != cfg.n_layer || (int)file_kv_dim != kv_dim) return false;
+    if (file_n_cached > (uint32_t)cfg.n_ctx) return false;  // sicurezza
+
+    // Resetta la cache e carica
+    cache.n_cached = 0;
+    for (int l = 0; l < cfg.n_layer; l++) {
+        std::fill(cache.k[l].begin(), cache.k[l].end(), 0.0f);
+        std::fill(cache.v[l].begin(), cache.v[l].end(), 0.0f);
+    }
+
+    uint64_t bytes = file_n_cached * kv_dim * sizeof(float);
+
+    // K cache
+    for (int l = 0; l < cfg.n_layer; l++) {
+        f.read(reinterpret_cast<char*>(cache.k[l].data()), bytes);
+        if (!f.good()) return false;
+    }
+    // V cache
+    for (int l = 0; l < cfg.n_layer; l++) {
+        f.read(reinterpret_cast<char*>(cache.v[l].data()), bytes);
+        if (!f.good()) return false;
+    }
+
+    cache.n_cached = file_n_cached;
     return true;
 }
 
@@ -1362,6 +1456,45 @@ void forward_prefill(Model& model, const std::vector<int>& token_ids, std::vecto
 //  draft in un unico passaggio: il target model processa
 //  i draft token e confronta argmax(logits_i) con draft_{i+1}.
 // ─────────────────────────────────────────────
+
+// ─────────────────────────────────────────────
+//  Forward pass BATCH incrementale
+//
+//  Come forward_prefill ma parte da base_pos invece che da 0.
+//  I token 0..base_pos-1 sono già nella KV cache.
+//
+//  Per batch piccoli (≤ 8) usa forward() sequenziale.
+//  Per batch grandi usa forward_verify() che sfrutta
+//  l'attention batch (matvec_quant_batch).
+//
+//  Dopo l'esecuzione:
+//    - kv_cache.n_cached = token_ids.size()
+//    - logits contiene i logits dell'ULTIMO token
+//    - model.bufs.x contiene l'output dell'ultimo token
+// ─────────────────────────────────────────────
+void forward_prefill_inc(Model& model, const std::vector<int>& token_ids,
+                          int base_pos, std::vector<float>& logits) {
+    const int N = static_cast<int>(token_ids.size());
+    if (N <= base_pos) return;
+
+    // Se il batch è piccolo, forward() sequenziale è più efficiente
+    const int new_tokens = N - base_pos;
+    if (new_tokens <= 8) {
+        for (int i = base_pos; i < N; i++)
+            forward(model, token_ids[i], i, logits, false);
+        model.kv_cache.n_cached = N;
+        return;
+    }
+
+    // Batch processing via forward_verify
+    std::vector<int> new_ids(token_ids.begin() + base_pos, token_ids.end());
+    std::vector<std::vector<float>> all_logits;
+    forward_verify(model, new_ids, base_pos, all_logits);
+    if (!all_logits.empty())
+        logits = all_logits.back();
+    model.kv_cache.n_cached = N;
+}
+
 void forward_verify(Model& model, const std::vector<int>& token_ids,
                     int base_pos, std::vector<std::vector<float>>& all_logits) {
     const int N = static_cast<int>(token_ids.size());

@@ -22,7 +22,7 @@ MODELS=(
     "tinyllama:TinyLlama 1.1B Chat (Q4_K_M):models/tinyllama.Q4_K_M.gguf:0.7:50:0.95:1.1"
     "llama32:Llama-3.2-3B-Instruct (Q4_K_M):models/llama-3.2-3b.Q4_K_M.gguf:0.6:40:0.9:1.1"
     "qwen25:Qwen2.5-1.5B-Instruct (Q4_K_M):models/qwen2.5-1.5b.Q4_K_M.gguf:0.7:40:0.8:1.05"
-    "qwen3:Qwen3-1.7B-Instruct (Q8_0):models/qwen3-1.7b.Q8_0.gguf:0.6:20:0.95:1.5"
+    "qwen3:Qwen3-1.7B-Instruct (Q4_K_M):models/qwen3-1.7b.Q4_K_M.gguf:0.6:20:0.95:1.5"
 )
 
 list_models() {

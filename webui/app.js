@@ -190,6 +190,8 @@ function selectChat(id) {
 function deleteChat(id, ev) {
   if (ev) ev.stopPropagation();
   if (!confirm('Eliminare questa chat?')) return;
+  // Elimina la KV cache su file
+  fetch('/v1/cache/' + id, {method: 'DELETE'}).catch(() => {});
   state.chats = state.chats.filter(c => c.id !== id);
   saveChats();
   if (state.currentChatId === id) {
@@ -410,6 +412,7 @@ async function blockingResponse(chat, assistantMsg, abortCtrl) {
         top_p: s.top_p,
         repetition_penalty: s.repetition_penalty,
         enable_thinking: s.enableThinking,
+        conversation_id: chat.id,
         stream: false,
       })
     : JSON.stringify({
@@ -451,6 +454,7 @@ async function streamResponse(chat, assistantMsg, abortCtrl) {
         top_p: s.top_p,
         repetition_penalty: s.repetition_penalty,
         enable_thinking: s.enableThinking,
+        conversation_id: chat.id,
         stream: true,
       })
     : JSON.stringify({
