@@ -27,103 +27,6 @@ static PrefixCache shell_prefix_cache;
 static const char* HISTORY_FILE = ".eie_history";
 
 // ─────────────────────────────────────────────
-//  Sanitizza l'output del modello
-//
-//  GPT-2 BPE byte-level mappa i 256 byte a
-//  caratteri Unicode specifici. In particolare
-//  i byte 0x00-0x20 e 0x7F vengono mappati al
-//  blocco Unicode U+0100-U+017F (Latin Extended)
-//  invece di usare i caratteri di controllo diretti.
-//
-//  Esempio:
-//    byte 0x0A (\n) → U+010A (Ċ) nel vocabolario GPT-2
-//    byte 0x20 ( )  → U+0120 (Ġ) → già gestito dal decoder
-//
-//  Strategia:
-//  - ASCII stampabile [0x20-0x7E] → passa
-//  - Newline 0x0A → passa (utile per la formattazione)
-//  - Caratteri Latin Extended U+0100-U+017F →
-//    potrebbero essere byte rimappati da GPT-2,
-//    li convertiamo al byte originale se stampabile
-//    altrimenti li scartiamo
-//  - Resto del Unicode → passa (emoji, CJK, ecc.
-//    potrebbero essere intenzionali)
-//  - Byte di controllo → scarta
-// ─────────────────────────────────────────────
-static std::string sanitize_output(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-
-    size_t i = 0;
-    while (i < s.size()) {
-        unsigned char c = static_cast<unsigned char>(s[i]);
-
-        // ── ASCII stampabile → passa direttamente ──
-        if (c >= 0x20 && c <= 0x7E) {
-            out += s[i++];
-            continue;
-        }
-
-        // ── Newline → passa ──
-        if (c == 0x0A) {
-            out += s[i++];
-            continue;
-        }
-
-        // ── Sequenza UTF-8 a 2 byte ──────────────
-        // Formato: [110xxxxx][10xxxxxx]
-        // Copriamo U+0080 .. U+07FF
-        if (c >= 0xC0 && c <= 0xDF && i + 1 < s.size()) {
-            unsigned char c2 = static_cast<unsigned char>(s[i+1]);
-
-            if ((c2 & 0xC0) == 0x80) {
-                // Ricostruisci il codepoint Unicode
-                uint32_t cp = ((c & 0x1F) << 6) | (c2 & 0x3F);
-
-                // U+0100–U+017F = Latin Extended-A
-                // GPT-2 usa questo blocco per rimappare
-                // i byte 0x00-0x7F non stampabili.
-                // Recuperiamo il byte originale:
-                //   byte_originale = codepoint - 0x100 + 0x00
-                // ma solo se il risultato è stampabile
-                if (cp >= 0x0100 && cp <= 0x017F) {
-                    uint8_t original_byte = static_cast<uint8_t>(cp - 0x100);
-                    // Tieni solo se stampabile o newline
-                    if (original_byte >= 0x20 && original_byte <= 0x7E)
-                        out += static_cast<char>(original_byte);
-                    else if (original_byte == 0x0A)
-                        out += '\n';
-                    // altrimenti scarta silenziosamente
-                } else {
-                    // Altro carattere a 2 byte — passa così com'è
-                    out += s[i];
-                    out += s[i+1];
-                }
-                i += 2;
-                continue;
-            }
-        }
-
-        // ── Sequenze UTF-8 a 3-4 byte → passa ────
-        // (es. emoji, CJK — probabilmente intenzionali)
-        if (c >= 0xE0 && c <= 0xEF && i + 2 < s.size()) {
-            out += s[i]; out += s[i+1]; out += s[i+2];
-            i += 3;
-            continue;
-        }
-        if (c >= 0xF0 && c <= 0xF7 && i + 3 < s.size()) {
-            out += s[i]; out += s[i+1]; out += s[i+2]; out += s[i+3];
-            i += 4;
-            continue;
-        }
-
-        // ── Tutto il resto (byte di controllo, ecc.) → scarta ──
-        i++;
-    }
-
-    return out;
-}
-// ─────────────────────────────────────────────
 //  Stampa i comandi disponibili
 // ─────────────────────────────────────────────
 static void print_help(bool chat_mode, bool speculative_mode, int draft_k, bool enable_thinking) {
@@ -523,7 +426,7 @@ static void generate_speculative(Model& model,
 // ─────────────────────────────────────────────
 void shell_run(Model& model, const Tokenizer& tok) {
     SamplingParams params;
-    int max_tokens = 200;
+    int max_tokens = 300;
     int draft_k = 4;
     bool speculative_mode = false;
     srand(static_cast<unsigned>(time(nullptr)));
@@ -755,6 +658,9 @@ void shell_run(Model& model, const Tokenizer& tok) {
                 std::cout.flush();
 
                 std::string assistant_reply;
+                std::string think_buffer;
+                double prefill_ms = 0, gen_ms = 0, total_ms = 0, tok_s = 0;
+
                 if (speculative_mode) {
                     generate_speculative(model, tok, formatted, params, max_tokens,
                                          draft_k, /*print_prompt=*/false,
@@ -770,6 +676,9 @@ void shell_run(Model& model, const Tokenizer& tok) {
                         shell_cache_len = 0;
                     }
 
+                    auto t0 = now();
+
+                    // Prefill incrementale
                     if (shell_cache_len == 0) {
                         forward_prefill(model, input_ids, logits);
                     } else {
@@ -780,6 +689,8 @@ void shell_run(Model& model, const Tokenizer& tok) {
 
                     int pos = (int)input_ids.size();
                     int generated = 0;
+
+                    auto t1 = now();
 
                     while (generated < max_tokens) {
                         apply_repetition_penalty(logits, context_ids, params.rep_penalty);
@@ -804,15 +715,24 @@ void shell_run(Model& model, const Tokenizer& tok) {
                         pos++;
                         generated++;
                     }
-                    std::cout << "\n\n";
                     shell_cache_len = pos;
+
+                    // Timing
+                    auto t2 = now();
+                    double prefill_ms = ms_between(t0, t1);
+                    double gen_ms = ms_between(t1, t2);
+                    double total_ms = ms_between(t0, t2);
+                    double tok_s = (generated > 0) ? (generated / (gen_ms / 1000.0)) : 0.0;
+                    std::cout << "\n\033[90m[" << std::fixed << std::setprecision(1)
+                              << prefill_ms << "ms prefill | " << gen_ms << "ms gen | "
+                              << tok_s << " tok/s | " << total_ms << "ms total]\033[0m\n\n";
+
                 }
 
-                // Parsing del thinking mode: separa <think>...</think> dal resto
+                // Rende il pensiero: mostra solo se c'è contenuto reale
                 auto [think_content, reply_content] = parse_think_tags(assistant_reply);
-                if (!think_content.empty()) {
-                    // Mostra il pensiero in grigio (solo se non vuoto)
-                    std::cout << "  [Pensiero]\033[90m" << think_content << "\033[0m\n";
+                if (!think_content.empty() && think_content.find_first_not_of(" \t\n\r") != std::string::npos) {
+                    std::cout << "  [Pensiero]\033[90m" << think_content << "\033[0m\n\n";
                 }
 
                 // Salva TUTTO (con tag think inclusi) nella conversazione

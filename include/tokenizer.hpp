@@ -121,6 +121,11 @@ std::string apply_chat_template_conversation(
     const std::vector<std::pair<std::string, std::string>>& messages,
     bool enable_thinking = true);
 
+// Sanitizza l'output del modello convertendo i caratteri Latin Extended-A
+// (U+0100-U+017F) del BPE byte-level GPT-2/Qwen ai byte originali.
+// Usato sia dalla shell che dal server per output pulito.
+std::string sanitize_output(const std::string& s);
+
 // Separa il contenuto <think>...</think> dal resto del testo generato.
 // Restituisce una coppia {thinking_content, reply_content}.
 // Se non ci sono tag think, thinking_content è vuoto e reply_content = input.

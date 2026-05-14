@@ -13,4 +13,4 @@
 # ═════════════════════════════════════════════════════════════════════════════
 set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec "$DIR/build/eie-llm" "$DIR/models/gpt2.Q8_0.gguf"
+exec "$DIR/build/eie-llm" "$DIR/models/gpt2.Q8_0.gguf" "$@"

@@ -3,13 +3,16 @@
 #  EIE-LLM — Unified model runner
 #
 #  Usage:
-#    ./scripts/run.sh [model]     → avvia il modello specificato
-#    ./scripts/run.sh             → menu interattivo
-#    ./scripts/run.sh --list      → elenca modelli disponibili
+#    ./scripts/run.sh [model] [args...]     → avvia il modello con argomenti
+#    ./scripts/run.sh --server [model] [port] → avvia il server HTTP
+#    ./scripts/run.sh                       → menu interattivo
+#    ./scripts/run.sh --list                → elenca modelli disponibili
 #
 #  Esempi:
-#    ./scripts/run.sh qwen3       → avvia Qwen3-1.7B
-#    ./scripts/run.sh llama32     → avvia Llama-3.2-3B
+#    ./scripts/run.sh qwen3                  → shell Qwen3-1.7B
+#    ./scripts/run.sh qwen3 --server 8080    → server HTTP Qwen3-1.7B
+#    ./scripts/run.sh --server qwen3 8080    → server HTTP (ordine alternativo)
+#    ./scripts/run.sh llama32 --bench        → benchmark Llama-3.2
 # ═════════════════════════════════════════════════════════════════════════════
 set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -59,12 +62,18 @@ menu() {
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#MODELS[@]}" ]; then
         local idx=$((choice-1))
         IFS=':' read -r key name path temp topk topp penalty <<< "${MODELS[$idx]}"
-        run_model "$key" "$name" "$path" "$temp" "$topk" "$topp" "$penalty"
+        local extra_args=()
+        read -rp "  Server HTTP? (porta, es. 8080, o lascia vuoto per shell): " srvport
+        if [ -n "$srvport" ]; then
+            extra_args=("--server" "$srvport")
+        fi
+        run_model "$key" "$name" "$path" "$temp" "$topk" "$topp" "$penalty" "${extra_args[@]}"
     fi
 }
 
 run_model() {
     local key="$1" name="$2" path="$3" temp="$4" topk="$5" topp="$6" penalty="$7"
+    shift 7  # rimuove i primi 7 argomenti, lascia extra_args in "$@"
     local full="$DIR/$path"
 
     if [ ! -f "$full" ]; then
@@ -73,9 +82,15 @@ run_model() {
         exit 1
     fi
 
+    local mode="shell"
+    for arg in "$@"; do
+        [ "$arg" = "--server" ] && mode="server"
+    done
+
     echo ""
     echo "╔═══════════════════════════════════════════╗"
     echo "║  Avvio: $name"
+    echo "║  Modalità: $mode"
     echo "║  Parametri: temp=$temp topk=$topk topp=$topp penalty=$penalty"
     if [ "$key" = "qwen3" ]; then
         echo "║  Thinking mode: ON (:think on)"
@@ -84,30 +99,58 @@ run_model() {
     echo "╚═══════════════════════════════════════════╝"
     echo ""
 
-    exec "$DIR/build/eie-llm" "$full"
+    exec "$DIR/build/eie-llm" "$full" "$@"
 }
 
-if [ $# -eq 0 ]; then
-    menu
-else
-    case "$1" in
-        --list|-l) list_models ;;
-        --help|-h) echo "Uso: ./scripts/run.sh [modello]"; list_models ;;
-        *)
-            found=false
+_run_main() {
+    if [ $# -eq 0 ]; then
+        menu
+        return
+    fi
+
+    local search_key=""
+    local extra_args=()
+
+    if [ "$1" = "--server" ]; then
+        search_key="$2"
+        extra_args=("--server")
+        [ -n "$3" ] && extra_args+=("$3")
+    elif [ "$1" = "--list" ] || [ "$1" = "-l" ]; then
+        list_models
+        return
+    elif [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        echo "Uso: ./scripts/run.sh [modello] [--server [porta] | --bench N]"
+        list_models
+        return
+    else
+        search_key="$1"
+        shift
+        while [ $# -gt 0 ]; do
+            local is_model=false
             for m in "${MODELS[@]}"; do
-                IFS=':' read -r key name path temp topk topp penalty <<< "$m"
-                if [ "$key" = "$1" ]; then
-                    run_model "$key" "$name" "$path" "$temp" "$topk" "$topp" "$penalty"
-                    found=true
-                    break
-                fi
+                local k n; IFS=':' read -r k n <<< "$m"
+                [ "$k" = "$1" ] && is_model=true
             done
-            if [ "$found" = false ]; then
-                echo "  [ERRORE] Modello sconosciuto: $1"
-                list_models
-                exit 1
-            fi
-            ;;
-    esac
-fi
+            [ "$is_model" = true ] && break
+            extra_args+=("$1")
+            shift
+        done
+    fi
+
+    local found=false
+    for m in "${MODELS[@]}"; do
+        local key name path temp topk topp penalty
+        IFS=':' read -r key name path temp topk topp penalty <<< "$m"
+        if [ "$key" = "$search_key" ]; then
+            run_model "$key" "$name" "$path" "$temp" "$topk" "$topp" "$penalty" "${extra_args[@]}"
+            found=true
+            break
+        fi
+    done
+    if [ "$found" = false ]; then
+        echo "  [ERRORE] Modello sconosciuto: $search_key" >&2
+        list_models
+        return 1
+    fi
+}
+_run_main "$@"

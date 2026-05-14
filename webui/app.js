@@ -16,7 +16,7 @@
 /* ── Default settings ─────────────────────────────────────────────────────── */
 const DEFAULTS = {
   temperature: 1.0,
-  max_tokens: 100,
+  max_tokens: 200,
   top_k: 40,
   top_p: 0.9,
   repetition_penalty: 1.1,
@@ -264,7 +264,7 @@ function formatContentWithThinking(content) {
 
   let html = '';
   if (before.trim()) html += before;
-  if (thinking) {
+  if (thinking && thinking.trim()) {
     html += '<details class="think-block" open>';
     html += '<summary>🧠 Pensiero</summary>';
     html += '<div class="think-content">' + thinking.replace(/\n/g, '<br>') + '</div>';

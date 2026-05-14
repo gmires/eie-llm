@@ -670,17 +670,85 @@ std::pair<std::string, std::string> parse_think_tags(const std::string& text) {
         return {thinking, ""};
     }
 
-    // Estrae il contenuto thinking (tra i tag)
+    // Estrae il contenuto thinking (tra i tag) e toglie whitespace
     thinking = text.substr(think_content_start, think_end - think_content_start);
+    // Se il contenuto è solo whitespace, lo consideriamo vuoto
+    bool only_ws = true;
+    for (char ch : thinking)
+        if (ch != ' ' && ch != '\n' && ch != '\t' && ch != '\r') { only_ws = false; break; }
+    if (only_ws) thinking.clear();
 
     // Il resto dopo </think> è la risposta
     size_t reply_start = think_end + 8; // 8 = len("</think>")
-    // Salta newline/spazi iniziali dopo </think>
     while (reply_start < text.size() && (text[reply_start] == '\n' || text[reply_start] == ' '))
         reply_start++;
     reply = (reply_start < text.size()) ? text.substr(reply_start) : "";
 
     return {thinking, reply};
+}
+
+// ─────────────────────────────────────────────
+//  sanitize_output
+//
+//  Converte i caratteri Latin Extended-A (U+0100-U+017F)
+//  del BPE byte-level GPT-2/Qwen ai byte originali.
+//  Senza questa conversione, l'output mostrerebbe caratteri
+//  come Ġ (al posto dello spazio), Ċ (al posto del newline)
+//  e sequenze âĢĵ (al posto di trattini/punteggiatura).
+//
+//  Funzionamento:
+//  - ASCII stampabile (0x20-0x7E): passa direttamente
+//  - Newline (0x0A): passa come \n
+//  - Latin Extended-A (U+0100-U+017F): riconverte al byte
+//    originale sottraendo 0x100
+//  - Ogni altra sequenza UTF-8: passa intatta
+// ─────────────────────────────────────────────
+std::string sanitize_output(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+
+        // ASCII stampabile
+        if (c >= 0x20 && c <= 0x7E) { out += s[i++]; continue; }
+
+        // Newline
+        if (c == 0x0A) { out += s[i++]; continue; }
+
+        // UTF-8 a 2 byte: verifichiamo se è Latin Extended-A
+        if (c >= 0xC0 && c <= 0xDF && i + 1 < s.size()) {
+            unsigned char c2 = static_cast<unsigned char>(s[i+1]);
+            if ((c2 & 0xC0) == 0x80) {
+                uint32_t cp = ((c & 0x1F) << 6) | (c2 & 0x3F);
+                if (cp >= 0x100 && cp <= 0x17F) {
+                    uint8_t original_byte = static_cast<uint8_t>(cp - 0x100);
+                    if (original_byte >= 0x20 && original_byte <= 0x7E)
+                        out += static_cast<char>(original_byte);
+                    else if (original_byte == 0x0A)
+                        out += '\n';
+                    // byte di controllo scartati
+                } else {
+                    out += s[i]; out += s[i+1];
+                }
+                i += 2; continue;
+            }
+        }
+
+        // UTF-8 a 3-4 byte: passa intatto
+        if (c >= 0xE0 && c <= 0xEF && i + 2 < s.size()) {
+            out += s[i]; out += s[i+1]; out += s[i+2];
+            i += 3; continue;
+        }
+        if (c >= 0xF0 && c <= 0xF7 && i + 3 < s.size()) {
+            out += s[i]; out += s[i+1]; out += s[i+2]; out += s[i+3];
+            i += 4; continue;
+        }
+
+        i++; // scarta byte sconosciuto
+    }
+    return out;
 }
 
 // ─────────────────────────────────────────────

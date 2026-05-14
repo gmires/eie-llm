@@ -13,4 +13,4 @@
 # ═════════════════════════════════════════════════════════════════════════════
 set -e
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec "$DIR/build/eie-llm" "$DIR/models/tinyllama.Q4_K_M.gguf"
+exec "$DIR/build/eie-llm" "$DIR/models/tinyllama.Q4_K_M.gguf" "$@"

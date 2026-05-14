@@ -144,7 +144,16 @@ Se vedi `Debug (-O0)`, ricompila in Release.
 ./scripts/run-qwen25.sh
 ./scripts/run-qwen3.sh
 ./scripts/run-gpt2.sh
+
+# Server HTTP (qualsiasi script):
+./scripts/run-qwen3.sh --server 8080
+./scripts/run.sh --server qwen3 8080   # Unified launcher
+./scripts/run.sh tinyllama --server    # Anche come argomento extra
 ```
+
+Tutti gli script accettano argomenti extra (`--server [porta]`, `--bench N`) e li
+passano direttamente al binario. Il launcher unificato `run.sh` nella modalità
+menu interattivo chiede se avviare il server HTTP.
 
 Tutti gli script avviano il modello con i **parametri consigliati** dalla rispettiva
 model card (vedi tabella nella sezione Modelli).

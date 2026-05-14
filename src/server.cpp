@@ -519,7 +519,7 @@ static void generate_for_request(Model& model,
             break;  // fine sequenza
         }
 
-        std::string token_str = tokenizer_decode(tok, {next_token});
+        std::string token_str = sanitize_output(tokenizer_decode(tok, {next_token}));
         req.output_text += token_str;
         req.context_ids.push_back(next_token);
         req.generated++;
@@ -645,7 +645,7 @@ static bool generate_streaming_for_request(
             break;
         }
 
-        std::string token_str = tokenizer_decode(tok, {next_token});
+        std::string token_str = sanitize_output(tokenizer_decode(tok, {next_token}));
         context_ids.push_back(next_token);
         generated++;
 
@@ -875,8 +875,8 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                   << " (body=" << req.body.size() << " bytes)\n";
 
         std::string prompt     = json_get_string(req.body, "prompt");
-        int         max_tokens = json_get_int   (req.body, "max_tokens", 50);
-        max_tokens = std::min(max_tokens, 500);
+        int         max_tokens = json_get_int   (req.body, "max_tokens", 200);
+        max_tokens = std::min(max_tokens, 800);
 
         SamplingParams params;
         params.temperature = json_get_float(req.body, "temperature",        1.0f);
@@ -989,8 +989,8 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                   << " (body=" << req.body.size() << " bytes)\n";
 
         auto messages = json_get_chat_messages(req.body);
-        int max_tokens = json_get_int(req.body, "max_tokens", 100);
-        max_tokens = std::min(max_tokens, 500);
+        int max_tokens = json_get_int(req.body, "max_tokens", 200);
+        max_tokens = std::min(max_tokens, 800);
 
         SamplingParams params;
         params.temperature = json_get_float(req.body, "temperature",        1.0f);
