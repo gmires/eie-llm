@@ -807,16 +807,55 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         });
 
     // ── GET /health ───────────────────────────
-    // Endpoint di health check — risponde subito
-    // senza toccare il modello.
-    svr.Get("/health", [&model](const httplib::Request&,
-                                 httplib::Response& res) {
-        std::string arch = (model.config.arch == ArchType::GPT2)
-                               ? "gpt2" : "llama";
-        res.set_content(
-            "{\"status\":\"ok\",\"model\":\"" + arch + "\"}",
-            "application/json"
-        );
+    // Endpoint di health check — restituisce stato, nome modello
+    // e parametri di sampling consigliati per la Web UI.
+    svr.Get("/health", [&model, &tok](const httplib::Request&,
+                                       httplib::Response& res) {
+        std::string arch;
+        std::string model_name;
+        int rec_temp_idx = 2;   // indice nella tabella parametri
+        if (model.config.arch == ArchType::GPT2) {
+            arch = "gpt2";
+            model_name = "GPT-2 small";
+            rec_temp_idx = 0;
+        } else {
+            // Rileva il nome del modello dal chat template o default
+            if      (tok.chat_template.find("<|im_start|>") != std::string::npos &&
+                     tok.chat_template.find("enable_thinking") != std::string::npos)
+                { arch = "qwen3"; model_name = "Qwen3-1.7B"; rec_temp_idx = 4; }
+            else if (tok.chat_template.find("<|im_start|>") != std::string::npos)
+                { arch = "qwen2"; model_name = "Qwen2.5-1.5B"; rec_temp_idx = 3; }
+            else if (tok.chat_template.find("<|start_header_id|>") != std::string::npos)
+                { arch = "llama3"; model_name = "Llama-3.2-3B"; rec_temp_idx = 2; }
+            else
+                { arch = "llama"; model_name = "TinyLlama 1.1B"; rec_temp_idx = 1; }
+        }
+
+        // Parametri consigliati per ogni modello
+        // [temp, top_k, top_p, rep_penalty, enable_thinking]
+        static const float rec_params[5][5] = {
+            {1.0f, 40, 0.9f, 1.0f, 0.0f},  // GPT-2
+            {0.7f, 50, 0.95f, 1.1f, 0.0f}, // TinyLlama
+            {0.6f, 40, 0.9f, 1.1f, 0.0f},  // Llama-3.2
+            {0.7f, 40, 0.8f, 1.05f, 0.0f}, // Qwen2.5
+            {0.6f, 20, 0.95f, 1.5f, 1.0f}, // Qwen3 (thinking)
+        };
+        const float* p = rec_params[rec_temp_idx];
+
+        std::ostringstream j;
+        j << "{"
+          << "\"status\":\"ok\","
+          << "\"model\":\"" << model_name << "\","
+          << "\"arch\":\"" << arch << "\","
+          << "\"recommended\":{"
+          << "\"temperature\":" << p[0] << ","
+          << "\"top_k\":"       << (int)p[1] << ","
+          << "\"top_p\":"       << p[2] << ","
+          << "\"repetition_penalty\":" << p[3] << ","
+          << "\"enable_thinking\":"    << (p[4] > 0.5f ? "true" : "false")
+          << "}"
+          << "}";
+        res.set_content(j.str(), "application/json");
     });
 
     // ── POST /v1/completions ──────────────────
@@ -968,8 +1007,12 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
             return;
         }
 
+        // Thinking mode: di default true (il modello decide se ragionare),
+        // false = risposta diretta senza ragionamento (Qwen3).
+        bool enable_thinking = json_get_bool(req.body, "enable_thinking", true);
+
         std::string prompt = tok.has_chat_template
-            ? apply_chat_template_conversation(tok, messages)
+            ? apply_chat_template_conversation(tok, messages, enable_thinking)
             : json_get_last_user_message(req.body);
 
         bool stream = json_get_bool(req.body, "stream", false);

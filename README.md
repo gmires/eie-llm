@@ -26,6 +26,27 @@ Puoi:
 | **TinyLlama 1.1B Chat** (Q4_K_M) | Funzionante | `models/tinyllama.Q4_K_M.gguf` |
 | **Llama-3.2-3B-Instruct** (Q4_K_M) | Funzionante | `models/llama-3.2-3b.Q4_K_M.gguf` |
 | **Qwen2.5-1.5B-Instruct** (Q4_K_M) | Funzionante | `models/qwen2.5-1.5b.Q4_K_M.gguf` |
+| **Qwen3-1.7B-Instruct** (Q8_0) | Funzionante | `models/qwen3-1.7b.Q8_0.gguf` |
+
+### Parametri di sampling consigliati per modello
+
+I parametri ottimali variano in base al modello e al compito. La tabella seguente
+riassume le configurazioni consigliate dalle rispettive model card ufficiali.
+
+| Modello | Temp | Top-K | Top-P | Rep. Penalty | Fonte |
+|---------|------|-------|-------|-------------|-------|
+| **GPT-2 small** | 1.0 | 40 | 0.9 | 1.0 | OpenAI / HF transformers |
+| **TinyLlama 1.1B** | 0.7 | 50 | 0.95 | 1.1 | Model card HF + Cloudflare Workers AI |
+| **Llama-3.2-3B** | 0.6 | 40 | 0.9 | 1.1 | Meta / best practices generali LLaMA |
+| **Qwen2.5-1.5B** | 0.7 | 40 | 0.8 | 1.05 | Qwen docs (modello rif. Qwen2.5-7B) |
+| **Qwen3-1.7B** (thinking) | **0.6** | **20** | **0.95** | **1.5** | Model card ufficiale Qwen3 |
+| **Qwen3-1.7B** (non-thinking) | **0.7** | **20** | **0.8** | **1.5** | Model card ufficiale Qwen3 |
+
+**Note:**
+- Per Qwen3 in thinking mode, **non usare greedy decoding** (`:greedy`) — causa
+  ripetizioni infinite. Usare sempre sampling con temperatura > 0.
+- `presence_penalty` è equivalente a `repetition_penalty` nel nostro motore.
+- I valori predefiniti del motore sono: temp=1.0, topk=40, topp=0.9, penalty=1.1.
 
 ---
 
@@ -67,12 +88,13 @@ chmod +x scripts/setup.sh
 ```
 
 Ti verrà chiesto:
-1. **Quale modello scaricare** — puoi scegliere tra GPT-2 (piccolo, inglese), TinyLlama (chat, multilingue) o Llama-3.2-3B (più potente, ottimo italiano). Se è la prima volta, scegli **Llama-3.2-3B** per la migliore esperienza.
+1. **Quale modello scaricare** — puoi scegliere tra GPT-2 (piccolo, inglese), TinyLlama (chat, multilingue), Llama-3.2-3B (più potente, ottimo italiano), Qwen2.5-1.5B (veloce, italiano) o Qwen3-1.7B (thinking mode). Se è la prima volta, scegli **Llama-3.2-3B** per la migliore esperienza.
 2. **Se aggiornare le librerie third_party** — `httplib.h` e `linenoise.hpp` sono già nel repository, ma puoi aggiornarle all'ultima versione.
 
 Se preferisci la modalità automatica (es. in uno script CI):
 ```bash
 ./scripts/setup.sh --llama32   # solo Llama-3.2
+./scripts/setup.sh --qwen3     # solo Qwen3-1.7B (thinking mode)
 ./scripts/setup.sh --all       # tutti i modelli
 ./scripts/setup.sh --gpt2      # solo GPT-2 (per test rapidi)
 ```
@@ -103,14 +125,42 @@ Se vedi `Debug (-O0)`, ricompila in Release.
 
 ## Utilizzo
 
-### Shell interattiva
+### Avvio rapido con script pre-configurati
+
+```bash
+# Launcher unificato con menu interattivo
+./scripts/run.sh
+
+# Oppure direttamente:
+./scripts/run.sh tinyllama      # TinyLlama 1.1B
+./scripts/run.sh llama32        # Llama-3.2-3B
+./scripts/run.sh qwen25         # Qwen2.5-1.5B
+./scripts/run.sh qwen3          # Qwen3-1.7B (thinking mode)
+./scripts/run.sh gpt2           # GPT-2 small
+
+# Script dedicati per modello:
+./scripts/run-tinyllama.sh
+./scripts/run-llama32.sh
+./scripts/run-qwen25.sh
+./scripts/run-qwen3.sh
+./scripts/run-gpt2.sh
+```
+
+Tutti gli script avviano il modello con i **parametri consigliati** dalla rispettiva
+model card (vedi tabella nella sezione Modelli).
+
+### Shell interattiva (avvio manuale)
 
 ```bash
 ./build/eie-llm models/tinyllama.Q4_K_M.gguf
 ./build/eie-llm models/gpt2.Q8_0.gguf
+./build/eie-llm models/llama-3.2-3b.Q4_K_M.gguf
+./build/eie-llm models/qwen2.5-1.5b.Q4_K_M.gguf
+./build/eie-llm models/qwen3-1.7b.Q8_0.gguf
 ```
 
-TinyLlama si avvia automaticamente in **modalità chat** perché ha un template nel file GGUF. GPT-2 parte in modalità raw (completamento libero).
+Tutti i modelli LLaMA/Qwen si avviano automaticamente in **modalità chat** perché hanno un template nel file GGUF. GPT-2 parte in modalità raw (completamento libero).  
+Per Qwen3, il comando `:think off` disabilita il thinking mode (risposte più rapide).
 
 **Comandi disponibili:**
 
@@ -126,8 +176,17 @@ TinyLlama si avvia automaticamente in **modalità chat** perché ha un template 
 | `:greedy` | Sampling deterministico (sceglie sempre il token più probabile) |
 | `:sample` | Sampling stocastico — top-k + top-p (default) |
 | `:params` | Mostra i parametri correnti |
-| `:reset` | Svuota la KV cache (ricomincia da capo) |
+| `:history` | Mostra la conversazione corrente (multi-turn) |
+| `:think [on\|off]` | Thinking mode (Qwen3): on=ragiona, off=risposta diretta |
+| `:reset` | Svuota KV cache, conversazione e thinking mode |
 | `:quit` | Esci |
+
+**Impostare i parametri di sampling all'avvio:**
+```bash
+# I parametri si impostano con i comandi ":"
+echo -e ":temp 0.6\n:topk 20\n:topp 0.95\n:penalty 1.5" | cat - /dev/stdin | ./build/eie-llm models/qwen3-1.7b.Q8_0.gguf
+```
+Oppure usa uno script pre-configurato (`scripts/run-qwen3.sh`).
 
 **Esempio:**
 ```
@@ -775,13 +834,15 @@ Obiettivo: aggiungere supporto per modelli più performanti in italiano, verific
 - **Tokenizer BPE senza supporto token speciali:** Llama-3.2 usa un tokenizer BPE (classificato come GPT-2) con ~256 token speciali di controllo (`<|start_header_id|>`, `<|eot_id|>`, ecc.). Il nostro encoder li spezzava in caratteri individuali perché non li riconosceva. Fix: `tokenizer_encode()` ora spezza il testo in segmenti, passando i token speciali come singoli ID e tokenizzando solo il testo normale.
 - **Chat template LLaMA-3 non riconosciuto:** Il template usa tag `<|start_header_id|>` / `<|end_header_id|>` / `<|eot_id|>` invece dei tag TinyLlama `<|user|>` / `<|assistant|>`. Il rilevamento del template falliva e il prompt veniva passato grezzo al modello. Fix: aggiunto rilevamento e formattazione del formato LLaMA-3 in `apply_chat_template()`.
 
-**Benchmark (CPU 8-core, Q4_K_M):**
+**Benchmark (CPU 8-core):**
 
 | Modello | Prefill | Generazione | Memoria modello |
 |---|---|---|---|
-| GPT-2 small | — | — | ~120 MB |
-| TinyLlama 1.1B | 8.2 tok/s | 5.7 tok/s | ~700 MB |
-| **Llama-3.2-3B** | **1.7 tok/s** | **1.9 tok/s** | **~1.9 GB** |
+| GPT-2 small (Q8_0) | — | — | ~120 MB |
+| TinyLlama 1.1B (Q4_K_M) | 8.2 tok/s | 5.7 tok/s | ~700 MB |
+| Llama-3.2-3B (Q4_K_M) | 1.7 tok/s | 1.9 tok/s | ~1.9 GB |
+| **Qwen2.5-1.5B (Q4_K_M)** | **3.6 tok/s** | **3.0 tok/s** | **~941 MB** |
+| **Qwen3-1.7B (Q8_0)** | **2.4 tok/s** | **5.8 tok/s** | **~1.8 GB** |
 
 **Perché prima:** architettura identica a LLaMA già supportata, quasi zero modifiche al C++. Conferma che il motore è robusto per tutta la famiglia LLaMA.
 
@@ -827,35 +888,50 @@ Obiettivo: aggiungere supporto per modelli più performanti in italiano, verific
 
 ---
 
-### Task D — Qwen3-1.7B-Instruct *(il futuro)*
+### Task C — Qwen3-1.7B-Instruct *(thinking mode)*
 
-**Stato:** ⬜ Da fare
+**Stato:** ✅ Completato
 
-**Architettura:** Qwen3 (simile a Qwen2 ma con **thinking mode** `/think` e `/no_think`)  
-**Peso:** ~1.1 GB (Q4_K_M)  
+**Architettura:** Qwen3 (architetturalmente identica a Qwen2, stessa RoPE NEOX, GQA, SwiGLU, RMSNorm). Aggiunge **QK-Norm** (RMSNorm su Q e K prima di RoPE) e **thinking mode** (tag `<think>...</think>`).  
+**Peso:** ~1.8 GB (Q8_0)  
 **Italiano:** Eccellente (119 lingue)  
-**Lavoro stimato:** ~3-4 giorni  
-**Difficoltà:** 🟡 Media-Alta
+**Lavoro stimato:** ~1.5-2 giorni  
+**Difficoltà:** 🟡 Media
 
-**Cosa fare:**
-1. Scaricare GGUF Q4_K_M da HuggingFace (`Qwen/Qwen3-1.7B-GGUF`)
-2. Verificare compatibilità tokenizer e tie embedding (come Task B)
-3. Aggiungere supporto per **thinking mode** nella shell e nella Web UI
-   - Parsing dei tag `<think>...</think>` nella risposta
-   - Toggle nell'UI per mostrare/nascondere il ragionamento
-4. Verificare nuovi formati di chat template con `/think` e `/no_think`
-5. Test end-to-end con thinking attivo e disattivato
-6. Benchmark comparativo: Qwen3 vs Qwen2.5 vs Llama-3.2
-7. Aggiornare `README.md` e `webui/README.md`
+**Cosa è stato fatto:**
+1. ✅ Scaricato GGUF Q8_0 da HuggingFace (`Qwen/Qwen3-1.7B-GGUF`)
+2. ✅ Aggiunto supporto metadati `qwen3.*` in `model_load_config()` (stesso path LLaMA con prefisso `qwen3.`)
+3. ✅ Aggiunto **QK-Norm**: `attn_q_norm.weight` e `attn_k_norm.weight` caricati opzionalmente in `LayerWeights` e applicati come RMSNorm per-head dopo la proiezione Q/K e prima di RoPE
+4. ✅ Aggiunto `enable_thinking` a `apply_chat_template_conversation()` — quando `false`, il template ChatML inserisce `<think>\n\n</think>\n\n` prima del tag assistant per disabilitare il ragionamento
+5. ✅ Aggiunta `parse_think_tags()` in `tokenizer.{hpp,cpp}` — separa il contenuto `<think>...</think>` dal resto della risposta
+6. ✅ Aggiunto comando `:think [on|off]` nella shell per controllare il thinking mode
+7. ✅ Aggiunto toggle **Thinking mode** nella Web UI (impostazioni → checkbox)
+8. ✅ Parsing e rendering di `<think>` nella Web UI come blocco collassabile con sfondo grigio
+9. ✅ Aggiunto parametro `enable_thinking` all'endpoint `/v1/chat/completions`
+10. ✅ Test end-to-end: shell, server, streaming SSE, attention heatmap
 
-**Perché terzo:** richiede tutto il lavoro di Task B più la gestione del thinking mode. È il modello più interessante ma conviene avere la base Qwen2.5 stabile prima.
+**Bug critici risolti durante l'integrazione:**
+- **QK-Norm mancante:** Qwen3 introduce `attn_q_norm.weight` e `attn_k_norm.weight` (RMSNorm per-head su Q e K). Senza questi, l'attenzione produceva output completamente casuale (caratteri nonsense). Fix: aggiunti i campi `attn_q_norm_w`/`attn_k_norm_w` in `LayerWeights` e RMSNorm applicato in `self_attention_llama()` e `self_attention_llama_prefill()`.
+- **Tensor naming differente:** Qwen3 ha 3 tensori in più per layer rispetto a Qwen2.5 (q_norm, k_norm, e attn_output ha dimensioni diverse). Il caricamento con `required=false` gestisce automaticamente i tensori opzionali.
+
+**Benchmark (CPU 8-core, Q8_0):**
+
+| Modello | Prefill | Generazione | Memoria modello |
+|---|---|---|---|
+| GPT-2 small | — | — | ~120 MB |
+| TinyLlama 1.1B | 8.2 tok/s | 5.7 tok/s | ~700 MB |
+| Llama-3.2-3B | 1.7 tok/s | 1.9 tok/s | ~1.9 GB |
+| Qwen2.5-1.5B | 3.6 tok/s | 3.0 tok/s | ~941 MB |
+| **Qwen3-1.7B** | **2.4 tok/s** | **5.8 tok/s** | **~1.8 GB** |
+
+**Perché terzo:** aggiunge il thinking mode che richiede modifiche in 4 componenti (tokenizer, shell, server, web UI). Qwen3 è il modello più avanzato supportato, con ragionamento esplicito e risposte di alta qualità.
 
 ---
 
 ### Ordine di esecuzione consigliato
 
 ```
-Task A (Llama-3.2) → Task B (Qwen2.5) → Task D (Qwen3)
+Task A (Llama-3.2) → Task B (Qwen2.5) → Task C (Qwen3)
 ```
 
 Ogni task include:

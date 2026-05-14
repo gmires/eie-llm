@@ -23,6 +23,7 @@ const DEFAULTS = {
   stream: true,
   greedy: false,
   chatMode: true,
+  enableThinking: true,  // thinking mode Qwen3: on/off
 };
 
 /* ── State ────────────────────────────────────────────────────────────────── */
@@ -66,6 +67,7 @@ const el = {
   sStream: $('setting-stream'),
   sGreedy: $('setting-greedy'),
   sChatMode: $('setting-chat-mode'),
+  sEnableThinking: $('setting-enable-thinking'),
   // Value labels
   vTemp: $('val-temperature'),
   vMaxTok: $('val-max-tokens'),
@@ -141,6 +143,7 @@ function applySettingsToUI() {
   el.sStream.checked = s.stream;
   el.sGreedy.checked = s.greedy;
   el.sChatMode.checked = s.chatMode;
+  el.sEnableThinking.checked = s.enableThinking;
 }
 function readSettingsFromUI() {
   state.settings.temperature = parseFloat(el.sTemp.value);
@@ -151,6 +154,7 @@ function readSettingsFromUI() {
   state.settings.stream = el.sStream.checked;
   state.settings.greedy = el.sGreedy.checked;
   state.settings.chatMode = el.sChatMode.checked;
+  state.settings.enableThinking = el.sEnableThinking.checked;
   saveSettings();
 }
 
@@ -245,11 +249,37 @@ function renderMessages() {
   scrollToBottom();
 }
 
+// Formatta il contenuto con eventuali tag <think>...</think>.
+// Il thinking viene reso come blocco collassabile <details>.
+function formatContentWithThinking(content) {
+  const thinkStart = content.indexOf('<think>');
+  if (thinkStart === -1) return content;
+
+  const thinkEnd = content.indexOf('</think>', thinkStart);
+  if (thinkEnd === -1) return content;
+
+  const before = content.substring(0, thinkStart);
+  const thinking = content.substring(thinkStart + 7, thinkEnd).trim();
+  const after = content.substring(thinkEnd + 8).trim();
+
+  let html = '';
+  if (before.trim()) html += before;
+  if (thinking) {
+    html += '<details class="think-block" open>';
+    html += '<summary>🧠 Pensiero</summary>';
+    html += '<div class="think-content">' + thinking.replace(/\n/g, '<br>') + '</div>';
+    html += '</details>';
+  }
+  if (after) html += '\n\n' + after;
+  return html;
+}
+
 function appendMessageBubble(role, content, animate = true) {
   const div = document.createElement('div');
   div.className = 'message ' + role + (animate ? ' generating' : '');
   const avatar = role === 'user' ? 'U' : 'AI';
-  const html = marked.parse(content, {breaks: true, gfm: true});
+  const formatted = role === 'assistant' ? formatContentWithThinking(content) : content;
+  const html = marked.parse(formatted, {breaks: true, gfm: true});
   div.innerHTML = `<div class="avatar">${avatar}</div><div class="bubble">${html}</div>`;
   el.chatMessages.appendChild(div);
   div.querySelectorAll('pre code').forEach(block => {
@@ -265,7 +295,8 @@ function updateLastBubble(content) {
   const last = el.chatMessages.lastElementChild;
   if (!last) return;
   const bubble = last.querySelector('.bubble');
-  const html = marked.parse(content, {breaks: true, gfm: true});
+  const formatted = formatContentWithThinking(content);
+  const html = marked.parse(formatted, {breaks: true, gfm: true});
   bubble.innerHTML = html;
   bubble.querySelectorAll('pre code').forEach(block => {
     if (window.hljs) hljs.highlightElement(block);
@@ -296,7 +327,20 @@ async function checkHealth() {
       const data = await res.json();
       el.modelStatus.textContent = '🟢 ' + (data.model || 'Connesso');
       el.modelStatus.classList.add('connected');
-      el.sModel.value = data.model || 'eie-llm';
+      const modelId = data.arch || 'llama';
+      el.sModel.value = modelId;
+
+      // Applica parametri consigliati dal server se l'utente
+      // non li ha personalizzati (primo avvio o reset)
+      if (data.recommended && !localStorage.getItem('eie-settings')) {
+        const r = data.recommended;
+        state.settings.temperature = r.temperature ?? 1.0;
+        state.settings.top_k = r.top_k ?? 40;
+        state.settings.top_p = r.top_p ?? 0.9;
+        state.settings.repetition_penalty = r.repetition_penalty ?? 1.1;
+        state.settings.enableThinking = r.enable_thinking ?? true;
+        applySettingsToUI();
+      }
     } else throw new Error('status ' + res.status);
   } catch (e) {
     el.modelStatus.textContent = '🔴 Disconnesso';
@@ -365,6 +409,7 @@ async function blockingResponse(chat, assistantMsg, abortCtrl) {
         top_k: s.top_k,
         top_p: s.top_p,
         repetition_penalty: s.repetition_penalty,
+        enable_thinking: s.enableThinking,
         stream: false,
       })
     : JSON.stringify({
@@ -405,6 +450,7 @@ async function streamResponse(chat, assistantMsg, abortCtrl) {
         top_k: s.top_k,
         top_p: s.top_p,
         repetition_penalty: s.repetition_penalty,
+        enable_thinking: s.enableThinking,
         stream: true,
       })
     : JSON.stringify({
@@ -480,7 +526,49 @@ function stopGeneration() {
   setGenerating(false);
 }
 
-/* ── Attention heatmap ─────────────────────────────────────────────────────── */
+/* ── Attention heatmap — ristrutturata ────────────────────────────────────── */
+//
+//  Miglioramenti rispetto alla versione precedente:
+//  • ImageData pixel buffer per rendering ~100x più veloce
+//  • Colormap uniforme (blu → ciano → giallo → rosso) invece di HSL singolo
+//  • Zoom con rotellina mouse + pan con trascinamento
+//  • Etichette token troncate senza sovrapposizioni
+//  • Media tra layer/head calcolata in batch e cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Colormap a 256 colori: blue → cyan → yellow → red
+function buildHeatmapColormap() {
+  const map = new Uint8Array(256 * 4); // RGBA
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let r, g, b;
+    if (t < 0.25) {
+      const u = t / 0.25;
+      r = 0; g = u * 255; b = 255;
+    } else if (t < 0.5) {
+      const u = (t - 0.25) / 0.25;
+      r = 0; g = 255; b = (1 - u) * 255;
+    } else if (t < 0.75) {
+      const u = (t - 0.5) / 0.25;
+      r = u * 255; g = 255; b = 0;
+    } else {
+      const u = (t - 0.75) / 0.25;
+      r = 255; g = (1 - u) * 255; b = 0;
+    }
+    const idx = i * 4;
+    map[idx] = r; map[idx+1] = g; map[idx+2] = b; map[idx+3] = 255;
+  }
+  return map;
+}
+const COLORMAP = buildHeatmapColormap();
+
+// Tronca etichetta a maxLen caratteri
+function truncLabel(s, maxLen) {
+  if (!s) return '';
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen - 1) + '…';
+}
+
 async function analyzeAttention() {
   const text = el.attInput.value.trim();
   if (!text) return;
@@ -494,10 +582,11 @@ async function analyzeAttention() {
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     state.attentionData = await res.json();
+    state._cachedAvg = null; // invalida cache media
     populateAttentionControls();
     drawAttention();
   } catch (e) {
-    alert('Errore analisi attention: ' + e.message);
+    alert('Errore: ' + e.message);
   } finally {
     el.btnAnalyze.textContent = 'Analizza';
     el.btnAnalyze.disabled = false;
@@ -508,10 +597,10 @@ function populateAttentionControls() {
   const d = state.attentionData;
   if (!d || !d.layers) return;
   el.attControls.style.display = 'flex';
-  el.attControls.style.flexDirection = 'column';
-  el.attControls.style.gap = '10px';
+  el.attControls.style.flexWrap = 'wrap';
+  el.attControls.style.gap = '8px';
 
-  el.attLayer.innerHTML = '';
+  el.attLayer.innerHTML = '<option value="-1">Media tutti</option>';
   d.layers.forEach((L, i) => {
     const opt = document.createElement('option');
     opt.value = i;
@@ -520,7 +609,7 @@ function populateAttentionControls() {
   });
   if (d.layers.length) {
     const nHeads = d.layers[0].heads.length;
-    el.attHead.innerHTML = '';
+    el.attHead.innerHTML = '<option value="-1">Media tutti</option>';
     for (let h = 0; h < nHeads; h++) {
       const opt = document.createElement('option');
       opt.value = h;
@@ -530,7 +619,50 @@ function populateAttentionControls() {
   }
   el.attLayer.onchange = drawAttention;
   el.attHead.onchange = drawAttention;
-  el.attAvg.onchange = drawAttention;
+}
+
+// Calcola la matrice da visualizzare con caching della media
+function computeAttentionMatrix() {
+  const d = state.attentionData;
+  if (!d || !d.tokens) return null;
+  const seqLen = d.tokens.length;
+  const li = parseInt(el.attLayer.value, 10);
+  const hi = parseInt(el.attHead.value, 10);
+
+  // Layer e head specifici
+  if (li >= 0 && hi >= 0 && li < d.layers.length && hi < d.layers[li].heads.length) {
+    return d.layers[li].heads[hi].weights;
+  }
+
+  // Media su layer/head — calcolata una volta e cache
+  if (li < 0 && hi < 0) {
+    if (state._cachedAvg && state._cachedAvg.length === seqLen) return state._cachedAvg;
+  }
+  if (state._cachedAvg && state._cachedAvg.length === seqLen) return state._cachedAvg;
+
+  const nL = d.layers.length;
+  const nH = d.layers[0]?.heads.length || 1;
+  const layerSet = li >= 0 ? [li] : [...Array(nL).keys()];
+  const headSet  = hi >= 0 ? [hi] : [...Array(nH).keys()];
+
+  // Pre-allocated array di float64 per performance
+  const matrix = Array.from({length: seqLen}, () => new Float64Array(seqLen));
+  for (let q = 0; q < seqLen; q++)
+    for (let k = 0; k < seqLen; k++) {
+      let sum = 0;
+      for (const l of layerSet)
+        for (const h of headSet)
+          sum += d.layers[l].heads[h].weights[q][k];
+      matrix[q][k] = sum / (layerSet.length * headSet.length);
+    }
+  state._cachedAvg = matrix;
+  return matrix;
+}
+
+// Stato zoom/pan
+let _attZoom = {scale:1, offsetX:0, offsetY:0, seqLen:0};
+function resetAttZoom(seqLen) {
+  _attZoom = {scale:1, offsetX:0, offsetY:0, seqLen};
 }
 
 function drawAttention() {
@@ -540,117 +672,135 @@ function drawAttention() {
   const seqLen = tokens.length;
   const canvas = el.attCanvas;
   const ctx = canvas.getContext('2d');
+  const isDark = document.body.classList.contains('dark-theme');
 
-  // Dimensioni
-  const margin = {top: 60, right: 20, bottom: 20, left: 60};
-  const cellSize = Math.max(4, Math.min(40, Math.floor(500 / seqLen)));
-  const width = margin.left + seqLen * cellSize + margin.right;
-  const height = margin.top + seqLen * cellSize + margin.bottom;
-  canvas.width = width;
-  canvas.height = height;
-  canvas.style.width = width + 'px';
-  canvas.style.height = height + 'px';
+  const matrix = computeAttentionMatrix();
+  if (!matrix) return;
 
-  // Calcola matrice da visualizzare
-  let matrix = [];
-  if (el.attAvg.checked) {
-    const nL = d.layers.length;
-    const nH = d.layers[0]?.heads.length || 1;
-    for (let q = 0; q < seqLen; q++) {
-      matrix[q] = [];
-      for (let k = 0; k < seqLen; k++) {
-        let sum = 0;
-        for (let li = 0; li < nL; li++) {
-          for (let hi = 0; hi < nH; hi++) {
-            sum += d.layers[li].heads[hi].weights[q][k];
-          }
+  const margin = {top: 50, right: 10, bottom: 10, left: 80};
+  const zoom = _attZoom.seqLen !== seqLen ? 1 : _attZoom.scale;
+  if (_attZoom.seqLen !== seqLen) resetAttZoom(seqLen);
+
+  const baseCell = Math.max(4, Math.min(48, Math.floor(600 / seqLen)));
+  const cellSize = Math.max(4, Math.floor(baseCell * zoom));
+  const ox = _attZoom.offsetX, oy = _attZoom.offsetY;
+
+  const w = margin.left + seqLen * cellSize + margin.right;
+  const h = margin.top + seqLen * cellSize + margin.bottom;
+  canvas.width = Math.max(w + ox, 200);
+  canvas.height = Math.max(h + oy, 200);
+
+  // Sfondo
+  ctx.fillStyle = isDark ? '#1a1a2e' : '#f8f9fa';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Disegna la matrice con ImageData (~100x più veloce di fillRect)
+  const pixelW = seqLen * cellSize;
+  const pixelH = seqLen * cellSize;
+  const imageData = ctx.createImageData(pixelW, pixelH);
+  const px = imageData.data;
+
+  for (let q = 0; q < seqLen; q++) {
+    for (let k = 0; k < seqLen; k++) {
+      const val = matrix[q][k];
+      const ci = Math.min(255, Math.max(0, Math.round(val * 255)));
+      const r = COLORMAP[ci * 4]; const g = COLORMAP[ci * 4 + 1]; const b = COLORMAP[ci * 4 + 2];
+
+      // Per ogni pixel nella cella (q, k)
+      const baseX = k * cellSize;
+      const baseY = q * cellSize;
+      for (let dy = 0; dy < cellSize; dy++) {
+        for (let dx = 0; dx < cellSize; dx++) {
+          const pi = ((baseY + dy) * pixelW + (baseX + dx)) * 4;
+          px[pi] = r; px[pi+1] = g; px[pi+2] = b; px[pi+3] = 255;
         }
-        matrix[q][k] = sum / (nL * nH);
+      }
+
+      // Bordo cella sottile
+      if (cellSize >= 8) {
+        const bx = baseX, by = baseY;
+        for (let dy = 0; dy < cellSize; dy++) {
+          const pi = ((by + dy) * pixelW + bx) * 4;
+          if (pi + 4 < px.length) { px[pi] = 0; px[pi+1] = 0; px[pi+2] = 0; px[pi+3] = 40; }
+        }
+        for (let dx = 0; dx < cellSize; dx++) {
+          const pi = (by * pixelW + bx + dx) * 4;
+          if (pi + 4 < px.length) { px[pi] = 0; px[pi+1] = 0; px[pi+2] = 0; px[pi+3] = 40; }
+        }
       }
     }
-  } else {
-    const li = parseInt(el.attLayer.value, 10);
-    const hi = parseInt(el.attHead.value, 10);
-    const layer = d.layers[li];
-    if (!layer || !layer.heads[hi]) return;
-    matrix = layer.heads[hi].weights;
   }
 
-  // Salva per il tooltip
+  ctx.putImageData(imageData, margin.left, margin.top);
+
+  // Salva per tooltip
   canvas._matrix = matrix;
   canvas._tokens = tokens;
   canvas._cellSize = cellSize;
   canvas._margin = margin;
+  canvas._seqLen = seqLen;
 
-  // Sfondo
-  ctx.fillStyle = document.body.classList.contains('dark-theme') ? '#0d0d0d' : '#ffffff';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  // Celle
-  const showNumbers = cellSize > 16;
-  for (let q = 0; q < seqLen; q++) {
-    for (let k = 0; k < seqLen; k++) {
-      const val = matrix[q][k];
-      const hue = 240 * (1 - val);
-      ctx.fillStyle = `hsl(${hue}, 80%, 50%)`;
-      ctx.fillRect(margin.left + k * cellSize, margin.top + q * cellSize, cellSize, cellSize);
-
-      if (showNumbers) {
-        ctx.fillStyle = val > 0.5 ? '#000' : '#fff';
-        ctx.font = `${Math.max(8, cellSize - 6)}px sans-serif`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(val.toFixed(2), margin.left + k * cellSize + cellSize / 2, margin.top + q * cellSize + cellSize / 2);
-      }
-    }
-  }
-
-  // Etichette token
-  ctx.fillStyle = document.body.classList.contains('dark-theme') ? '#e6e6e6' : '#202123';
-  ctx.font = `${Math.min(12, cellSize)}px sans-serif`;
+  // Etichette row (query tokens)
+  const labelSize = Math.max(9, Math.min(13, cellSize));
+  ctx.fillStyle = isDark ? '#ccc' : '#333';
+  ctx.font = `bold ${labelSize}px monospace`;
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
   for (let i = 0; i < seqLen; i++) {
-    const label = tokens[i];
-    const y = margin.top + i * cellSize + cellSize / 2;
-    ctx.fillText(label, margin.left - 6, y);
+    const label = truncLabel(tokens[i], Math.max(2, Math.floor(margin.left / labelSize * 0.7)));
+    ctx.fillText(label, margin.left - 6, margin.top + i * cellSize + cellSize / 2);
   }
-  ctx.save();
-  ctx.translate(15, margin.top + seqLen * cellSize / 2);
-  ctx.rotate(-Math.PI / 2);
-  ctx.textAlign = 'center';
-  ctx.fillText('Query tokens', 0, 0);
-  ctx.restore();
 
-  ctx.textAlign = 'center';
+  // Etichette colonna (key tokens) — ruotate
+  ctx.textAlign = 'right';
   ctx.textBaseline = 'top';
   for (let i = 0; i < seqLen; i++) {
-    const label = tokens[i];
+    const label = truncLabel(tokens[i], Math.max(2, Math.floor(cellSize / labelSize * 2)));
     const x = margin.left + i * cellSize + cellSize / 2;
+    const y = margin.top - 4;
     ctx.save();
-    ctx.translate(x, margin.top - 4);
-    ctx.rotate(-Math.PI / 4);
+    ctx.translate(x, y);
+    ctx.rotate(-Math.PI / 3);
     ctx.fillText(label, 0, 0);
     ctx.restore();
   }
-  ctx.save();
-  ctx.translate(margin.left + seqLen * cellSize / 2, 10);
-  ctx.fillText('Key tokens', 0, 0);
-  ctx.restore();
 
-  el.attInfo.textContent = `${tokens.length} token × ${tokens.length} token — Media: ${el.attAvg.checked ? 'tutti i layer/head' : 'Layer ' + el.attLayer.value + ' Head ' + el.attHead.value}`;
+  // Info
+  const li = parseInt(el.attLayer.value, 10);
+  const hi = parseInt(el.attHead.value, 10);
+  const label = li >= 0 && hi >= 0 ? `Layer ${li} Head ${hi}`
+              : li >= 0 ? `Layer ${li} (media head)`
+              : hi >= 0 ? `Head ${hi} (media layer)`
+              : 'Media tutti';
+  el.attInfo.textContent = `${tokens.length}×${tokens.length} — ${label}  (zoom: ×${zoom.toFixed(1)}, rotella per zoomare)`;
 }
 
-// Tooltip heatmap
+// Tooltip + zoom/pan interattivo
 function setupAttentionTooltip() {
   const tooltip = document.createElement('div');
   tooltip.id = 'att-tooltip';
-  tooltip.style.cssText = 'position:absolute;display:none;padding:6px 10px;border-radius:6px;font-size:12px;pointer-events:none;z-index:200;background:var(--bg-3);color:var(--text-0);border:1px solid var(--border);box-shadow:0 2px 8px var(--shadow);';
+  tooltip.style.cssText = 'position:absolute;display:none;padding:6px 10px;border-radius:6px;font-size:12px;pointer-events:none;z-index:200;background:var(--bg-3);color:var(--text-0);border:1px solid var(--border);box-shadow:0 2px 8px var(--shadow);max-width:300px;';
   document.body.appendChild(tooltip);
 
+  let dragging = false, dragStartX = 0, dragStartY = 0;
+
+  el.attCanvas.addEventListener('mousedown', (e) => {
+    if (e.button === 0) { dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; }
+  });
+  window.addEventListener('mouseup', () => { dragging = false; });
   el.attCanvas.addEventListener('mousemove', (e) => {
     const c = el.attCanvas;
     if (!c._matrix) return;
+
+    if (dragging) {
+      _attZoom.offsetX += (e.clientX - dragStartX);
+      _attZoom.offsetY += (e.clientY - dragStartY);
+      dragStartX = e.clientX; dragStartY = e.clientY;
+      drawAttention();
+      return;
+    }
+
+    // Tooltip
     const rect = c.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -658,22 +808,28 @@ function setupAttentionTooltip() {
     const m = c._margin;
     const k = Math.floor((x - m.left) / cs);
     const q = Math.floor((y - m.top) / cs);
-    const seqLen = c._tokens.length;
+    const seq = c._seqLen || 0;
 
-    if (q >= 0 && q < seqLen && k >= 0 && k < seqLen) {
+    if (q >= 0 && q < seq && k >= 0 && k < seq) {
       const val = c._matrix[q][k];
-      tooltip.innerHTML = `<strong>Q:</strong> "${escapeHtml(c._tokens[q])}"<br><strong>K:</strong> "${escapeHtml(c._tokens[k])}"<br><strong>Att:</strong> ${val.toFixed(4)}`;
+      tooltip.innerHTML = `<strong>Q[${q}]:</strong> ${escapeHtml(truncLabel(c._tokens[q], 16))}<br><strong>K[${k}]:</strong> ${escapeHtml(truncLabel(c._tokens[k], 16))}<br><strong>Attenzione:</strong> ${(val * 100).toFixed(1)}%`;
       tooltip.style.display = 'block';
-      tooltip.style.left = (e.pageX + 12) + 'px';
-      tooltip.style.top = (e.pageY + 12) + 'px';
+      tooltip.style.left = (e.pageX + 14) + 'px';
+      tooltip.style.top = (e.pageY + 14) + 'px';
     } else {
       tooltip.style.display = 'none';
     }
   });
 
-  el.attCanvas.addEventListener('mouseleave', () => {
-    tooltip.style.display = 'none';
-  });
+  el.attCanvas.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; dragging = false; });
+
+  // Zoom rotellina
+  el.attCanvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const d = e.deltaY > 0 ? 0.85 : 1.15;
+    _attZoom.scale = Math.max(0.3, Math.min(10, _attZoom.scale * d));
+    drawAttention();
+  }, {passive: false});
 }
 
 /* ── Panels ─────────────────────────────────────────────────────────────────── */

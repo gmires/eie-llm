@@ -83,6 +83,11 @@ struct LayerWeights {
     std::vector<float> attn_k_b;
     std::vector<float> attn_v_b;
 
+    // QK-Norm (usato da Qwen3): RMSNorm applicato a Q e K
+    // dopo la proiezione ma prima di RoPE.
+    std::vector<float> attn_q_norm_w;  // per head Q
+    std::vector<float> attn_k_norm_w;  // per head KV
+
     // Output projection (comune a entrambi)
     QuantTensor        attn_out_w;
     std::vector<float> attn_out_b;  // GPT2 ha il bias, LLaMA no

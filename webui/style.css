@@ -281,6 +281,28 @@ body {
 }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* ── Thinking mode (Qwen3) ──────────────────────────────────────────────────── */
+.think-block {
+  background: var(--bg-2, #2a2a2a);
+  border: 1px solid var(--border, #444);
+  border-radius: 8px;
+  padding: .6em;
+  margin: .4em 0;
+}
+.think-block summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text-2, #999);
+  font-size: .85em;
+  user-select: none;
+}
+.think-content {
+  font-size: .9em;
+  color: var(--text-2, #bbb);
+  line-height: 1.4;
+  padding: .4em .2em 0;
+}
+
 /* ── Input area ───────────────────────────────────────────────────────────── */
 #input-area {
   height: var(--input-h);

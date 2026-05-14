@@ -106,13 +106,29 @@ std::string apply_chat_template(const Tokenizer& tok,
 // "system", "user" o "assistant". Costruisce il prompt completo
 // con tutta la history della conversazione.
 //
+// enable_thinking:
+//   true  (default) — il modello decide liberamente se usare il thinking mode.
+//   false           — il template inserisce <think>\n\n</think>\n\n vuoto
+//                      prima del tag assistant per disabilitare il ragionamento.
+//                      Usato da Qwen3 per il thinking mode.
+//
 // Esempio ChatML con 2 turni:
 //   [{"user","Ciao"},{"assistant","Ciao!"},{"user","Come stai?"}]
 //   → "<|im_start|>user\nCiao<|im_end|>\n<|im_start|>assistant\nCiao!<|im_end|>\n"
 //      "<|im_start|>user\nCome stai?<|im_end|>\n<|im_start|>assistant\n"
 std::string apply_chat_template_conversation(
     const Tokenizer& tok,
-    const std::vector<std::pair<std::string, std::string>>& messages);
+    const std::vector<std::pair<std::string, std::string>>& messages,
+    bool enable_thinking = true);
+
+// Separa il contenuto <think>...</think> dal resto del testo generato.
+// Restituisce una coppia {thinking_content, reply_content}.
+// Se non ci sono tag think, thinking_content è vuoto e reply_content = input.
+//
+// Esempio:
+//   input = "<think>\nDevo sommare...\n</think>\n\n2+2=4"
+//   → {"\nDevo sommare...\n", "2+2=4"}
+std::pair<std::string, std::string> parse_think_tags(const std::string& text);
 
 // Info debug
 void tokenizer_print_info(const Tokenizer& tok);

@@ -561,10 +561,16 @@ std::string apply_chat_template(const Tokenizer& tok,
 //  Come apply_chat_template ma per conversazioni multi-turn.
 //  Itera su tutti i messaggi e li formatta secondo il template.
 //  Aggiunge il tag assistant finale per invitare il modello a rispondere.
+//
+//  enable_thinking controlla il thinking mode di Qwen3:
+//    true  — il modello decide liberamente se usare <think>...
+//    false — il template inserisce <think>\n\n</think>\n\n prima del
+//            tag assistant, segnalando al modello di non ragionare.
 // ─────────────────────────────────────────────
 std::string apply_chat_template_conversation(
     const Tokenizer& tok,
-    const std::vector<std::pair<std::string, std::string>>& messages) {
+    const std::vector<std::pair<std::string, std::string>>& messages,
+    bool enable_thinking) {
 
     const std::string& eos = tok.eos_token_str;
 
@@ -605,10 +611,18 @@ std::string apply_chat_template_conversation(
 
     } else if (is_chatml) {
         // Formato ChatML (Mistral/Qwen)
+        // Supporta anche il thinking mode di Qwen3.
         for (const auto& [role, content] : messages) {
             result += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
         }
         result += "<|im_start|>assistant\n";
+
+        // Thinking mode OFF: inserisce il tag vuoto per disabilitare
+        // il ragionamento (Qwen3 interpreta <think>\n\n</think>\n\n
+        // come segnale per saltare il reasoning).
+        if (!enable_thinking) {
+            result += "<think>\n\n</think>\n\n";
+        }
 
     } else {
         // Fallback: concatenazione grezza
@@ -619,6 +633,54 @@ std::string apply_chat_template_conversation(
     }
 
     return result;
+}
+
+// ─────────────────────────────────────────────
+//  parse_think_tags
+//
+//  Separa il contenuto <think>...</think> dal resto
+//  del testo generato dal modello.
+//
+//  Il formato tipico di Qwen3 in thinking mode è:
+//    <think>
+//    Il ragionamento...
+//    </think>
+//
+//    La risposta finale.
+//
+//  Se non ci sono tag think, la coppia restituita
+//  ha first vuoto e second = testo originale.
+// ─────────────────────────────────────────────
+std::pair<std::string, std::string> parse_think_tags(const std::string& text) {
+    std::string thinking;
+    std::string reply;
+
+    size_t think_start = text.find("<think>");
+    if (think_start == std::string::npos) {
+        // Nessun tag think: tutto è reply
+        return {"", text};
+    }
+
+    size_t think_content_start = think_start + 7; // 7 = len("<think>")
+    size_t think_end = text.find("</think>", think_content_start);
+
+    if (think_end == std::string::npos) {
+        // Tag di apertura ma non di chiusura: tutto dopo <think> è thinking
+        thinking = text.substr(think_content_start);
+        return {thinking, ""};
+    }
+
+    // Estrae il contenuto thinking (tra i tag)
+    thinking = text.substr(think_content_start, think_end - think_content_start);
+
+    // Il resto dopo </think> è la risposta
+    size_t reply_start = think_end + 8; // 8 = len("</think>")
+    // Salta newline/spazi iniziali dopo </think>
+    while (reply_start < text.size() && (text[reply_start] == '\n' || text[reply_start] == ' '))
+        reply_start++;
+    reply = (reply_start < text.size()) ? text.substr(reply_start) : "";
+
+    return {thinking, reply};
 }
 
 // ─────────────────────────────────────────────

@@ -103,14 +103,15 @@ bool model_load_config(ModelConfig& cfg, const GGUFContext& ctx) {
             if (auto* s = kv.value.get_if<std::string>())
                 arch_str = *s;
 
-    if (arch_str == "llama" || arch_str == "qwen2") {
-        // Qwen2 è architetturalmente identico a LLaMA:
+    if (arch_str == "llama" || arch_str == "qwen2" || arch_str == "qwen3") {
+        // Qwen2 e Qwen3 sono architetturalmente identici a LLaMA:
         // RMSNorm, RoPE, GQA, SwiGLU. Le differenze sono solo
-        // nei nomi dei metadata (qwen2.* invece di llama.*)
-        // e in alcuni dettagli (es. bias su Q/K/V).
+        // nei nomi dei metadata (qwen2.* o qwen3.* invece di llama.*)
+        // e in alcuni dettagli (es. bias su Q/K/V, thinking mode).
         cfg.arch = ArchType::LLAMA;
 
-        std::string prefix = (arch_str == "qwen2") ? "qwen2." : "llama.";
+        std::string prefix = (arch_str == "qwen2") ? "qwen2." :
+                             (arch_str == "qwen3") ? "qwen3." : "llama.";
 
         cfg.n_vocab  = get_u32(ctx, "tokenizer.ggml.vocab_size", 32000);
         cfg.n_ctx    = get_u32(ctx, prefix + "context_length",      2048);
@@ -167,8 +168,8 @@ bool model_load_config(ModelConfig& cfg, const GGUFContext& ctx) {
     if (cfg.arch == ArchType::LLAMA && cfg.rope_dim == 0)
         cfg.rope_dim = cfg.d_head;
 
-    // Qwen2 usa RoPE tipo NEOX (coppie scambiate), non NORM
-    if (arch_str == "qwen2")
+    // Qwen2 e Qwen3 usano RoPE tipo NEOX (coppie scambiate), non NORM
+    if (arch_str == "qwen2" || arch_str == "qwen3")
         cfg.rope_type = RopeType::NEOX;
 
     return true;
@@ -248,6 +249,9 @@ bool model_load_weights(Model& model, const GGUFContext& ctx) {
             lw.attn_q_b   = load_tensor      (ctx, p + "attn_q.bias", false);
             lw.attn_k_b   = load_tensor      (ctx, p + "attn_k.bias", false);
             lw.attn_v_b   = load_tensor      (ctx, p + "attn_v.bias", false);
+            // QK-Norm (Qwen3): RMSNorm applicato a Q e K prima di RoPE
+            lw.attn_q_norm_w = load_tensor    (ctx, p + "attn_q_norm.weight", false);
+            lw.attn_k_norm_w = load_tensor    (ctx, p + "attn_k_norm.weight", false);
             lw.attn_out_w = load_quant_tensor(ctx, p + "attn_output.weight");
             lw.ln2_w      = load_tensor      (ctx, p + "ffn_norm.weight");
             lw.ffn_gate_w = load_quant_tensor(ctx, p + "ffn_gate.weight");
@@ -568,7 +572,22 @@ void self_attention_llama(const float* x, float* out, const LayerWeights& lw, KV
     if (!lw.attn_k_b.empty()) vec_add(bufs.K.data(), lw.attn_k_b.data(), bufs.K.data(), kv_dim);
     if (!lw.attn_v_b.empty()) vec_add(bufs.V.data(), lw.attn_v_b.data(), bufs.V.data(), kv_dim);
 
-    // ── Step 2: applica RoPE a Q e K ─────────
+    // ── Step 2: QK-Norm (Qwen3) ───────────────
+    //
+    // RMSNorm per-head applicato a Q e K dopo la proiezione
+    // ma prima di RoPE. Il peso è lo stesso per tutte le head.
+    if (!lw.attn_q_norm_w.empty()) {
+        for (int h = 0; h < n_head; h++)
+            rms_norm(bufs.Q.data() + h * d_head, lw.attn_q_norm_w.data(),
+                     bufs.Q.data() + h * d_head, d_head, cfg.norm_eps);
+    }
+    if (!lw.attn_k_norm_w.empty()) {
+        for (int h = 0; h < n_head_kv; h++)
+            rms_norm(bufs.K.data() + h * d_head, lw.attn_k_norm_w.data(),
+                     bufs.K.data() + h * d_head, d_head, cfg.norm_eps);
+    }
+
+    // ── Step 3: applica RoPE a Q e K ─────────
     //
     // RoPE ruota ogni coppia di dimensioni in base
     // alla posizione. Applicato prima di salvare
@@ -1089,6 +1108,24 @@ static void self_attention_llama_prefill(const float* x_batch, float* out_batch,
     if (!lw.attn_v_b.empty()) {
         for (int t = 0; t < N; t++)
             vec_add(V_batch.data() + t * kv_dim, lw.attn_v_b.data(), V_batch.data() + t * kv_dim, kv_dim);
+    }
+
+    // QK-Norm (Qwen3): RMSNorm per-head dopo proiezione, prima di RoPE
+    if (!lw.attn_q_norm_w.empty()) {
+        for (int t = 0; t < N; t++)
+            for (int h = 0; h < n_head; h++)
+                rms_norm(Q_batch.data() + t * n_embd + h * d_head,
+                         lw.attn_q_norm_w.data(),
+                         Q_batch.data() + t * n_embd + h * d_head,
+                         d_head, cfg.norm_eps);
+    }
+    if (!lw.attn_k_norm_w.empty()) {
+        for (int t = 0; t < N; t++)
+            for (int h = 0; h < n_head_kv; h++)
+                rms_norm(K_batch.data() + t * kv_dim + h * d_head,
+                         lw.attn_k_norm_w.data(),
+                         K_batch.data() + t * kv_dim + h * d_head,
+                         d_head, cfg.norm_eps);
     }
 
     // RoPE per tutte le posizioni (globali)

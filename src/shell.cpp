@@ -126,7 +126,7 @@ static std::string sanitize_output(const std::string& s) {
 // ─────────────────────────────────────────────
 //  Stampa i comandi disponibili
 // ─────────────────────────────────────────────
-static void print_help(bool chat_mode, bool speculative_mode, int draft_k) {
+static void print_help(bool chat_mode, bool speculative_mode, int draft_k, bool enable_thinking) {
     std::cout
         << "\n  Comandi disponibili:\n"
         << "  :help                mostra questo messaggio\n"
@@ -146,11 +146,14 @@ static void print_help(bool chat_mode, bool speculative_mode, int draft_k) {
         << "  :raw                 modalità raw  (prompt diretto)\n"
         << "  :params              mostra parametri correnti\n"
         << "  :history             mostra la conversazione corrente\n"
+        << "  :think [on|off]      thinking mode (Qwen3): on=ragiona, off=risposta diretta\n"
         << "  :reset               azzera KV cache e conversazione\n"
         << "  :quit                esci\n"
         << "  qualsiasi testo      genera completamento\n"
         << "\n  Modalità corrente: " << (chat_mode ? "chat" : "raw")
-        << " | Speculative: " << (speculative_mode ? "on (draft=" + std::to_string(draft_k) + ")" : "off") << "\n"
+        << " | Speculative: " << (speculative_mode ? "on (draft=" + std::to_string(draft_k) + ")" : "off")
+        << " | Thinking: " << (chat_mode ? (enable_thinking ? "on" : "off") : "—")
+        << "\n"
         << "\n  Scorciatoie tastiera:\n"
         << "  ↑ ↓                  naviga la history\n"
         << "  Ctrl+R               cerca nella history\n"
@@ -533,6 +536,11 @@ void shell_run(Model& model, const Tokenizer& tok) {
     // Ogni messaggio è una coppia {role, content}.
     std::vector<std::pair<std::string, std::string>> conversation;
 
+    // Thinking mode per Qwen3: controlla se il modello deve ragionare.
+    // true  = il modello decide se usare <think> (default)
+    // false = il modello non ragiona (risposta diretta)
+    bool enable_thinking = true;
+
     // Traccia quanti token sono già stati scritti nella KV cache.
     // Usato per il prefill incrementale in modalità chat multi-turn:
     // solo i token nuovi vengono processati, quelli vecchi sono riutilizzati.
@@ -552,7 +560,7 @@ void shell_run(Model& model, const Tokenizer& tok) {
               << (model_name + "  •  CPU only  •  C++17")
               << "║\n";
     std::cout << "╚═══════════════════════════════════════╝\n";
-    print_help(chat_mode, speculative_mode, draft_k);
+    print_help(chat_mode, speculative_mode, draft_k, enable_thinking);
 
     while (true) {
         std::string line;
@@ -576,13 +584,31 @@ void shell_run(Model& model, const Tokenizer& tok) {
                 break;
             }
             else if (line == ":help" || line == ":h") {
-                print_help(chat_mode, speculative_mode, draft_k);
+                print_help(chat_mode, speculative_mode, draft_k, enable_thinking);
+            }
+            else if (line.substr(0, 6) == ":think") {
+                // Thinking mode per Qwen3: controlla il ragionamento.
+                // :think       — mostra lo stato corrente
+                // :think on    — abilita thinking (default, modello decide)
+                // :think off   — disabilita thinking (risposta diretta)
+                std::string arg = line.size() > 7 ? line.substr(7) : "";
+                if (arg == "on") {
+                    enable_thinking = true;
+                    std::cout << "  Thinking mode: on (il modello può ragionare)\n\n";
+                } else if (arg == "off") {
+                    enable_thinking = false;
+                    std::cout << "  Thinking mode: off (risposta diretta)\n\n";
+                } else {
+                    std::cout << "  Thinking mode: "
+                              << (enable_thinking ? "on" : "off") << "\n\n";
+                }
             }
             else if (line == ":reset") {
                 model_init_kvcache(model);
                 conversation.clear();
                 shell_cache_len = 0;
-                std::cout << "  KV cache e conversazione azzerate\n\n";
+                enable_thinking = true;
+                std::cout << "  KV cache, conversazione e thinking mode azzerati\n\n";
             }
             else if (line == ":history") {
                 if (conversation.empty()) {
@@ -706,26 +732,25 @@ void shell_run(Model& model, const Tokenizer& tok) {
         } else {
             if (chat_mode) {
                 // ═══════════════════════════════════════════════════════
-                //  CHAT MULTI-TURN CON PREFILL INCREMENTALE
+                //  CHAT MULTI-TURN CON PREFILL INCREMENTALE E THINKING
                 //
                 //  Invece di passare l'intero prompt a generate() che
                 //  azzera la cache e rifà il prefill completo, gestiamo
                 //  direttamente il forward pass nella shell.
                 //
                 //  Algoritmo:
-                //    1. Formatta il prompt con tutta la conversazione
+                //    1. Formatta il prompt (enable_thinking controlla il
+                //       thinking mode di Qwen3)
                 //    2. Tokenizza il prompt completo
-                //    3. Se shell_cache_len == 0 (primo turno):
-                //         usa forward_prefill() batch (veloce)
-                //       Altrimenti:
-                //         forward() sequenziale solo per i token NUOVI
-                //    4. Genera la risposta con forward() sequenziale
-                //       o speculative decoding (se attivo)
-                //    5. Aggiorna shell_cache_len = prompt_len + gen_len
+                //    3. Prefill incrementale o batch
+                //    4. Genera la risposta
+                //    5. Parsing dei tag <think>...</think> (Qwen3)
+                //    6. Aggiorna shell_cache_len
                 // ═══════════════════════════════════════════════════════
 
                 conversation.push_back({"user", line});
-                std::string formatted = apply_chat_template_conversation(tok, conversation);
+                std::string formatted = apply_chat_template_conversation(
+                    tok, conversation, enable_thinking);
                 std::cout << "\nAssistente: ";
                 std::cout.flush();
 
@@ -740,20 +765,14 @@ void shell_run(Model& model, const Tokenizer& tok) {
                     std::vector<int> context_ids = input_ids;
                     std::vector<float> logits;
 
-                    // Se la cache è più lunga del prompt (anomalia, es. cambio
-                    // template o tokenizzazione diversa), resetta tutto.
                     if (shell_cache_len > (int)input_ids.size()) {
                         model_init_kvcache(model);
                         shell_cache_len = 0;
                     }
 
-                    // Prefill incrementale
                     if (shell_cache_len == 0) {
-                        // Primo turno: usa forward_prefill batch (più veloce)
                         forward_prefill(model, input_ids, logits);
                     } else {
-                        // Turni successivi: forward() solo sui token nuovi.
-                        // La cache contiene già i token 0..shell_cache_len-1.
                         for (int i = shell_cache_len; i < (int)input_ids.size(); i++) {
                             forward(model, input_ids[i], i, logits);
                         }
@@ -788,6 +807,16 @@ void shell_run(Model& model, const Tokenizer& tok) {
                     std::cout << "\n\n";
                     shell_cache_len = pos;
                 }
+
+                // Parsing del thinking mode: separa <think>...</think> dal resto
+                auto [think_content, reply_content] = parse_think_tags(assistant_reply);
+                if (!think_content.empty()) {
+                    // Mostra il pensiero in grigio (solo se non vuoto)
+                    std::cout << "  [Pensiero]\033[90m" << think_content << "\033[0m\n";
+                }
+
+                // Salva TUTTO (con tag think inclusi) nella conversazione
+                // per preservare il contesto multi-turn
                 conversation.push_back({"assistant", assistant_reply});
 
             } else {
