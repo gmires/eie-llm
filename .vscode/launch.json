@@ -1,8 +1,12 @@
 {
   "version": "0.2.0",
   "configurations": [
+    // ═══════════════════════════════════════════
+    //  GPT-2 small (124M, Q8_0)
+    //  Parametri: temp=1.0 topk=40 topp=0.9 penalty=1.0
+    // ═══════════════════════════════════════════
     {
-      "name": "Debug GPT-2 (shell)",
+      "name": "🟢 GPT-2 shell",
       "type": "cppdbg",
       "request": "launch",
       "program": "${workspaceFolder}/build/eie-llm",
@@ -12,33 +16,11 @@
       "preLaunchTask": "cmake build debug",
       "MIMode": "gdb",
       "setupCommands": [
-        {
-          "description": "Abilita pretty-printing",
-          "text": "-enable-pretty-printing",
-          "ignoreFailures": true
-        }
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
       ]
     },
     {
-      "name": "Debug TinyLlama (shell)",
-      "type": "cppdbg",
-      "request": "launch",
-      "program": "${workspaceFolder}/build/eie-llm",
-      "args": ["models/tinyllama.Q4_K_M.gguf"],
-      "stopAtEntry": false,
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "cmake build debug",
-      "MIMode": "gdb",
-      "setupCommands": [
-        {
-          "description": "Abilita pretty-printing",
-          "text": "-enable-pretty-printing",
-          "ignoreFailures": true
-        }
-      ]
-    },
-    {
-      "name": "Debug GPT-2 Server",
+      "name": "🟢 GPT-2 server",
       "type": "cppdbg",
       "request": "launch",
       "program": "${workspaceFolder}/build/eie-llm",
@@ -48,33 +30,11 @@
       "preLaunchTask": "cmake build debug",
       "MIMode": "gdb",
       "setupCommands": [
-        {
-          "description": "Abilita pretty-printing",
-          "text": "-enable-pretty-printing",
-          "ignoreFailures": true
-        }
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
       ]
     },
     {
-      "name": "Debug TinyLlama Server",
-      "type": "cppdbg",
-      "request": "launch",
-      "program": "${workspaceFolder}/build/eie-llm",
-      "args": ["models/tinyllama.Q4_K_M.gguf", "--server", "8080"],
-      "stopAtEntry": false,
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "cmake build debug",
-      "MIMode": "gdb",
-      "setupCommands": [
-        {
-          "description": "Abilita pretty-printing",
-          "text": "-enable-pretty-printing",
-          "ignoreFailures": true
-        }
-      ]
-    },
-    {
-      "name": "Debug GPT-2 Bench",
+      "name": "🟢 GPT-2 bench",
       "type": "cppdbg",
       "request": "launch",
       "program": "${workspaceFolder}/build/eie-llm",
@@ -84,15 +44,43 @@
       "preLaunchTask": "cmake build debug",
       "MIMode": "gdb",
       "setupCommands": [
-        {
-          "description": "Abilita pretty-printing",
-          "text": "-enable-pretty-printing",
-          "ignoreFailures": true
-        }
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    // ═══════════════════════════════════════════
+    //  TinyLlama 1.1B Chat (Q4_K_M)
+    //  Parametri: temp=0.7 topk=50 topp=0.95 penalty=1.1
+    // ═══════════════════════════════════════════
+    {
+      "name": "🟡 TinyLlama shell",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/tinyllama.Q4_K_M.gguf"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
       ]
     },
     {
-      "name": "Debug TinyLlama Bench",
+      "name": "🟡 TinyLlama server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/tinyllama.Q4_K_M.gguf", "--server", "8080"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "🟡 TinyLlama bench",
       "type": "cppdbg",
       "request": "launch",
       "program": "${workspaceFolder}/build/eie-llm",
@@ -102,11 +90,147 @@
       "preLaunchTask": "cmake build debug",
       "MIMode": "gdb",
       "setupCommands": [
-        {
-          "description": "Abilita pretty-printing",
-          "text": "-enable-pretty-printing",
-          "ignoreFailures": true
-        }
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    // ═══════════════════════════════════════════
+    //  Llama-3.2-3B-Instruct (Q4_K_M)
+    //  Parametri: temp=0.6 topk=40 topp=0.9 penalty=1.1
+    // ═══════════════════════════════════════════
+    {
+      "name": "🔵 Llama-3.2 shell",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/llama-3.2-3b.Q4_K_M.gguf"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "🔵 Llama-3.2 server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/llama-3.2-3b.Q4_K_M.gguf", "--server", "8080"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "🔵 Llama-3.2 bench",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/llama-3.2-3b.Q4_K_M.gguf", "--bench", "50"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    // ═══════════════════════════════════════════
+    //  Qwen2.5-1.5B-Instruct (Q4_K_M)
+    //  Parametri: temp=0.7 topk=40 topp=0.8 penalty=1.05
+    // ═══════════════════════════════════════════
+    {
+      "name": "🟣 Qwen2.5 shell",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/qwen2.5-1.5b.Q4_K_M.gguf"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "🟣 Qwen2.5 server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/qwen2.5-1.5b.Q4_K_M.gguf", "--server", "8080"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "🟣 Qwen2.5 bench",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/qwen2.5-1.5b.Q4_K_M.gguf", "--bench", "50"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    // ═══════════════════════════════════════════
+    //  Qwen3-1.7B-Instruct (Q4_K_M, thinking)
+    //  Parametri thinking: temp=0.6 topk=20 topp=0.95 penalty=1.5
+    //  Parametri no-think: temp=0.7 topk=20 topp=0.8  penalty=1.5
+    //  NOTA: non usare greedy decoding in thinking mode
+    // ═══════════════════════════════════════════
+    {
+      "name": "🔴 Qwen3 shell",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/qwen3-1.7b.Q4_K_M.gguf"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "🔴 Qwen3 server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/qwen3-1.7b.Q4_K_M.gguf", "--server", "8080"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    },
+    {
+      "name": "🔴 Qwen3 bench",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/eie-llm",
+      "args": ["models/qwen3-1.7b.Q4_K_M.gguf", "--bench", "50"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "cmake build debug",
+      "MIMode": "gdb",
+      "setupCommands": [
+        { "description": "Pretty-printing", "text": "-enable-pretty-printing", "ignoreFailures": true }
       ]
     }
   ]

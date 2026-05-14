@@ -1,5 +1,6 @@
 # Build
 build/
+build-debug/
 cmake-build-*/
 
 # Modelli — troppo grandi per git, si scaricano con lo script
