@@ -659,7 +659,6 @@ void shell_run(Model& model, const Tokenizer& tok) {
 
                 std::string assistant_reply;
                 std::string think_buffer;
-                double prefill_ms = 0, gen_ms = 0, total_ms = 0, tok_s = 0;
 
                 if (speculative_mode) {
                     generate_speculative(model, tok, formatted, params, max_tokens,
@@ -678,14 +677,20 @@ void shell_run(Model& model, const Tokenizer& tok) {
 
                     auto t0 = now();
 
-                    // Prefill: la cache viene sempre azzerata perché la
-                    // tokenizzazione del prompt formattato non è garantita
-                    // essere identica ai token originali generati.
-                    // Q4_K_M rende il prefill abbastanza veloce (~3s).
-                    model_init_kvcache(model);
-                    forward_prefill(model, input_ids, logits);
-
-                    int pos = (int)input_ids.size();
+                    // Prefill: la KV cache PERSISTE tra un turno e l'altro.
+                    // Il primo turno usa forward_prefill() (crea la cache),
+                    // i turni successivi usano forward_prefill_inc() che
+                    // processa solo i token nuovi (prompt tag + nuovo messaggio).
+                    // La cache contiene già i turni precedenti.
+                    int pos;
+                    if (shell_cache_len == 0) {
+                        model_init_kvcache(model);
+                        forward_prefill(model, input_ids, logits);
+                        pos = (int)input_ids.size();
+                    } else {
+                        forward_prefill_inc(model, input_ids, shell_cache_len, logits);
+                        pos = (int)input_ids.size();
+                    }
                     int generated = 0;
 
                     auto t1 = now();

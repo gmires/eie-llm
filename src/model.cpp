@@ -1477,21 +1477,12 @@ void forward_prefill_inc(Model& model, const std::vector<int>& token_ids,
     const int N = static_cast<int>(token_ids.size());
     if (N <= base_pos) return;
 
-    // Se il batch è piccolo, forward() sequenziale è più efficiente
-    const int new_tokens = N - base_pos;
-    if (new_tokens <= 8) {
-        for (int i = base_pos; i < N; i++)
-            forward(model, token_ids[i], i, logits, false);
-        model.kv_cache.n_cached = N;
-        return;
-    }
-
-    // Batch processing via forward_verify
-    std::vector<int> new_ids(token_ids.begin() + base_pos, token_ids.end());
-    std::vector<std::vector<float>> all_logits;
-    forward_verify(model, new_ids, base_pos, all_logits);
-    if (!all_logits.empty())
-        logits = all_logits.back();
+    // Usa forward() sequenziale per ogni token nuovo.
+    // NOTA: forward_verify (batch) è più lento per base_pos grandi
+    // perché non riutilizza la dequantizzazione della cache precedente.
+    // forward() individuaali sono più cache-friendly.
+    for (int i = base_pos; i < N; i++)
+        forward(model, token_ids[i], i, logits, false);
     model.kv_cache.n_cached = N;
 }
 
