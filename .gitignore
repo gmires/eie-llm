@@ -27,3 +27,4 @@ venv/
 .eie_history
 
 __pycache__
+cache/

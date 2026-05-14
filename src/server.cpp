@@ -623,7 +623,9 @@ static bool generate_streaming_for_request(
         const SamplingParams& params,
         std::function<bool(const std::string& token,
                            bool is_first,
-                           bool is_last)> callback) {
+                           bool is_last)> callback,
+        std::string* out_text = nullptr,
+        const std::string& conversation_id = "") {
 
     std::cout << "[GEN_STREAM] prompt=\"" << prompt.substr(0, 40)
               << (prompt.size() > 40 ? "..." : "")
@@ -638,19 +640,38 @@ static bool generate_streaming_for_request(
 
     std::cout << "[GEN_STREAM] prompt tokenizzato, n=" << input_ids.size() << "\n";
 
-    // Prefill con prefix cache
+    // Prefill: file cache (conversation_id) > prefix cache > full prefill
+    bool cache_loaded = false;
     if (!input_ids.empty()) {
-        int cached_tokens = 0;
-        bool cache_hit = prefix_cache.lookup(prompt, model, cached_tokens);
+        // Livello 1: KV cache su file
+        if (!conversation_id.empty()) {
+            std::string cache_path = "cache/conversations/" + conversation_id + ".kvcache";
+            cache_loaded = model_load_kvcache(model, cache_path);
+            if (cache_loaded) {
+                int file_cached = model.kv_cache.n_cached;
+                if (file_cached < (int)input_ids.size()) {
+                    forward_prefill_inc(model, input_ids, file_cached, logits);
+                } else {
+                    forward(model, input_ids.back(), (int)input_ids.size() - 1, logits);
+                }
+                pos = static_cast<int>(input_ids.size());
+            }
+        }
 
-        if (cache_hit && cached_tokens == (int)input_ids.size()) {
-            forward(model, input_ids.back(), cached_tokens - 1, logits);
-            pos = cached_tokens;
-        } else {
-            model_init_kvcache(model);
-            forward_prefill(model, input_ids, logits);
-            pos = static_cast<int>(input_ids.size());
-            prefix_cache.store(prompt, model, pos);
+        // Livello 2: prefix cache (solo se file cache non trovata)
+        if (!cache_loaded) {
+            int cached_tokens = 0;
+            bool cache_hit = prefix_cache.lookup(prompt, model, cached_tokens);
+
+            if (cache_hit && cached_tokens == (int)input_ids.size()) {
+                forward(model, input_ids.back(), cached_tokens - 1, logits);
+                pos = cached_tokens;
+            } else {
+                model_init_kvcache(model);
+                forward_prefill(model, input_ids, logits);
+                pos = static_cast<int>(input_ids.size());
+                prefix_cache.store(prompt, model, pos);
+            }
         }
     } else {
         model_init_kvcache(model);
@@ -671,6 +692,7 @@ static bool generate_streaming_for_request(
     // Loop di generazione con callback
     bool client_ok = true;
     int generated = 0;
+    std::string output_text;
     for (int i = 0; i < max_tokens && client_ok; i++) {
         if (next_token == tok.eos_id) {
             std::cout << "[GEN_STREAM] EOS raggiunto dopo " << generated << " token\n";
@@ -680,6 +702,7 @@ static bool generate_streaming_for_request(
 
         std::string token_str = sanitize_output(tokenizer_decode(tok, {next_token}));
         context_ids.push_back(next_token);
+        output_text += token_str;
         generated++;
 
         client_ok = callback(token_str, i == 0, false);
@@ -702,6 +725,21 @@ static bool generate_streaming_for_request(
         std::cout << "[GEN_STREAM] max_tokens raggiunto, generated=" << generated << "\n";
         callback("", false, true);
     }
+
+    // Salva KV cache su file dopo la generazione
+    if (!conversation_id.empty() && model.kv_cache.n_cached > 0) {
+        std::string cache_dir = "cache/conversations";
+        try {
+            if (!fs::exists(cache_dir))
+                fs::create_directories(cache_dir);
+        } catch (...) {}
+        std::string cache_path = cache_dir + "/" + conversation_id + ".kvcache";
+        model_save_kvcache(model, cache_path);
+    }
+
+    // Restituisci il testo generato se richiesto
+    if (out_text) *out_text = output_text;
+
     auto t_end = std::chrono::high_resolution_clock::now();
     double gen_ms = std::chrono::duration<double, std::milli>(t_end - t_prefill).count();
     double total_ms = std::chrono::duration<double, std::milli>(t_end - t0).count();
@@ -904,7 +942,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
           << "\"enable_thinking\":"    << (p[4] > 0.5f ? "true" : "false")
           << "}"
           << "}";
-        res.set_content(j.str(), "application/json");
+        res.set_content(j.str(), "application/json; charset=utf-8");
     });
 
     // ── POST /v1/completions ──────────────────
@@ -937,7 +975,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         if (prompt.empty()) {
             res.status = 400;
             res.set_content("{\"error\":\"prompt mancante o vuoto\"}",
-                            "application/json");
+                            "application/json; charset=utf-8");
             return;
         }
 
@@ -978,13 +1016,13 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                 res.status = 500;
                 res.set_content(
                     "{\"error\":\"" + json_escape(sreq->error_msg) + "\"}",
-                    "application/json");
+                    "application/json; charset=utf-8");
                 return;
             }
 
             std::cout << "[RES] generati " << sreq->completion_tokens
                       << " token\n";
-            res.set_content(build_response_json(*sreq), "application/json");
+            res.set_content(build_response_json(*sreq), "application/json; charset=utf-8");
             return;
         }
 
@@ -995,7 +1033,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         // genera i token direttamente e li invia al client
         // via chunked transfer encoding. Questo mantiene la
         // Time-To-First-Token (TTFT) bassissima.
-        res.set_chunked_content_provider("text/event-stream",
+        res.set_chunked_content_provider("text/event-stream; charset=utf-8",
             [prompt, max_tokens, params, &model, &tok]
             (size_t offset, httplib::DataSink &sink) -> bool {
                 if (offset > 0) {
@@ -1052,7 +1090,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
             res.status = 400;
             res.set_content(
                 "{\"error\":\"nessun messaggio trovato in messages\"}",
-                "application/json");
+                "application/json; charset=utf-8");
             return;
         }
 
@@ -1096,21 +1134,21 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                 res.status = 500;
                 res.set_content(
                     "{\"error\":\"" + json_escape(sreq->error_msg) + "\"}",
-                    "application/json");
+                    "application/json; charset=utf-8");
                 return;
             }
 
             std::cout << "[RES] generati " << sreq->completion_tokens
                       << " token\n";
-            res.set_content(build_response_json(*sreq), "application/json");
+            res.set_content(build_response_json(*sreq), "application/json; charset=utf-8");
             return;
         }
 
         // ═════════════════════════════════════════
         //  RISPOSTA STREAMING (sincrona)
         // ═════════════════════════════════════════
-        res.set_chunked_content_provider("text/event-stream",
-            [prompt, max_tokens, params, &model, &tok]
+        res.set_chunked_content_provider("text/event-stream; charset=utf-8",
+            [prompt, max_tokens, params, conversation_id, &model, &tok]
             (size_t offset, httplib::DataSink &sink) -> bool {
                 if (offset > 0) {
                     sink.done();
@@ -1130,7 +1168,8 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                             std::cout << "[STREAM] client disconnesso (sink.write=false)\n";
                         }
                         return ok;
-                    });
+                    },
+                    nullptr, conversation_id);
 
                 std::cout << "[STREAM] /v1/chat/completions content_provider terminato\n";
                 sink.done();
@@ -1150,7 +1189,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         } catch (...) {}
         std::ostringstream j;
         j << "{\"deleted\":" << (deleted ? "true" : "false") << "}";
-        res.set_content(j.str(), "application/json");
+        res.set_content(j.str(), "application/json; charset=utf-8");
     });
 
     // ── POST /v1/inspect/attention ────────────
@@ -1180,7 +1219,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
         if (prompt.empty()) {
             res.status = 400;
             res.set_content("{\"error\":\"prompt mancante\"}",
-                            "application/json");
+                            "application/json; charset=utf-8");
             return;
         }
 
@@ -1190,7 +1229,7 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                   << "\"\n";
 
         std::string json = inspect_attention(model, tok, prompt, max_len);
-        res.set_content(json, "application/json");
+        res.set_content(json, "application/json; charset=utf-8");
     });
 
     // ── Monta directory webui per la UI statica ──

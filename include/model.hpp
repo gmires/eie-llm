@@ -373,8 +373,7 @@ void forward_prefill(Model& model, const std::vector<int>& token_ids, std::vecto
 // I token 0..base_pos-1 sono già nella KV cache e vengono riutilizzati.
 // Processa solo i token da base_pos a token_ids.size()-1.
 // Dopo l'esecuzione, kv_cache.n_cached = token_ids.size().
-void forward_prefill_inc(Model& model, const std::vector<int>& token_ids,
-                          int base_pos, std::vector<float>& logits);
+void forward_prefill_inc(Model& model, const std::vector<int>& token_ids, int base_pos, std::vector<float>& logits);
 
 // Forward pass BATCH per verifica (Speculative Decoding).
 //
