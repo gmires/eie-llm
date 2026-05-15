@@ -704,6 +704,14 @@ std::pair<std::string, std::string> parse_think_tags(const std::string& text) {
 //  - Ogni altra sequenza UTF-8: passa intatta
 // ─────────────────────────────────────────────
 std::string sanitize_output(const std::string& s) {
+    // Converte i caratteri Latin Extended-A (U+0100-U+017F) del BPE
+    // byte-level GPT-2/Qwen ai byte originali.
+    //
+    // Regole:
+    //   - ASCII stampabile (0x20-0x7E) + newline/tab: passa
+    //   - 2-byte UTF-8 in U+0100-U+017F: byte mapping → byte originale
+    //   - Ogni altro byte (inclusi UTF-8 multi-byte, continuation bytes):
+    //     passa intatto — meglio un carattere raw che uno perso
     std::string out;
     out.reserve(s.size());
 
@@ -711,42 +719,36 @@ std::string sanitize_output(const std::string& s) {
     while (i < s.size()) {
         unsigned char c = static_cast<unsigned char>(s[i]);
 
-        // ASCII stampabile
+        // ASCII stampabile + newline + tab: passa direttamente
         if (c >= 0x20 && c <= 0x7E) { out += s[i++]; continue; }
+        if (c == 0x0A || c == 0x09) { out += s[i++]; continue; }
 
-        // Newline
-        if (c == 0x0A) { out += s[i++]; continue; }
-
-        // UTF-8 a 2 byte: verifichiamo se è Latin Extended-A
+        // Possibile 2-byte UTF-8: verifica se è Latin Extended-A (byte mapping)
         if (c >= 0xC0 && c <= 0xDF && i + 1 < s.size()) {
             unsigned char c2 = static_cast<unsigned char>(s[i+1]);
             if ((c2 & 0xC0) == 0x80) {
                 uint32_t cp = ((c & 0x1F) << 6) | (c2 & 0x3F);
+                // U+0100-U+017F = byte mapping GPT-2: converti al byte originale
                 if (cp >= 0x100 && cp <= 0x17F) {
-                    uint8_t original_byte = static_cast<uint8_t>(cp - 0x100);
-                    if (original_byte >= 0x20 && original_byte <= 0x7E)
-                        out += static_cast<char>(original_byte);
-                    else if (original_byte == 0x0A)
-                        out += '\n';
-                    // byte di controllo scartati
-                } else {
-                    out += s[i]; out += s[i+1];
+                    uint8_t b = static_cast<uint8_t>(cp - 0x100);
+                    if (b >= 0x20 && b <= 0x7E) out += (char)b;
+                    else if (b == 0x0A) out += '\n';
+                    i += 2; continue;
                 }
+                // Altri caratteri 2-byte validi (es. è, à): passa intatti
+                out += s[i]; out += s[i+1];
                 i += 2; continue;
             }
+            // Continuazione non valida: passa il primo byte,
+            // il secondo verrà gestito al prossimo ciclo
+            out += s[i++]; continue;
         }
 
-        // UTF-8 a 3-4 byte: passa intatto
-        if (c >= 0xE0 && c <= 0xEF && i + 2 < s.size()) {
-            out += s[i]; out += s[i+1]; out += s[i+2];
-            i += 3; continue;
-        }
-        if (c >= 0xF0 && c <= 0xF7 && i + 3 < s.size()) {
-            out += s[i]; out += s[i+1]; out += s[i+2]; out += s[i+3];
-            i += 4; continue;
-        }
-
-        i++; // scarta byte sconosciuto
+        // Tutto il resto (UTF-8 multi-byte, continuation bytes solitari,
+        // byte di controllo): passa intatto — meglio visibile che perso
+        // Questo gestisce il caso in cui un carattere UTF-8 multi-byte
+        // è stato splittato in più token dal BPE e arriva in pezzi.
+        out += s[i++];
     }
     return out;
 }
