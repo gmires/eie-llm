@@ -9,7 +9,7 @@ Interfaccia web moderna per EIE-LLM, ispirata a OpenWebUI. Si connette direttame
 - **Markdown + syntax highlighting** — messaggi formattati con marked.js e highlight.js
 - **Pannello impostazioni** — temperatura, top-k, top-p, repetition penalty, greedy, streaming toggle, modalità chat, **thinking mode** (Qwen3)
 - **Parametri consigliati automatici** — il server comunica i parametri ottimali per il modello caricato; la Web UI li applica al primo avvio
-- **KV Cache persistente su file** — ogni conversazione ha un `conversation_id` inviato al server; la KV cache viene salvata su disco tra una richiesta e l'altra, eliminando il prefill completo ad ogni turno. La cache viene eliminata automaticamente quando elimini la chat
+- **KV Cache persistente su file** — ogni conversazione viene creata con un UUID (`conversation_id`) inviato in ogni richiesta API. Il server salva la KV cache su disco dopo ogni turno e la riutilizza alla richiesta successiva, processando SOLO i nuovi token. Il prefill dei turni precedenti viene saltato, riducendo la latenza da O(n²) a O(m) per turno. La cache viene eliminata automaticamente quando elimini la chat (`DELETE /v1/cache/{id}`). TTL: 24 ore
 - **Attention Heatmap interattiva** — visualizza i pesi attention per ogni layer/head con colormap uniforme (blu→ciano→giallo→rosso), zoom con rotellina, pan con trascinamento, tooltip con percentuale
 - **Tema chiaro/scuro** — toggle immediato con persistenza
 - **Importa/Esporta chat** — formato JSON per backup e condivisione

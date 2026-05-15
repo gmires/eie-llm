@@ -7,6 +7,7 @@
 #include <sstream>
 #include <string>
 #include <filesystem>
+#include <sys/stat.h>
 namespace fs = std::filesystem;
 #include <mutex>
 #include <functional>
@@ -492,21 +493,35 @@ static void generate_for_request(Model& model,
             req.pos = cached_tokens;
         }
         // Livello 2: KV cache su file (conversation_id)
+        //
+        // La Web UI invia conversation_id ad ogni richiesta.
+        // Se il file esiste, lo carichiamo e facciamo forward() solo
+        // per i token nuovi. Se non esiste, è la prima richiesta
+        // di quella conversazione — full prefill da zero.
         else if (!req.conversation_id.empty()) {
             std::string cache_path = "cache/conversations/" + req.conversation_id + ".kvcache";
             file_cache_loaded = model_load_kvcache(model, cache_path);
+
             if (file_cache_loaded) {
                 file_cached = model.kv_cache.n_cached;
-                // Prefill solo dei token nuovi
+                std::cout << "[CACHE] Caricata: conv=" << req.conversation_id
+                          << " cached=" << file_cached
+                          << " prompt=" << req.input_ids.size()
+                          << " nuovi=" << (req.input_ids.size() - file_cached)
+                          << " token\n";
+
+                // Prefill solo dei token nuovi rispetto alla cache
                 if (file_cached < (int)req.input_ids.size()) {
                     forward_prefill_inc(model, req.input_ids, file_cached, req.logits);
                 } else {
-                    // Cache più lunga del prompt: logits dell'ultimo token
+                    // Cache più lunga del prompt — ricalcola solo l'ultimo
                     forward(model, req.input_ids.back(), (int)req.input_ids.size() - 1, req.logits);
                 }
                 req.pos = static_cast<int>(req.input_ids.size());
             } else {
-                // Nessuna cache su file: prefill completo
+                // Prima richiesta per questa conversazione
+                std::cout << "[CACHE] Non trovata (primo turno): conv="
+                          << req.conversation_id << "\n";
                 model_init_kvcache(model);
                 forward_prefill(model, req.input_ids, req.logits);
                 req.pos = static_cast<int>(req.input_ids.size());
@@ -572,14 +587,16 @@ static void generate_for_request(Model& model,
               << " (" << (req.generated / (gen_ms / 1000.0)) << " tok/s)" << std::endl;
 
     // ── Fase 5: Salva KV cache su file ─────────
+    // forward() non aggiorna n_cached, lo facciamo noi prima di salvare.
+    // La cache include TUTTI i token (prompt + risposta).
+    model.kv_cache.n_cached = req.pos;
     if (!req.conversation_id.empty() && model.kv_cache.n_cached > 0) {
         std::string cache_dir = "cache/conversations";
-        try {
-            if (!fs::exists(cache_dir))
-                fs::create_directories(cache_dir);
-        } catch (...) {}
+        try { fs::create_directories(cache_dir); } catch (...) {}
         std::string cache_path = cache_dir + "/" + req.conversation_id + ".kvcache";
         model_save_kvcache(model, cache_path);
+        std::cout << "[CACHE] Salvata: conv=" << req.conversation_id
+                  << " tokens=" << model.kv_cache.n_cached << "\n";
     }
 
     // ── Fase 6: Segnala completamento ─────────
@@ -643,18 +660,30 @@ static bool generate_streaming_for_request(
     // Prefill: file cache (conversation_id) > prefix cache > full prefill
     bool cache_loaded = false;
     if (!input_ids.empty()) {
-        // Livello 1: KV cache su file
+        // Livello 1: KV cache su file (conversation_id)
+        // La Web UI invia conversation_id ad ogni richiesta.
+        // Se il file esiste, solo i nuovi token vengono processati.
         if (!conversation_id.empty()) {
             std::string cache_path = "cache/conversations/" + conversation_id + ".kvcache";
             cache_loaded = model_load_kvcache(model, cache_path);
+
             if (cache_loaded) {
                 int file_cached = model.kv_cache.n_cached;
+                std::cout << "[CACHE] Caricata: conv=" << conversation_id
+                          << " cached=" << file_cached
+                          << " prompt=" << input_ids.size()
+                          << " nuovi=" << (input_ids.size() - file_cached)
+                          << " token\n";
+
                 if (file_cached < (int)input_ids.size()) {
                     forward_prefill_inc(model, input_ids, file_cached, logits);
                 } else {
                     forward(model, input_ids.back(), (int)input_ids.size() - 1, logits);
                 }
                 pos = static_cast<int>(input_ids.size());
+            } else {
+                std::cout << "[CACHE] Non trovata (primo turno): conv="
+                          << conversation_id << "\n";
             }
         }
 
@@ -726,7 +755,8 @@ static bool generate_streaming_for_request(
         callback("", false, true);
     }
 
-    // Salva KV cache su file dopo la generazione
+    // Aggiorna n_cached e salva KV cache su file
+    model.kv_cache.n_cached = pos;
     if (!conversation_id.empty() && model.kv_cache.n_cached > 0) {
         std::string cache_dir = "cache/conversations";
         try {
@@ -735,6 +765,8 @@ static bool generate_streaming_for_request(
         } catch (...) {}
         std::string cache_path = cache_dir + "/" + conversation_id + ".kvcache";
         model_save_kvcache(model, cache_path);
+        std::cout << "[CACHE] Salvata: conv=" << conversation_id
+                  << " tokens=" << model.kv_cache.n_cached << "\n";
     }
 
     // Restituisci il testo generato se richiesto
@@ -858,20 +890,46 @@ void server_run(Model& model, const Tokenizer& tok, int port) {
                              std::ref(queue));
 
     // ── Crea directory per cache su file ──────
+    // Cache TTL: 24 ore. I file più vecchi vengono rimossi
+    // all'avvio del server e periodicamente ogni 30 minuti.
+    static constexpr time_t CACHE_TTL_SECONDS = 24 * 3600;  // 24 ore
     try {
         fs::create_directories("cache/conversations");
-        // TTL cleanup: rimuovi cache più vecchie di 1 ora
-        auto now = std::chrono::system_clock::now();
-        for (const auto& entry : fs::directory_iterator("cache/conversations")) {
-            auto ftime = fs::last_write_time(entry.path());
-            auto age = std::chrono::duration_cast<std::chrono::hours>(
-                now - std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                    ftime - decltype(ftime)::clock::now() + now)).count();
-            if (age >= 1) {
-                fs::remove(entry.path());
-            }
-        }
     } catch (...) {}
+
+    // Funzione lambda per pulire la cache scaduta
+    auto cleanup_cache = []() {
+        try {
+            time_t now = time(nullptr);
+            int removed = 0;
+            for (const auto& entry : fs::directory_iterator("cache/conversations")) {
+                struct stat st;
+                if (stat(entry.path().c_str(), &st) == 0) {
+                    double age_sec = difftime(now, st.st_mtime);
+                    if (age_sec > CACHE_TTL_SECONDS) {
+                        fs::remove(entry.path());
+                        removed++;
+                    }
+                }
+            }
+            if (removed > 0)
+                std::cout << "[CACHE] Pulizia: rimossi " << removed << " file scaduti\n";
+        } catch (...) {}
+    };
+
+    // Pulizia iniziale all'avvio del server
+    cleanup_cache();
+
+    // Thread periodico di pulizia cache (ogni 30 minuti)
+    // In un server sempre acceso, le cache scadute si accumulano
+    // e occupano spazio su disco.
+    std::thread cache_cleaner([cleanup_cache]() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::minutes(30));
+            cleanup_cache();
+        }
+    });
+    cache_cleaner.detach();
 
     // ── CORS globale ──────────────────────────
     // Permette alla Web UI (o a qualsiasi client)

@@ -954,33 +954,73 @@ Ogni task include:
 
 ---
 
-## Integrazioni future
+## KV Cache persistente su file
 
-### KV Cache persistente su file
+La KV cache può essere salvata su disco e riutilizzata tra richieste successive della stessa conversazione,
+eliminando il ricalcolo O(n²) del prefill.
 
-**Problema:** In conversazioni lunghe (es. 500+ token), il prefill deve rielaborare l'intera history ad ogni nuovo messaggio. Questo è O(n²) e diventa molto lento — con Qwen2.5, 500 token di history richiedono ~15-20 secondi di prefill.
+### Come funziona
 
-**Soluzione proposta:** Salvare la KV cache su file alla fine di ogni turno di conversazione, e ricaricarla all'inizio del turno successivo. La KV cache per un modello 1.5B con context 8192 occupa:
-- K cache: `n_layer × n_ctx × n_head_kv × d_head × 4 byte` ≈ 28 × 8192 × 2 × 128 × 4 ≈ **234 MB**
-- V cache: uguale ≈ **234 MB**
-- Totale: ~**470 MB** per conversazione — gestibile su SSD moderni.
+1. La **Web UI** genera un `conversation_id` (UUID) per ogni chat e lo invia in ogni richiesta
+2. Il **server** cerca il file `cache/conversations/{id}.kvcache`
+3. Se trovato → carica la cache e processa **solo i token nuovi** (`forward_prefill_inc`)
+4. Se non trovato → prefill completo da zero (primo turno)
+5. Dopo ogni risposta → salva la cache aggiornata su disco (conversazioni già in cache vengono estese)
+6. All'eliminazione della chat → `DELETE /v1/cache/{id}` rimuove il file
 
-**Implementazione:**
-1. Aggiungere `model_save_kvcache(const Model&, const std::string& path)` — serializza K e V in formato binario raw (float32).
-2. Aggiungere `model_load_kvcache(Model&, const std::string& path)` — deserializza e verifica dimensioni (n_layer, n_ctx, kv_dim).
-3. Aggiungere un campo `conversation_id` nelle richieste HTTP della Web UI, e un meccanismo di mappaggio `conversation_id → file_cache` nel server.
-4. La Web UI salva `conversation_id` in `localStorage` insieme alla cronologia chat; il server salva/ripristina la KV cache associata.
+### Formato file binario
 
-**Vantaggi:**
-- Prefill di conversazioni lunghe passa da O(n²) a O(m) dove m è la lunghezza del nuovo messaggio.
-- UX della Web UI molto più fluida su conversazioni lunghe.
-- Implementazione relativamente semplice: la KV cache è già flat e contigua in memoria.
+```
+[uint32: magic = 0x4B564341 ("KVCA")]
+[uint32: version = 1]
+[uint32: n_layer]
+[uint32: kv_dim]
+[uint32: n_cached]
+[n_layer × n_cached × kv_dim × float32: K cache]
+[n_layer × n_cached × kv_dim × float32: V cache]
+```
 
-**Limitazioni:**
-- Ogni conversazione occupa ~470 MB su disco.
-- Non è adatto a deployment multi-utente con migliaia di conversazioni attive (servirebbe un eviction policy LRU).
+### Console logging
 
-**Priorità:** Media — miglioramento significativo dell'UX ma non bloccante per l'uso didattico.
+Il server stampa messaggi `[CACHE]` a ogni operazione sulla cache:
+
+```
+[CACHE] Non trovata (primo turno): conv=abc-123       ← prima richiesta
+[CACHE] Salvata: conv=abc-123 tokens=42               ← dopo la generazione
+[CACHE] Caricata: conv=abc-123 cached=42 nuovi=15     ← turno successivo
+```
+
+### TTL e pulizia
+
+- **TTL: 24 ore** — i file più vecchi vengono rimossi automaticamente
+- **All'avvio del server**: pulizia iniziale di tutti i file scaduti
+- **Ogni 30 minuti**: thread background di pulizia
+- **DELETE esplicito**: la Web UI chiama `/v1/cache/{id}` quando l'utente elimina una chat
+
+### Implementazione
+
+| File | Funzione | Ruolo |
+|------|----------|-------|
+| `src/model.cpp:268-330` | `model_save_kvcache()` | Serializza K/V su file binario |
+| `src/model.cpp:332-375` | `model_load_kvcache()` | Carica e verifica compatibilità |
+| `src/server.cpp:494-522` | `generate_for_request()` | Carica cache → forward_prefill_inc → salva |
+| `src/server.cpp:647-678` | `generate_streaming_for_request()` | Stessa logica per streaming |
+| `src/server.cpp:1138-1150` | `DELETE /v1/cache/{id}` | Eliminazione esplicita |
+| `src/server.cpp:870-900` | `cleanup_cache()` | TTL 24h + thread periodico |
+
+### Caching a tre livelli
+
+1. **PrefixCache** (in memoria): prompt ESATTAMENTE identico → hit immediato
+2. **File cache** (`conversation_id`): multi-turn → carica da disco, processa solo nuovi token
+3. **Full prefill**: nessuna cache disponibile → da zero
+
+### Dimensione tipica
+
+```
+TinyLlama, 42 token:  ~2 MB
+Qwen3, 100 token:    ~40 MB
+Qwen3, 1000 token:   ~400 MB
+```
 
 ---
 
